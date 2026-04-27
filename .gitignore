@@ -4,3 +4,4 @@
 !.gitignore
 !add_steam_entries.py
 !make_desktop_entries.sh
+!games.csv
