@@ -335,6 +335,10 @@ class GameArchiver(App):
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
         Binding("l", "launch", "Launch"),
+        Binding("o", "open_folder", "Open"),
+        Binding("p", "open_remote_folder", "Open Remote"),
+        Binding("t", "terminal", "Terminal"),
+        Binding("s", "remote_terminal", "SSH"),
     ]
 
 
@@ -657,6 +661,91 @@ class GameArchiver(App):
             start_new_session=True,
         )
 
+    def action_open_folder(self):
+        view = self.current_view()
+
+        if view.index is None:
+            return
+
+        row = view.children[view.index]
+        game = row.game
+
+        path = launch_path(game)
+
+        try:
+            subprocess.Popen(
+                ["xdg-open", str(path)],
+                start_new_session=True,
+            )
+        except Exception as e:
+            self.notify(f"Open failed: {e}")
+
+
+    def action_open_remote_folder(self):
+        view = self.current_view()
+
+        if view.index is None:
+            return
+
+        row = view.children[view.index]
+        game = row.game
+
+        path = row.game.path
+
+        try:
+            subprocess.Popen(
+                ["xdg-open", str(path)],
+                start_new_session=True,
+            )
+        except Exception as e:
+            self.notify(f"Open failed: {e}")
+
+    def action_terminal(self):
+        view = self.current_view()
+
+        if view.index is None:
+            return
+
+        row = view.children[view.index]
+        game = row.game
+
+        path = launch_path(game)
+
+        self.notify(
+            f"Opening terminal in {game.name}"
+        )
+
+        subprocess.Popen(
+            [
+                "alacritty",
+                "--working-directory",
+                str(path),
+            ],
+            start_new_session=True,
+        )
+
+    def action_remote_terminal(self):
+        view = self.current_view()
+
+        if view.index is None:
+            return
+
+        row = view.children[view.index]
+        game = row.game
+
+        path = game.path
+
+        subprocess.Popen(
+            [
+                "alacritty",
+                "-e",
+                "ssh",
+                "-t",
+                "sebanisuserver",
+                f"cd '{path}' && exec $SHELL -l",
+            ],
+            start_new_session=True,
+        )
 # ============================================================
 # MAIN
 # ============================================================
