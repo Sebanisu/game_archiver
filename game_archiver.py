@@ -147,7 +147,27 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
     save_size_cache(SIZE_CACHE)
 
     return size, mtime
-        
+
+
+def game_list_changed(
+        path: Path,
+        games: list[Game],
+    ) -> bool:
+    cached = {
+        (g.name, g.mtime)
+        for g in games
+    }
+
+    current = {
+        (
+            p.name,
+            p.stat().st_mtime,
+        )
+        for p in path.iterdir()
+        if p.is_dir()
+    }
+
+    return current != cached
 
 def local_sync_status():
     if not LOCAL_SHARED_DIR.exists():
@@ -221,7 +241,6 @@ def latest_activity(path: Path) -> float:
         return newest
 
     return path.stat().st_mtime
-
 
 def scan_games(base: Path) -> list[Game]:
     games = []
@@ -324,6 +343,13 @@ class GameArchiver(App):
         height: 3;
         padding: 0 1;
     }
+
+    .pane-title {
+        dock: top;
+        height: 1;
+        padding-left: 1;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
@@ -355,12 +381,30 @@ class GameArchiver(App):
         self.sync_status = local_sync_status()
         self.update_status()
 
+
+    def refresh_if_changed(self):
+        if (
+            game_list_changed(
+                SHARED_DIR,
+                self.shared_games,
+            )
+            or game_list_changed(
+                ARCHIVED_DIR,
+                self.archived_games,
+            )
+        ):
+            self.action_refresh()
+
+
     def compose(self) -> ComposeResult:
         yield Header()
 
         with Horizontal(id="panes"):
-            yield ListView(id="shared")
-            yield ListView(id="archived")
+            self.shared_view = ListView(id="shared")
+            yield self.shared_view
+
+            self.archived_view = ListView(id="archived")
+            yield self.archived_view
 
         yield Static(id="status")
 
@@ -407,6 +451,8 @@ class GameArchiver(App):
         )
 
     def on_mount(self):
+        self.shared_view.border_title = " Shared / Synced "
+        self.archived_view.border_title = " Archived / Remote "
         verify_storage()
 
         self.shared_games = scan_games(SHARED_DIR)
@@ -425,6 +471,11 @@ class GameArchiver(App):
             5,
             self.refresh_sync_status,
         )
+        self.set_interval(
+            60,
+            self.refresh_if_changed,
+        )
+
 
     # ========================================================
 
