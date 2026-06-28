@@ -7,6 +7,7 @@ import shutil
 import time
 import subprocess
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,12 +64,30 @@ class Game:
     path: Path
     size: int
     mtime: float
+    last_played: float = 0.0
     selected: bool = False
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+
+def fmt_time(ts: float) -> str:
+    if not ts:
+        return "Never"
+
+    return time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(ts),
+    )
+
+def natural_key(s: str):
+    return [
+        int(part)
+        if part.isdigit()
+        else part.casefold()
+        for part in re.split(r"(\d+)", s)
+    ]
 
 def launch_path(game: Game) -> Path:
     # Only games in shared can have a local mirror.
@@ -130,23 +149,32 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
         return 0, 0.0
 
     cached = SIZE_CACHE.get(key)
+    
+    last_played = (
+        cached.get("last_played", 0.0)
+        if cached
+        else 0.0
+    )
 
     if (
         cached is not None
         and cached["mtime"] == mtime
     ):
-        return cached["size"], cached["mtime"]
+        return cached["size"], cached["mtime"], last_played
 
     size = dir_size(path)
+
+    
 
     SIZE_CACHE[key] = {
         "mtime": mtime,
         "size": size,
+        "last_played": last_played,
     }
 
     save_size_cache(SIZE_CACHE)
 
-    return size, mtime
+    return size, mtime, last_played
 
 
 def game_list_changed(
@@ -265,10 +293,20 @@ def scan_games(base: Path) -> list[Game]:
                 path=item,
                 size=0,
                 mtime=0,#latest_activity(item),
+                last_played=0.0,
             )
         )
 
+    sort_games(games)
     return games
+
+def sort_games(games: list[Game]):
+    games.sort(
+        key=lambda g: (
+            -g.last_played,
+            natural_key(g.name),
+        )
+    )
 
 def verify_storage():
     if not POOL_DIR.is_mount():
@@ -288,7 +326,6 @@ class GameRow(ListItem):
 
     def __init__(self, game: Game):
         self.game = game
-
         self.label = Static()
 
         super().__init__(self.label)
@@ -316,6 +353,10 @@ class GameRow(ListItem):
     def refresh_row(self):
         self.label.update(
             self.build_line()
+        )
+        self.tooltip = (
+            f"Last Played: {fmt_time(self.game.last_played)}\n"
+            f"Modified:    {fmt_time(self.game.mtime)}"
         )
 
 
@@ -425,15 +466,22 @@ class GameArchiver(App):
 
     def compute_sizes(self):
         for game in self.shared_games:
-            game.size, game.mtime = cached_dir_info(game.path)
+            game.size, game.mtime, game.last_played = cached_dir_info(game.path)
             self.call_from_thread(self.refresh_game_row, game)
 
         for game in self.archived_games:
-            game.size, game.mtime = cached_dir_info(game.path)
+            game.size, game.mtime, game.last_played = cached_dir_info(game.path)
             self.call_from_thread(self.refresh_game_row, game)
 
         self.call_from_thread(self.sizes_finished)
         self.call_from_thread(self.update_status)
+        self.call_from_thread(self.resort_games)
+
+    def resort_games(self):
+        game = self.get_highlighted_game()
+        sort_games(self.shared_games)
+        sort_games(self.archived_games)
+        self.refresh_views(game)
 
     def sizes_finished(self):
         self.computing_sizes = False
@@ -479,8 +527,20 @@ class GameArchiver(App):
 
     # ========================================================
 
-    def refresh_views(self):
+    def get_highlighted_game(self) -> Game | None:
+        view = self.current_view()
 
+        if view.index is None:
+            return None
+
+        row = view.children[view.index]
+        game = row.game
+        return game
+
+    def refresh_views(
+            self,
+            highlighted_game: Game | None = None,
+        ):
         self.shared_view.clear()
         self.archived_view.clear()
 
@@ -493,6 +553,17 @@ class GameArchiver(App):
         )
 
         self.update_status()
+
+        if highlighted_game is not None:
+            for view in (
+                self.shared_view,
+                self.archived_view,
+            ):
+                for i, row in enumerate(view.children):
+                    if row.game.path == highlighted_game.path:
+                        view.focus()
+                        view.index = i
+                        return
 
     def update_status(self):
 
@@ -553,6 +624,7 @@ class GameArchiver(App):
         self.update_status()
 
     def action_auto_select(self):
+        game_saved = self.get_highlighted_game()
         if self.computing_sizes:
             self.notify(
                 "Please wait for size scan to finish."
@@ -583,9 +655,10 @@ class GameArchiver(App):
             game.selected = True
             freed += game.size
 
-        self.refresh_views()
+        self.refresh_views(game_saved)
 
     def action_move_selected(self):
+        game_saved = self.get_highlighted_game()
         if self.computing_sizes:
             self.notify(
                 "Please wait for size scan to finish."
@@ -624,7 +697,7 @@ class GameArchiver(App):
 
         self.shared_games = scan_games(SHARED_DIR)
         self.archived_games = scan_games(ARCHIVED_DIR)
-        self.refresh_views()
+        self.refresh_views(game_saved)
         self.start_scan()
 
     def move_games(self, games: list[Game], target: Path):
@@ -647,6 +720,7 @@ class GameArchiver(App):
 
 
     def action_refresh(self):
+        game_saved = self.get_highlighted_game()
         if self.computing_sizes:
             self.notify(
                 "Please wait for size scan to finish."
@@ -656,17 +730,13 @@ class GameArchiver(App):
         self.shared_games = scan_games(SHARED_DIR)
         self.archived_games = scan_games(ARCHIVED_DIR)
 
-        self.refresh_views()
+        self.refresh_views(game_saved)
         self.start_scan()
 
     def action_launch(self):
-        view = self.current_view()
-
-        if view.index is None:
+        game = self.get_highlighted_game()
+        if game is None:
             return
-
-        row = view.children[view.index]
-        game = row.game
 
         launch_dir = launch_path(game)
         launcher = find_launcher(launch_dir)
@@ -713,6 +783,23 @@ class GameArchiver(App):
             ]
         else:
             cmd = [str(launcher)]
+
+        key = str(game.path)
+
+        SIZE_CACHE.setdefault(key, {})
+
+        SIZE_CACHE[key]["last_played"] = time.time()
+        game.last_played = SIZE_CACHE[key]["last_played"]
+
+        save_size_cache(SIZE_CACHE)
+
+        if game in self.shared_games:
+            sort_games(self.shared_games)
+        else:
+            sort_games(self.archived_games)
+
+        self.refresh_views(game)
+
         subprocess.Popen(
             cmd,
             cwd=launch_dir,
