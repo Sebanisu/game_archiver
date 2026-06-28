@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 import subprocess
@@ -25,6 +26,10 @@ REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
 REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
 POOL_DIR = Path("/mnt/media/pool")
 CACHE_FILE = Path.home() / ".cache/game_archiver_sizes.json"
+PROTON = (
+    Path.home()
+    / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
+)
 
 SHARED_DIR = REMOTE_SHARED_DIR
 ARCHIVED_DIR = REMOTE_ARCHIVED_DIR
@@ -68,22 +73,27 @@ def launch_path(game: Game) -> Path:
     return game.path
 
 def find_launcher(path: Path) -> Path | None:
+    LAUNCHER_EXTS = (
+        ".sh",
+        ".AppImage",
+        ".x86_64",
+        ".exe",
+    )
+
     launchers = []
 
     for p in path.iterdir():
         if not p.is_file():
             continue
 
-        if p.suffix == ".sh":
-            launchers.append(p)
-        elif p.suffix in {
-            ".AppImage",
-            ".x86_64",
-        }:
+        if p.suffix in LAUNCHER_EXTS:
             launchers.append(p)
 
-    if not launchers:
-        return None
+    # Prefer Linux-native launchers.
+    for ext in LAUNCHER_EXTS:
+        for p in launchers:
+            if p.suffix == ext:
+                return p
 
     return launchers[0]
 
@@ -613,13 +623,37 @@ class GameArchiver(App):
             f"Launching {game.name} ({source})"
         )
 
+        env = os.environ.copy()
         if launcher.suffix == ".sh":
             cmd = ["bash", str(launcher)]
+        elif launcher.suffix == ".exe":
+            if not PROTON.exists():
+                self.notify("Proton not found")
+                return
+            compat = (
+                Path.home()
+                / ".local/share/game_archiver/compatdata"
+                / game.name
+            )
+
+            compat.mkdir(parents=True, exist_ok=True)
+
+            env["STEAM_COMPAT_DATA_PATH"] = str(compat)
+            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(
+                Path.home() / ".local/share/Steam"
+                )
+
+            cmd = [
+                str(PROTON),
+                "run",
+                str(launcher),
+            ]
         else:
             cmd = [str(launcher)]
         subprocess.Popen(
             cmd,
-            cwd=game.path,
+            cwd=launch_dir,
+            env=env,
             start_new_session=True,
         )
 
