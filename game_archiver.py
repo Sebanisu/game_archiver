@@ -347,9 +347,14 @@ class GameArchiver(App):
 
         self.computing_sizes = True
         self.game_rows = {}
+        self.sync_status = "Unknown"
 
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
+
+    def refresh_sync_status(self):
+        self.sync_status = local_sync_status()
+        self.update_status()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -416,6 +421,11 @@ class GameArchiver(App):
         self.shared_view.focus()
 
         self.start_scan()
+        
+        self.set_interval(
+            5,
+            self.refresh_sync_status,
+        )
 
     # ========================================================
 
@@ -451,14 +461,11 @@ class GameArchiver(App):
 
         scan_text = "    Computing sizes..." if self.computing_sizes else ""
 
-
-        sync = local_sync_status()
-
         text = (
             f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB    "
             f"To Archive: {fmt_size(selected_archive)}    "
             f"To Restore: {fmt_size(selected_restore)}    "
-            f"Sync: {sync}"
+            f"Sync: {self.sync_status}"
             f"{scan_text}"
         )
 
