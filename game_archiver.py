@@ -44,6 +44,14 @@ IGNORE_DIRS = {
     ".cache",
 }
 
+LAUNCHER_EXTS = (
+    ".sh",
+    ".AppImage",
+    ".x86_64",
+    ".exe",
+    ".swf",
+)
+
 
 # ============================================================
 # MODEL
@@ -73,29 +81,27 @@ def launch_path(game: Game) -> Path:
     return game.path
 
 def find_launcher(path: Path) -> Path | None:
-    LAUNCHER_EXTS = (
-        ".sh",
-        ".AppImage",
-        ".x86_64",
-        ".exe",
-    )
-
-    launchers = []
+    launchers: list[Path] = []
 
     for p in path.iterdir():
-        if not p.is_file():
-            continue
-
-        if p.suffix in LAUNCHER_EXTS:
+        if p.is_file() and p.suffix in LAUNCHER_EXTS:
             launchers.append(p)
 
-    # Prefer Linux-native launchers.
-    for ext in LAUNCHER_EXTS:
-        for p in launchers:
-            if p.suffix == ext:
-                return p
+        if p.is_dir():
+            for child in p.iterdir():
+                if child.is_file() and child.suffix in LAUNCHER_EXTS:
+                    launchers.append(child)
 
-    return launchers[0]
+    if not launchers:
+        return None
+
+    return min(
+        launchers,
+        key=lambda p: (
+            len(p.relative_to(path).parts),
+            LAUNCHER_EXTS.index(p.suffix),
+        ),
+    )
 
 def load_size_cache() -> dict:
     try:
@@ -188,13 +194,6 @@ def dir_size(path: Path) -> int:
 def latest_activity(path: Path) -> float:
     newest = 0.0
 
-    launcher_exts = {
-        ".sh",
-        ".exe",
-        ".AppImage",
-        ".x86_64",
-    }
-
     try:
         for p in path.rglob("*"):
 
@@ -210,7 +209,7 @@ def latest_activity(path: Path) -> float:
                 continue
 
             # prioritize launcher-like files
-            if p.suffix in launcher_exts:
+            if p.suffix in LAUNCHER_EXTS:
                 newest = max(newest, mtime + 10_000_000)
 
             newest = max(newest, mtime)
@@ -637,6 +636,8 @@ class GameArchiver(App):
         env = os.environ.copy()
         if launcher.suffix == ".sh":
             cmd = ["bash", str(launcher)]
+        elif launcher.suffix == ".swf":
+            cmd = ["ruffle", str(launcher)]
         elif launcher.suffix == ".exe":
             if not PROTON.exists():
                 self.notify("Proton not found")
