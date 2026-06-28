@@ -3,5 +3,6 @@
 # 2. Re-include the .gitignore file itself (highly recommended)
 !.gitignore
 !add_steam_entries.py
+!game_archiver.py
 !make_desktop_entries.sh
 !games.csv
