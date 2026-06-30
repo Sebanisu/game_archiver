@@ -8,7 +8,11 @@ import time
 import subprocess
 import json
 import re
+import binascii
+import ctypes
+import tempfile
 import vdf
+import shlex
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,12 +72,88 @@ class Game:
     mtime: float
     last_played: float = 0.0
     selected: bool = False
+    launcher: Path | None = None
+    in_steam: bool = False
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
+def shortcuts_path(user: SteamUser) -> Path:
+    return (
+        STEAM_DIR
+        / "userdata"
+        / user.userdata_id
+        / "config"
+        / "shortcuts.vdf"
+    )
+
+def load_shortcuts(user: SteamUser) -> dict:
+    path = shortcuts_path(user)
+
+    if not path.exists():
+        return {"shortcuts": {}}
+
+    try:
+        with path.open("rb") as f:
+            return vdf.binary_load(f)
+    except Exception:
+        return {"shortcuts": {}}
+
+def save_shortcuts(user: SteamUser, data: dict):
+    path = shortcuts_path(user)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent,
+        delete=False,
+    ) as tmp:
+        vdf.binary_dump(data, tmp)
+        tmp_path = Path(tmp.name)
+
+    tmp_path.replace(path)
+
+def normalize_exe(exe: str) -> str:
+    if not exe:
+        return ""
+
+    parts = shlex.split(exe)
+
+    if parts and parts[0] == "env":
+        for part in parts[1:]:
+            if "=" not in part:
+                return part
+        return ""
+
+    return parts[0]
+
+
+def find_existing_shortcut(entries: dict, launcher: Path):
+    target = normalize_exe(str(launcher))
+
+    for key, entry in entries.items():
+        exe = normalize_exe(
+            entry.get("Exe")
+            or entry.get("exe")
+            or ""
+        )
+
+        if exe == target:
+            return key
+
+    return None
+
+def generate_appid(exe: Path, stable_id: str) -> str:
+    crc = (
+        binascii.crc32(
+            (str(exe) + stable_id).encode("utf-8")
+        )
+        | 0x80000000
+    )
+
+    return str(crc & 0xFFFFFFFF)
 
 def fmt_time(ts: float) -> str:
     if not ts:
@@ -346,21 +426,26 @@ class GameRow(ListItem):
 
         size = fmt_size(self.game.size)
 
+        steam = "S" if self.game.in_steam else " "
+
         return (
             f"{mark} "
             f"{self.game.name:<45.45} "
             f"{size:>8} "
-            f"{date}"
+            f"{date} "
+            f"{steam}"
         )
 
     def refresh_row(self):
         self.label.update(
             self.build_line()
         )
-        self.tooltip = (
-            f"Last Played: {fmt_time(self.game.last_played)}\n"
-            f"Modified:    {fmt_time(self.game.mtime)}"
-        )
+        parts =[
+            f"{self.game.launcher}" if self.game.launcher else None,
+            f"Last Played: {fmt_time(self.game.last_played)}",
+            f"Modified:    {fmt_time(self.game.mtime)}",
+        ]
+        self.tooltip = "\n".join(part for part in parts if part)
 
 
 # ============================================================
@@ -415,6 +500,7 @@ class GameArchiver(App):
         super().__init__(**kwargs)
 
         self.computing_sizes = True
+        self.detecting_steam = True
         self.game_rows = {}
         self.sync_status = "Unknown"
 
@@ -423,6 +509,43 @@ class GameArchiver(App):
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
 
+   
+    def compute_steam_status(self):
+        user = self.current_steam_user()
+
+        if user is None:
+            return
+
+        shortcuts = load_shortcuts(user)
+        entries = shortcuts["shortcuts"]
+
+        for game in self.shared_games:
+            if(game.launcher is None):
+                game.launcher = find_launcher(launch_path(game))
+            game.in_steam = (
+                game.launcher is not None
+                and find_existing_shortcut(entries, game.launcher) is not None
+            )
+            self.call_from_thread(self.refresh_game_row, game)
+
+        for game in self.archived_games:
+            if(game.launcher is None):
+                game.launcher = find_launcher(launch_path(game))
+            game.in_steam = (
+                game.launcher is not None
+                and find_existing_shortcut(entries, game.launcher) is not None
+            )
+            self.call_from_thread(self.refresh_game_row, game)
+
+        self.call_from_thread(self.steam_scan_finished)
+        self.call_from_thread(self.update_status)
+
+    def start_steam_scan(self):
+        self.run_worker(
+            self.compute_steam_status,
+            thread=True,
+            name="compute-steam",
+        )
 
     def current_steam_user(self) -> SteamUser | None:
         if not self.steam_users:
@@ -498,9 +621,12 @@ class GameArchiver(App):
     def sizes_finished(self):
         self.computing_sizes = False
 
+    def steam_scan_finished(self):
+        self.detecting_steam = False
 
     def start_scan(self):
         self.computing_sizes = True
+        self.detecting_steam = True
         self.refresh_bindings()
         self.update_status()
 
@@ -526,6 +652,7 @@ class GameArchiver(App):
         self.shared_view.focus()
 
         self.start_scan()
+        self.start_steam_scan()
         
         self.set_interval(
             5,
@@ -601,17 +728,21 @@ class GameArchiver(App):
         else:
             steam_text = steam.display_name
 
-        scan_text = "    Computing sizes..." if self.computing_sizes else ""
 
-        text = (
-            f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB    "
-            f"To Archive: {fmt_size(selected_archive)}    "
-            f"To Restore: {fmt_size(selected_restore)}    "
-            f"Sync: {self.sync_status}    "
-            f"Steam: {steam_text}    "
-            f"{scan_text}"
-        )
+        scan_text = "Computing sizes..." if self.computing_sizes else ""
+        steam_scan_text = "Detecting Steam..." if self.detecting_steam else ""
 
+        parts = [
+            f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB",
+            f"To Archive: {fmt_size(selected_archive)}",
+            f"To Restore: {fmt_size(selected_restore)}",
+            f"Sync: {self.sync_status}",
+            f"Steam: {steam_text}",
+            f"{scan_text}",
+            f"{steam_scan_text}"
+        ]
+
+        text = "   ".join(part for part in parts if part)
         self.query_one("#status", Static).update(text)
 
     def current_view(self) -> ListView:
@@ -721,6 +852,7 @@ class GameArchiver(App):
         self.archived_games = scan_games(ARCHIVED_DIR)
         self.refresh_views(game_saved)
         self.start_scan()
+        self.start_steam_scan()
 
     def move_games(self, games: list[Game], target: Path):
 
@@ -754,16 +886,18 @@ class GameArchiver(App):
 
         self.refresh_views(game_saved)
         self.start_scan()
-
+        self.start_steam_scan()
     def action_launch(self):
         game = self.get_highlighted_game()
         if game is None:
             return
 
+        
         launch_dir = launch_path(game)
-        launcher = find_launcher(launch_dir)
+        if game.launcher is None:
+            game.launcher = find_launcher(launch_dir)
 
-        if launcher is None:
+        if game.launcher is None:
             self.notify("No launcher found")
             return
         source = (
@@ -777,11 +911,11 @@ class GameArchiver(App):
         )
 
         env = os.environ.copy()
-        if launcher.suffix == ".sh":
-            cmd = ["bash", str(launcher)]
-        elif launcher.suffix == ".swf":
-            cmd = ["ruffle", str(launcher)]
-        elif launcher.suffix == ".exe":
+        if game.launcher.suffix == ".sh":
+            cmd = ["bash", str(game.launcher)]
+        elif game.launcher.suffix == ".swf":
+            cmd = ["ruffle", str(game.launcher)]
+        elif game.launcher.suffix == ".exe":
             if not PROTON.exists():
                 self.notify("Proton not found")
                 return
@@ -801,10 +935,10 @@ class GameArchiver(App):
             cmd = [
                 str(PROTON),
                 "run",
-                str(launcher),
+                str(game.launcher),
             ]
         else:
-            cmd = [str(launcher)]
+            cmd = [str(game.launcher)]
 
         key = str(game.path)
 
@@ -824,7 +958,7 @@ class GameArchiver(App):
 
         subprocess.Popen(
             cmd,
-            cwd=launch_dir,
+            cwd=game.launcher.parent,
             env=env,
             start_new_session=True,
         )
@@ -934,6 +1068,18 @@ class GameArchiver(App):
         ) % len(self.steam_users)
 
         self.update_status()
+
+    def action_add_to_steam(self):
+        game = self.get_highlighted_game()
+
+        if game.in_steam:
+            self.notify("Already in Steam")
+            return
+
+        add_shortcut(game)
+
+        game.in_steam = True
+        self.refresh_game_row(game)
 
 
 # ============================================================
