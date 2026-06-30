@@ -8,6 +8,8 @@ import time
 import subprocess
 import json
 import re
+import vdf
+
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +73,7 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
 
 def fmt_time(ts: float) -> str:
     if not ts:
@@ -417,6 +420,15 @@ class GameArchiver(App):
 
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
+        self.steam_users = get_steam_users()
+        self.selected_steam_user = 0
+
+
+    def current_steam_user(self) -> SteamUser | None:
+        if not self.steam_users:
+            return None
+
+        return self.steam_users[self.selected_steam_user]
 
     def refresh_sync_status(self):
         self.sync_status = local_sync_status()
@@ -523,7 +535,10 @@ class GameArchiver(App):
             60,
             self.refresh_if_changed,
         )
-
+        if len(self.steam_users) > 1:
+            self.bind("[", "prev_steam_user", "Steam-")
+            self.bind("]", "next_steam_user", "Steam+")
+        self.refresh_bindings()
 
     # ========================================================
 
@@ -579,6 +594,12 @@ class GameArchiver(App):
             if g.selected
         )
 
+        steam = self.current_steam_user()
+
+        if steam is None:
+            steam_text = "None"
+        else:
+            steam_text = steam.display_name
 
         scan_text = "    Computing sizes..." if self.computing_sizes else ""
 
@@ -586,7 +607,8 @@ class GameArchiver(App):
             f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB    "
             f"To Archive: {fmt_size(selected_archive)}    "
             f"To Restore: {fmt_size(selected_restore)}    "
-            f"Sync: {self.sync_status}"
+            f"Sync: {self.sync_status}    "
+            f"Steam: {steam_text}    "
             f"{scan_text}"
         )
 
@@ -892,6 +914,89 @@ class GameArchiver(App):
             ],
             start_new_session=True,
         )
+    def action_next_steam_user(self):
+        if len(self.steam_users) <= 1:
+            return
+
+        self.selected_steam_user = (
+            self.selected_steam_user + 1
+        ) % len(self.steam_users)
+
+        self.update_status()
+
+
+    def action_prev_steam_user(self):
+        if len(self.steam_users) <= 1:
+            return
+
+        self.selected_steam_user = (
+            self.selected_steam_user - 1
+        ) % len(self.steam_users)
+
+        self.update_status()
+
+
+# ============================================================
+# STEAM
+# ============================================================
+
+STEAM_DIR = Path.home() / ".steam/steam"
+
+
+@dataclass
+class SteamUser:
+    userdata_id: str
+    persona_name: str | None
+
+    @property
+    def display_name(self) -> str:
+        if self.persona_name:
+            return f"{self.persona_name} ({self.userdata_id})"
+        return self.userdata_id
+
+
+def get_steam_users() -> list[SteamUser]:
+    users: list[SteamUser] = []
+
+    userdata = STEAM_DIR / "userdata"
+    loginusers = STEAM_DIR / "config/loginusers.vdf"
+
+    persona_lookup = {}
+
+    if loginusers.exists():
+        try:
+            with loginusers.open(encoding="utf-8") as f:
+                data = vdf.load(f)
+
+            for steamid64, info in data.get("users", {}).items():
+                userdata_id = str(int(steamid64) - 76561197960265728)
+
+                persona_lookup[userdata_id] = (
+                    info.get("PersonaName")
+                    or info.get("AccountName")
+                )
+        except Exception:
+            pass
+
+    if userdata.exists():
+        for p in sorted(userdata.iterdir()):
+            if not p.is_dir():
+                continue
+
+            if not p.name.isdigit():
+                continue
+
+            if p.name == "0":
+                continue
+
+            users.append(
+                SteamUser(
+                    userdata_id=p.name,
+                    persona_name=persona_lookup.get(p.name),
+                )
+            )
+
+    return users
 # ============================================================
 # MAIN
 # ============================================================
