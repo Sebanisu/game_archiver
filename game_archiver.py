@@ -37,6 +37,21 @@ PROTON = (
     Path.home()
     / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
 )
+BAD_LAUNCHER_NAMES = (
+    "unins",
+    "uninstall",
+    "setup",
+    "install",
+    "config",
+    "configure",
+    "crash",
+    "crashpad",
+    "updater",
+    "update",
+    "dxsetup",
+    "vc_redist",
+    "redist",
+)
 
 SHARED_DIR = REMOTE_SHARED_DIR
 ARCHIVED_DIR = REMOTE_ARCHIVED_DIR
@@ -65,6 +80,56 @@ LAUNCHER_EXTS = (
 # ============================================================
 
 @dataclass
+class LaunchInfo:
+    cmd: list[str]
+    cwd: Path
+    env: dict[str, str]
+
+def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
+    launcher = game.launcher
+    if launcher is None:
+        raise ValueError("Game has no launcher")
+
+    env = os.environ.copy()
+
+    if launcher.suffix == ".sh":
+        cmd = ["bash", str(launcher)]
+
+    elif launcher.suffix == ".swf":
+        cmd = ["ruffle", str(launcher)]
+
+    elif launcher.suffix == ".exe":
+        if for_steam:
+            cmd = [str(launcher)]
+        else:
+            compat = (
+                Path.home()
+                / ".local/share/game_archiver/compatdata"
+                / game.name
+            )
+
+            compat.mkdir(parents=True, exist_ok=True)
+
+            env["STEAM_COMPAT_DATA_PATH"] = str(compat)
+            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(
+                Path.home() / ".local/share/Steam"
+            )
+
+            cmd = [
+                str(PROTON),
+                "run",
+                str(launcher),
+            ]
+    else:
+        cmd = [str(launcher)]
+
+    return LaunchInfo(
+        cmd=cmd,
+        cwd=launcher.parent,
+        env=env,
+    )
+
+@dataclass
 class Game:
     name: str
     path: Path
@@ -79,6 +144,50 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+def launcher_score(path: Path, root: Path):
+    name = path.stem.casefold()
+
+    score = 0
+
+    if any(bad in name for bad in BAD_LAUNCHER_NAMES):
+        score += 1000
+
+    return (
+        score,
+        len(path.relative_to(root).parts),
+        LAUNCHER_EXTS.index(path.suffix),
+        natural_key(path.stem),
+    )
+
+def make_shortcut(game: Game) -> dict:
+    launcher = game.launcher
+    assert launcher is not None
+    info = get_launch_info(game, for_steam=True);
+
+
+    return {
+        "appid": generate_appid(launcher, game.name),
+        "AppName": game.name,
+        "Exe": f'"{info.cmd[0]}"',
+        "StartDir": f'"{info.cwd}"',
+        "icon": "",
+        "ShortcutPath": "",
+        "LaunchOptions": " ".join(
+            shlex.quote(arg)
+            for arg in info.cmd[1:]
+        ),
+        "IsHidden": 0,
+        "AllowDesktopConfig": 1,
+        "AllowOverlay": 1,
+        "OpenVR": 0,
+        "Devkit": 0,
+        "DevkitGameID": "",
+        "LastPlayTime": 0,
+        "tags": {
+            "0": "Non-Steam",
+        },
+    }
 
 def shortcuts_path(user: SteamUser) -> Path:
     return (
@@ -199,10 +308,7 @@ def find_launcher(path: Path) -> Path | None:
 
     return min(
         launchers,
-        key=lambda p: (
-            len(p.relative_to(path).parts),
-            LAUNCHER_EXTS.index(p.suffix),
-        ),
+        key=lambda p: launcher_score(p, path),
     )
 
 def load_size_cache() -> dict:
@@ -509,6 +615,21 @@ class GameArchiver(App):
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
 
+    def add_shortcut(self, game: Game):
+        user = self.current_steam_user()
+        shortcuts = load_shortcuts(user)
+
+        entries = shortcuts["shortcuts"]
+
+        if find_existing_shortcut(entries, game.launcher):
+            return False
+
+        index = max((int(k) for k in entries), default=-1) + 1
+        entries[str(index)] = make_shortcut(game)
+
+        save_shortcuts(user, shortcuts)
+
+        return True
    
     def compute_steam_status(self):
         user = self.current_steam_user()
@@ -887,58 +1008,11 @@ class GameArchiver(App):
         self.refresh_views(game_saved)
         self.start_scan()
         self.start_steam_scan()
+
     def action_launch(self):
         game = self.get_highlighted_game()
         if game is None:
             return
-
-        
-        launch_dir = launch_path(game)
-        if game.launcher is None:
-            game.launcher = find_launcher(launch_dir)
-
-        if game.launcher is None:
-            self.notify("No launcher found")
-            return
-        source = (
-            "local"
-            if launch_dir.parent == LOCAL_SHARED_DIR
-            else "remote"
-        )
-
-        self.notify(
-            f"Launching {game.name} ({source})"
-        )
-
-        env = os.environ.copy()
-        if game.launcher.suffix == ".sh":
-            cmd = ["bash", str(game.launcher)]
-        elif game.launcher.suffix == ".swf":
-            cmd = ["ruffle", str(game.launcher)]
-        elif game.launcher.suffix == ".exe":
-            if not PROTON.exists():
-                self.notify("Proton not found")
-                return
-            compat = (
-                Path.home()
-                / ".local/share/game_archiver/compatdata"
-                / game.name
-            )
-
-            compat.mkdir(parents=True, exist_ok=True)
-
-            env["STEAM_COMPAT_DATA_PATH"] = str(compat)
-            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(
-                Path.home() / ".local/share/Steam"
-                )
-
-            cmd = [
-                str(PROTON),
-                "run",
-                str(game.launcher),
-            ]
-        else:
-            cmd = [str(game.launcher)]
 
         key = str(game.path)
 
@@ -956,10 +1030,12 @@ class GameArchiver(App):
 
         self.refresh_views(game)
 
+        info = get_launch_info(game)
+
         subprocess.Popen(
-            cmd,
-            cwd=game.launcher.parent,
-            env=env,
+            info.cmd,
+            cwd=info.cwd,
+            env=info.env,
             start_new_session=True,
         )
 
