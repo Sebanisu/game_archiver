@@ -37,6 +37,9 @@ PROTON = (
     Path.home()
     / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
 )
+ICON_FALLBACK = Path(
+    "/usr/share/icons/hicolor/256x256/apps/steam.png"
+)
 BAD_LAUNCHER_NAMES = (
     "unins",
     "uninstall",
@@ -115,6 +118,9 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
                 Path.home() / ".local/share/Steam"
             )
 
+            #env["WINE_FULLSCREEN_FSR"] = "1"
+            #env["DXVK_HUD"] = "full"
+
             cmd = [
                 str(PROTON),
                 "run",
@@ -138,12 +144,51 @@ class Game:
     last_played: float = 0.0
     selected: bool = False
     launcher: Path | None = None
+    icon: Path | None = None
     in_steam: bool = False
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+
+def find_icon(root: Path) -> Path:
+    best_icon: Path | None = None
+    best_size = -1
+
+    for current, dirs, files in os.walk(root):
+        depth = len(Path(current).relative_to(root).parts)
+
+        if depth > 3:
+            dirs[:] = []
+            continue
+
+        for file in sorted(files):
+            path = Path(current) / file
+            name = file.casefold()
+
+            # Best possible icon
+            if name == "window_icon.png":
+                return path
+
+            # icon256.png / icon-512.png / icon_128.png
+            if match := re.search(r"icon[-_]?(\d+)", name):
+                size = int(match.group(1))
+                if size > best_size:
+                    best_size = size
+                    best_icon = path
+                continue
+
+            # Fallbacks
+            if best_icon is None:
+                if (
+                    name == "icon.png"
+                    or name == "android-icon_foreground.png"
+                    or path.suffix.casefold() == ".ico"
+                ):
+                    best_icon = path
+
+    return best_icon or ICON_FALLBACK
 
 def launcher_score(path: Path, root: Path):
     name = path.stem.casefold()
@@ -171,7 +216,7 @@ def make_shortcut(game: Game) -> dict:
         "AppName": game.name,
         "Exe": f'"{info.cmd[0]}"',
         "StartDir": f'"{info.cwd}"',
-        "icon": "",
+        "icon": str(game.icon) if game.icon is not None else "",
         "ShortcutPath": "",
         "LaunchOptions": " ".join(
             shlex.quote(arg)
@@ -642,7 +687,9 @@ class GameArchiver(App):
 
         for game in self.shared_games:
             if(game.launcher is None):
-                game.launcher = find_launcher(launch_path(game))
+                game.launcher = find_launcher(launch_path(game))            
+            if game.icon is None:
+                game.icon = find_icon(launch_path(game))    
             game.in_steam = (
                 game.launcher is not None
                 and find_existing_shortcut(entries, game.launcher) is not None
@@ -652,6 +699,8 @@ class GameArchiver(App):
         for game in self.archived_games:
             if(game.launcher is None):
                 game.launcher = find_launcher(launch_path(game))
+            if game.icon is None:
+                game.icon = find_icon(launch_path(game))
             game.in_steam = (
                 game.launcher is not None
                 and find_existing_shortcut(entries, game.launcher) is not None
