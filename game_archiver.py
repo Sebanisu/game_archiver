@@ -2,32 +2,55 @@
 
 from __future__ import annotations
 
-import os
-import shutil
-import time
-import subprocess
-import json
-import re
 import binascii
 import ctypes
-import tempfile
-import vdf
+import hashlib
+import json
+import os
+import re
 import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+import tomllib
+import webbrowser
 
 from dataclasses import dataclass
 from pathlib import Path
 
+from PIL import Image
+
+import vdf
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import Footer, Header, ListItem, ListView, Static
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Static,
+)
 
+try:
+    import tomli_w
+except ImportError:
+    tomli_w = None
 
 
 # ============================================================
 # CONFIG
 # ============================================================
+CONFIG_DIR = Path.home() / ".config/game_archiver"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
 
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_SHARED_DIR = Path.home() / "Games/shared"
 REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
 REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
@@ -75,7 +98,15 @@ LAUNCHER_EXTS = (
     ".x86_64",
     ".exe",
     ".swf",
+    ".apk"
 )
+
+ICON_CACHE = (
+    Path.home()
+    / ".cache/game_archiver/icons"
+)
+ICON_CACHE.mkdir(parents=True, exist_ok=True)
+
 
 
 # ============================================================
@@ -96,10 +127,22 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
     env = os.environ.copy()
 
     if launcher.suffix == ".sh":
-        cmd = ["bash", str(launcher)]
+        cmd = (
+            [str(launcher)]
+            if for_steam
+            else ["bash", str(launcher)]
+        )
 
     elif launcher.suffix == ".swf":
         cmd = ["ruffle", str(launcher)]
+        
+    elif launcher.suffix == ".apk" and for_steam == False:
+        cmd = [
+            "waydroid",
+            "app",
+            "install",
+            str(launcher),
+        ]
 
     elif launcher.suffix == ".exe":
         if for_steam:
@@ -148,11 +191,162 @@ class Game:
     steam_key: str | None = None
     steam_entry: dict | None = None
     in_steam: bool = False
+    steam_broken: bool = False
+    duplicate_steam: bool = False
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+def launcher_signature(path: str | Path) -> tuple[str, str]:
+    path = Path(normalize_exe(str(path)))
+
+    if len(path.parts) >= 2:
+        return (
+            path.parent.name.casefold(),
+            path.name.casefold(),
+        )
+
+    return ("", path.name.casefold())
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return {}
+
+    with CONFIG_FILE.open("rb") as f:
+        return tomllib.load(f)
+
+
+def save_config(config: dict):
+    if tomli_w is None:
+        raise RuntimeError("tomli-w is required to save config.")
+
+    with CONFIG_FILE.open("wb") as f:
+        tomli_w.dump(config, f)
+
+
+async def get_steamgriddb_api_key(app) -> str | None:
+    config = load_config()
+
+    key = (
+        config.get("steamgriddb", {})
+        .get("api_key")
+    )
+
+    if key:
+        return key
+
+    while True:
+        choice = await app.push_screen_wait(
+            OptionDialog(
+                title="SteamGridDB",
+                message=(
+                    "SteamGridDB API key is required.\n\n"
+                    "Open the API page?"
+                ),
+                options=[
+                    ("Open", "open"),
+                    ("Paste Key", "paste"),
+                    ("Cancel", "cancel"),
+                ],
+            )
+        )
+
+        if choice == "cancel":
+            return None
+
+        if choice == "open":
+            webbrowser.open(
+                "https://www.steamgriddb.com/profile/preferences/api"
+            )
+            continue
+
+        if choice == "paste":
+            key = await app.push_screen_wait(
+                InputDialog(
+                    title="SteamGridDB API Key",
+                    prompt="Paste your API key:",
+                    placeholder="Paste API key...",
+                    password=False,
+                )
+            )
+
+            if not key:
+                continue
+
+            config.setdefault(
+                "steamgriddb",
+                {},
+            )["api_key"] = key.strip()
+
+            save_config(config)
+
+            return key.strip()
+
+
+def extract_exe_icon(exe: Path) -> Path | None:
+    key = hashlib.sha1(
+        f"{exe.resolve()}:{exe.stat().st_mtime_ns}".encode()
+    ).hexdigest()
+
+    out_dir = ICON_CACHE / key
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pngs = list(out_dir.glob("*.png"))
+    if pngs:
+        return max(
+            pngs,
+            key=lambda p: Image.open(p).width,
+        )
+
+    try:
+        subprocess.run(
+            [
+                "wrestool",
+                "-x",
+                "-t14",
+                "-o",
+                str(out_dir),
+                str(exe),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        ico_files = list(out_dir.glob("*.ico"))
+
+        if not ico_files:
+            return None
+
+        subprocess.run(
+            [
+                "icotool",
+                "-x",
+                "-o",
+                str(out_dir),
+                *map(str, ico_files),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        pngs = list(out_dir.glob("*.png"))
+
+        if not pngs:
+            return None
+
+        return max(
+            pngs,
+            key=lambda p: Image.open(p).width,
+        )
+
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+    ):
+        return None
 
 def steam_running() -> bool:
     try:
@@ -168,6 +362,7 @@ def steam_running() -> bool:
 
 def find_icon(root: Path) -> Path:
     best_icon: Path | None = None
+    best_exe: Path | None = None
     best_size = -1
 
     for current, dirs, files in os.walk(root):
@@ -180,6 +375,13 @@ def find_icon(root: Path) -> Path:
         for file in sorted(files):
             path = Path(current) / file
             name = file.casefold()
+            if path.suffix.casefold() == ".exe":
+                if (
+                    best_exe is None
+                    or launcher_score(path, root)
+                    < launcher_score(best_exe, root)
+                ):
+                    best_exe = path
 
             # Best possible icon
             if name == "window_icon.png":
@@ -202,7 +404,14 @@ def find_icon(root: Path) -> Path:
                 ):
                     best_icon = path
 
-    return best_icon or ICON_FALLBACK
+    if best_icon is not None:
+        return best_icon
+
+    if best_exe is not None:
+        if icon := extract_exe_icon(best_exe):
+            return icon
+
+    return ICON_FALLBACK
 
 def launcher_score(path: Path, root: Path):
     name = path.stem.casefold()
@@ -285,31 +494,94 @@ def save_shortcuts(user: SteamUser, data: dict):
     tmp_path.replace(path)
 
 def normalize_exe(exe: str) -> str:
+    exe = exe.strip()
+
     if not exe:
         return ""
 
-    parts = shlex.split(exe)
+    # Strip surrounding quotes only.
+    if (
+        len(exe) >= 2
+        and exe[0] == exe[-1]
+        and exe[0] in "\"'"
+    ):
+        exe = exe[1:-1]
 
-    if parts and parts[0] == "env":
+    if exe.startswith("env "):
+        parts = shlex.split(exe)
+
         for part in parts[1:]:
             if "=" not in part:
                 return part
+
         return ""
 
-    return parts[0]
+    return exe
+def shortcut_target(entry: dict) -> str:
+    exe = normalize_exe(
+        entry.get("Exe")
+        or entry.get("exe")
+        or ""
+    )
+
+    launch_options = (
+        entry.get("LaunchOptions")
+        or entry.get("launchoptions")
+        or ""
+    )
+
+    # Old shortcuts:
+    # Exe = "bash"
+    # LaunchOptions = "/path/to/game.sh"
+    if Path(exe).name == "bash":
+        try:
+            args = shlex.split(launch_options)
+        except ValueError:
+            return exe
+
+        for arg in args:
+            if arg.endswith(".sh"):
+                return normalize_exe(arg)
+
+    return exe
 
 
-def find_existing_shortcut(entries: dict, launcher: Path):
-    target = normalize_exe(str(launcher))
+def find_existing_shortcut(
+    entries: dict,
+    game: Game,
+):
+    target_name = game.name.casefold()
+    target_exe = (
+        normalize_exe(str(game.launcher))
+        if game.launcher
+        else ""
+    )
+
+    # First look for matching launcher
+    for key, entry in entries.items():
+        exe = shortcut_target(entry)
+
+        if exe == target_exe:
+            return key
+
+    # Then fall back to matching launcher signature
+    target = launcher_signature(target_exe)
 
     for key, entry in entries.items():
-        exe = normalize_exe(
-            entry.get("Exe")
-            or entry.get("exe")
-            or ""
-        )
+        exe = shortcut_target(entry)
 
-        if exe == target:
+        if launcher_signature(exe) == target:
+            return key
+
+    # Finally fall back to matching game name
+    for key, entry in entries.items():
+        name = (
+            entry.get("AppName")
+            or entry.get("appname")
+            or ""
+        ).casefold()
+
+        if name == target_name:
             return key
 
     return None
@@ -593,7 +865,14 @@ class GameRow(ListItem):
 
         size = fmt_size(self.game.size)
 
-        steam = "S" if self.game.in_steam else " "
+        if self.game.duplicate_steam:
+            steam = "D"
+        elif self.game.steam_broken:
+            steam = "!"
+        elif self.game.in_steam:
+            steam = "S"
+        else:
+            steam = " "
 
         return (
             f"{mark} "
@@ -607,11 +886,26 @@ class GameRow(ListItem):
         self.label.update(
             self.build_line()
         )
-        parts =[
-            f"{self.game.launcher}" if self.game.launcher else None,
+        parts = [
+            f"Launcher: {self.game.launcher}" if self.game.launcher else None,
+            "Steam: Duplicate shortcut exists" if self.game.duplicate_steam else None,
+            "Steam: Shortcut path is out of date" if self.game.steam_broken else None,
+            "Steam: Shortcut is synchronized"
+                if self.game.in_steam
+                and not self.game.steam_broken
+                and not self.game.duplicate_steam
+                else None,
             f"Last Played: {fmt_time(self.game.last_played)}",
             f"Modified:    {fmt_time(self.game.mtime)}",
         ]
+        if self.game.steam_entry:
+            parts.append(
+                f"Steam Exe: {self.game.steam_entry['Exe']}")
+            launch_options = self.game.steam_entry.get("LaunchOptions", "")
+            if launch_options:
+                parts.append(
+                    f"Steam LaunchOptions: {launch_options}"
+                )            
         self.tooltip = "\n".join(part for part in parts if part)
 
 
@@ -661,6 +955,8 @@ class GameArchiver(App):
         Binding("t", "terminal", "Terminal"),
         Binding("s", "remote_terminal", "SSH"),
         Binding("u", "sync_shortcut", "Sync Steam"),
+        Binding("ctrl+a", "select_all", "Select All"),
+        Binding("g", "download_steamgriddb", "SteamGridDB"),
     ]
 
 
@@ -678,6 +974,8 @@ class GameArchiver(App):
         self.selected_steam_user = 0
 
     def sync_shortcut(self, game: Game) -> bool:
+        if game.duplicate_steam:
+            return False
         user = self.current_steam_user()
 
         if user is None:
@@ -689,10 +987,7 @@ class GameArchiver(App):
         shortcuts = load_shortcuts(user)
         entries = shortcuts["shortcuts"]
 
-        key = find_existing_shortcut(
-            entries,
-            game.launcher,
-        )
+        key = game.steam_key
 
         desired = make_shortcut(game)
 
@@ -728,6 +1023,11 @@ class GameArchiver(App):
         return changed
    
     def can_modify_steam(self) -> bool:
+        if self.detecting_steam:
+            self.notify(
+                "Please wait for the Steam scan to finish."
+            )
+            return False
         if steam_running():
             self.notify(
                 "Steam is running. Close Steam before modifying shortcuts."
@@ -735,6 +1035,55 @@ class GameArchiver(App):
             return False
 
         return True
+
+    def update_game_steam_status(
+        self,
+        game: Game,
+        entries: dict,
+    ):
+        if game.launcher is None:
+            game.launcher = find_launcher(launch_path(game))
+
+        if game.icon is None:
+            game.icon = find_icon(launch_path(game))
+
+        game.in_steam = False
+        game.steam_broken = False
+        game.duplicate_steam = False
+        game.steam_key = None
+        game.steam_entry = None
+
+        if game.launcher is None:
+            return
+
+        key = find_existing_shortcut(
+            entries,
+            game,
+        )
+
+        if key is None:
+            return
+
+        game.in_steam = True
+
+        entry = entries[key]
+        exe = shortcut_target(entry)
+        expected = normalize_exe(str(game.launcher))
+
+        if exe != expected:
+            if Path(exe).exists():
+                game.duplicate_steam = True
+                self.notify(
+                    f"{repr(exe)} == {repr(expected)}"
+                )
+                self.notify(
+                    f"{len(exe)} == {len(expected)}"
+                )
+            else:
+                game.steam_broken = True
+
+        game.steam_key = key
+        game.steam_entry = entry
 
     def compute_steam_status(self):
         user = self.current_steam_user()
@@ -745,27 +1094,16 @@ class GameArchiver(App):
         shortcuts = load_shortcuts(user)
         entries = shortcuts["shortcuts"]
 
-        for game in self.shared_games:
-            if(game.launcher is None):
-                game.launcher = find_launcher(launch_path(game))            
-            if game.icon is None:
-                game.icon = find_icon(launch_path(game))    
-            game.in_steam = (
-                game.launcher is not None
-                and find_existing_shortcut(entries, game.launcher) is not None
+        for game in self.shared_games + self.archived_games:
+            self.update_game_steam_status(
+                game,
+                entries,
             )
-            self.call_from_thread(self.refresh_game_row, game)
 
-        for game in self.archived_games:
-            if(game.launcher is None):
-                game.launcher = find_launcher(launch_path(game))
-            if game.icon is None:
-                game.icon = find_icon(launch_path(game))
-            game.in_steam = (
-                game.launcher is not None
-                and find_existing_shortcut(entries, game.launcher) is not None
+            self.call_from_thread(
+                self.refresh_game_row,
+                game,
             )
-            self.call_from_thread(self.refresh_game_row, game)
 
         self.call_from_thread(self.steam_scan_finished)
         self.call_from_thread(self.update_status)
@@ -1283,18 +1621,64 @@ class GameArchiver(App):
         if not self.can_modify_steam():
             return
 
-        game = self.get_highlighted_game()
+        if self.shared_view.has_focus:
+            games = [g for g in self.shared_games if g.selected]
+        else:
+            games = [g for g in self.archived_games if g.selected]
 
-        if game is None:
+        if not games:
+            game = self.get_highlighted_game()
+            if game is None:
+                self.notify("No games selected or highlighted.")
+                return
+            games = [game]
+
+        shortcuts = load_shortcuts(self.current_steam_user())
+        entries = shortcuts["shortcuts"]
+
+        updated = 0
+
+        for game in games:
+            if self.sync_shortcut(game):
+                updated += 1
+
+        # Reload after any changes
+        shortcuts = load_shortcuts(self.current_steam_user())
+        entries = shortcuts["shortcuts"]
+
+        for game in games:
+            self.update_game_steam_status(game, entries)
+            self.refresh_game_row(game)
+
+        self.notify(
+            f"Updated {updated} Steam shortcut{'s' if updated != 1 else ''}."
+        )
+
+    def action_select_all(self):
+        if self.shared_view.has_focus:
+            games = self.shared_games
+        else:
+            games = self.archived_games
+
+        if not games:
+            self.notify("No games.")
             return
 
-        if self.sync_shortcut(game):
-            self.notify("Steam shortcut updated.")
-        else:
-            self.notify("No changes.")
+        for game in games:
+            if not game.selected:
+                game.selected = True
+                self.refresh_game_row(game)
 
-        self.refresh_game_row(game)
+        self.update_status()
+    @work
+    async def action_download_steamgriddb(self):
+        key = await get_steamgriddb_api_key(self)
 
+        if key is None:
+            return
+
+        # Create the client
+        client = SteamGridDBClient(key)
 
 # ============================================================
 # STEAM
@@ -1357,6 +1741,160 @@ def get_steam_users() -> list[SteamUser]:
             )
 
     return users
+
+# ============================================================
+# Option Dialog
+# ============================================================
+class OptionDialog(ModalScreen[str | None]):
+    DEFAULT_CSS = """
+    OptionDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 60;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #buttons {
+        align-horizontal: center;
+        margin-top: 1;
+    }
+
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        options: list[tuple[str, str]],
+    ):
+        super().__init__()
+        self.title = title
+        self.message = message
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"[b]{self.title}[/b]")
+            yield Label(self.message)
+
+            with Horizontal(id="buttons"):
+                for text, value in self.options:
+                    yield Button(
+                        text,
+                        id=value,
+                    )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        self.dismiss(event.button.id)
+
+    def action_dismiss(self):
+        self.dismiss(None)
+
+# ============================================================
+# Input Dialog
+# ============================================================
+class InputDialog(ModalScreen[str | None]):
+    DEFAULT_CSS = """
+    InputDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 70;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #buttons {
+        align-horizontal: right;
+        margin-top: 1;
+    }
+
+    Input {
+        margin-top: 1;
+    }
+
+    Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        title: str,
+        prompt: str,
+        value: str = "",
+        placeholder: str = "",
+        password: bool = False,
+    ):
+        super().__init__()
+        self.title = title
+        self.prompt = prompt
+        self.value = value
+        self.placeholder = placeholder
+        self.password = password
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"[b]{self.title}[/b]")
+            yield Label(self.prompt)
+            yield Input(
+                value=self.value,
+                placeholder=self.placeholder,
+                password=self.password,
+                id="input",
+            )
+
+            with Horizontal(id="buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button(
+                    "OK",
+                    id="ok",
+                    variant="primary",
+                )
+
+    def on_mount(self):
+        self.query_one(Input).focus()
+
+    def on_input_submitted(
+        self,
+        event: Input.Submitted,
+    ):
+        self.dismiss(event.value)
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        if event.button.id == "ok":
+            self.dismiss(
+                self.query_one(Input).value
+            )
+        else:
+            self.dismiss(None)
+
+    def action_dismiss(self):
+        self.dismiss(None)
+
+# ============================================================
+# SteamGridDB Client
+# ============================================================
+class SteamGridDBClient:
+    BASE_URL = "https://www.steamgriddb.com/api/v2"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 # ============================================================
 # MAIN
 # ============================================================
