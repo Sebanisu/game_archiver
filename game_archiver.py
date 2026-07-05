@@ -152,6 +152,18 @@ class Game:
 # HELPERS
 # ============================================================
 
+def steam_running() -> bool:
+    try:
+        subprocess.run(
+            ["pgrep", "-x", "steam"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
 def find_icon(root: Path) -> Path:
     best_icon: Path | None = None
     best_size = -1
@@ -204,6 +216,7 @@ def launcher_score(path: Path, root: Path):
         LAUNCHER_EXTS.index(path.suffix),
         natural_key(path.stem),
     )
+
 
 def make_shortcut(game: Game) -> dict:
     launcher = game.launcher
@@ -644,6 +657,7 @@ class GameArchiver(App):
         Binding("p", "open_remote_folder", "Open Remote"),
         Binding("t", "terminal", "Terminal"),
         Binding("s", "remote_terminal", "SSH"),
+        Binding("u", "sync_shortcut", "Sync Steam"),
     ]
 
 
@@ -660,22 +674,63 @@ class GameArchiver(App):
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
 
-    def add_shortcut(self, game: Game):
+    def sync_shortcut(self, game: Game) -> bool:
         user = self.current_steam_user()
-        shortcuts = load_shortcuts(user)
 
-        entries = shortcuts["shortcuts"]
-
-        if find_existing_shortcut(entries, game.launcher):
+        if user is None:
             return False
 
-        index = max((int(k) for k in entries), default=-1) + 1
-        entries[str(index)] = make_shortcut(game)
+        if game.launcher is None:
+            return False
 
-        save_shortcuts(user, shortcuts)
+        shortcuts = load_shortcuts(user)
+        entries = shortcuts["shortcuts"]
+
+        key = find_existing_shortcut(
+            entries,
+            game.launcher,
+        )
+
+        desired = make_shortcut(game)
+
+        changed = False
+
+        if key is None:
+            index = (
+                max((int(k) for k in entries), default=-1)
+                + 1
+            )
+
+            entries[str(index)] = desired
+            changed = True
+
+        else:
+            existing = entries[key]
+
+            for field, value in desired.items():
+                if existing.get(field) != value:
+                    existing[field] = value
+                    changed = True
+
+        if changed:
+            save_shortcuts(
+                user,
+                shortcuts,
+            )
+
+        game.in_steam = True
+
+        return changed
+   
+    def can_modify_steam(self) -> bool:
+        if steam_running():
+            self.notify(
+                "Steam is running. Close Steam before modifying shortcuts."
+            )
+            return False
 
         return True
-   
+
     def compute_steam_status(self):
         user = self.current_steam_user()
 
@@ -1194,16 +1249,20 @@ class GameArchiver(App):
 
         self.update_status()
 
-    def action_add_to_steam(self):
-        game = self.get_highlighted_game()
-
-        if game.in_steam:
-            self.notify("Already in Steam")
+    def action_sync_shortcut(self):
+        if not self.can_modify_steam():
             return
 
-        add_shortcut(game)
+        game = self.get_highlighted_game()
 
-        game.in_steam = True
+        if game is None:
+            return
+
+        if self.sync_shortcut(game):
+            self.notify("Steam shortcut updated.")
+        else:
+            self.notify("No changes.")
+
         self.refresh_game_row(game)
 
 
