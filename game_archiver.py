@@ -443,6 +443,7 @@ def game_list_changed(
         for p in path.iterdir()
         if p.is_dir()
     }
+    
 
     return current != cached
 
@@ -788,6 +789,7 @@ class GameArchiver(App):
 
 
     def refresh_if_changed(self):
+
         if (
             game_list_changed(
                 SHARED_DIR,
@@ -799,7 +801,24 @@ class GameArchiver(App):
             )
         ):
             self.action_refresh()
+            return
+        self.refresh_launchers()
 
+    def refresh_launchers(self):
+        if not self.can_modify_steam():
+            return
+
+        for game in self.shared_games + self.archived_games:
+            launcher = find_launcher(launch_path(game))
+
+            if (launcher != game.launcher):
+                game.launcher = launcher
+                game.icon = find_icon(launch_path(game))
+
+                if game.in_steam:
+                    self.sync_shortcut(game)
+
+                self.refresh_game_row(game)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1040,6 +1059,8 @@ class GameArchiver(App):
         self.refresh_views(game_saved)
 
     def action_move_selected(self):
+        if not self.can_modify_steam():
+            return
         game_saved = self.get_highlighted_game()
         if self.computing_sizes:
             self.notify(
@@ -1093,13 +1114,18 @@ class GameArchiver(App):
         )
 
         for game in moving:
-
             self.notify(f"Moving {game.name}")
+            old_path = game.path
 
-            shutil.move(
-                str(game.path),
-                str(target / game.path.name)
-            )
+            new_path = target / game.name
+
+            shutil.move(old_path, new_path)
+
+            game.path = new_path
+            game.launcher = find_launcher(launch_path(game))
+            game.icon = find_icon(launch_path(game))
+
+            self.sync_shortcut(game)
 
 
     def action_refresh(self):
