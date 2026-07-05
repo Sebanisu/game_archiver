@@ -145,6 +145,8 @@ class Game:
     selected: bool = False
     launcher: Path | None = None
     icon: Path | None = None
+    steam_key: str | None = None
+    steam_entry: dict | None = None
     in_steam: bool = False
 
 
@@ -718,7 +720,9 @@ class GameArchiver(App):
                 shortcuts,
             )
 
-        game.in_steam = True
+        game.steam_key = key
+        game.steam_entry = entries.get(key) if key else None
+        game.in_steam = key is not None
 
         return changed
    
