@@ -1786,6 +1786,25 @@ class GameArchiver(App):
                     "id": selected["id"],
                     "name": selected["name"],
                     "search": query,
+
+                    # Unix timestamp of the last artwork metadata refresh.
+                    "cached": None,
+
+                    # None = never fetched.
+                    "art": {
+                        "grids": None,
+                        "heroes": None,
+                        "logos": None,
+                        "icons": None,
+                    },
+
+                    # User's chosen artwork IDs.
+                    "selected": {
+                        "grid": None,
+                        "hero": None,
+                        "logo": None,
+                        "icon": None,
+                    },
                 }
                 SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
                 save_size_cache(SIZE_CACHE)
@@ -1829,27 +1848,21 @@ class GameArchiver(App):
         self,
         game: Game,
         client: SteamGridDBClient,
-    ):        
-        grids = await client.get_grids(game)
-        heroes = await client.get_heroes(game)
-        logos = await client.get_logos(game)
-        icons = await client.get_icons(game)
+    ):
+        art = await client.get_all_art(game)
 
-        if not grids["success"]:
-            self.notify(grids["error"])
-            return
-        if not heroes["success"]:
-            self.notify(heroes["error"])
-            return
-        if not logos["success"]:
-            self.notify(logos["error"])
-            return
-        if not icons["success"]:
-            self.notify(icons["error"])
+        if not art["success"]:
+            self.notify(art["error"])
             return
 
-        self.notify(f"Found {len(grids['data'])} grids.\nFound {len(heroes['data'])} heroes.\nFound {len(logos['data'])} logos.\nFound {len(icons['data'])} icons.")
+        data = art["data"]
 
+        self.notify(
+            f"Found {len(data['grids'])} grids.\n"
+            f"Found {len(data['heroes'])} heroes.\n"
+            f"Found {len(data['logos'])} logos.\n"
+            f"Found {len(data['icons'])} icons."
+        )
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
@@ -2435,6 +2448,48 @@ class SteamGridDBClient:
 
     async def get_icons(self, game: Game) -> dict:
         return await self.get_art("icons", game)
+    async def get_all_art(
+        self,
+        game: Game,
+    ) -> dict:
+        cached = game.steamgriddb.get("cached")
+        if (
+            cached is not None
+            and time.time() - cached < 60 * 60 * 24 * 30
+        ):
+            return {
+                "success": True,
+                "data": game.steamgriddb["art"],
+            }
+        cache_key = str(game.path)
+        SIZE_CACHE.setdefault(cache_key, {})
+
+        grids = await self.get_grids(game)
+        heroes = await self.get_heroes(game)
+        logos = await self.get_logos(game)
+        icons = await self.get_icons(game)
+
+        for result in (grids, heroes, logos, icons):
+            if not result["success"]:
+                return result
+
+        game.steamgriddb["art"] = {
+            "grids": grids["data"],
+            "heroes": heroes["data"],
+            "logos": logos["data"],
+            "icons": icons["data"],
+        }
+
+        game.steamgriddb["cached"] = time.time()
+
+        SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
+        save_size_cache(SIZE_CACHE)
+
+        return {
+            "success": True,
+            "data": game.steamgriddb["art"],
+        }
+        
 
 # ============================================================
 # MAIN
