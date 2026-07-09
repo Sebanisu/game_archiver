@@ -15,7 +15,10 @@ import tempfile
 import time
 import tomllib
 import webbrowser
-
+import httpx
+import datetime
+from enum import Enum, auto
+from urllib.parse import quote
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -177,6 +180,11 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
         cwd=launcher.parent,
         env=env,
     )
+class SteamGridDBAction(Enum):
+    BROWSE = auto()
+    DOWNLOAD = auto()
+    CHANGE = auto()
+    CANCEL = auto()
 
 @dataclass
 class Game:
@@ -193,11 +201,28 @@ class Game:
     in_steam: bool = False
     steam_broken: bool = False
     duplicate_steam: bool = False
+    steamgriddb: dict | None = None
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+def move_cache(
+    old_path: Path,
+    new_path: Path,
+):
+    old_key = str(old_path)
+    new_key = str(new_path)
+
+    entry = SIZE_CACHE.pop(old_key, None)
+    if entry is None:
+        return
+
+    entry["mtime"] = new_path.stat().st_mtime
+    SIZE_CACHE[new_key] = entry
+
+    save_cache()
+
 def launcher_signature(path: str | Path) -> tuple[str, str]:
     path = Path(normalize_exe(str(path)))
 
@@ -677,12 +702,22 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
         else 0.0
     )
 
+    steamgriddb = (
+        cached.get("steamgriddb", {})
+        if cached
+        else {}
+    )
+
     if (
         cached is not None
         and cached["mtime"] == mtime
     ):
-        return cached["size"], cached["mtime"], last_played
-
+        return (        
+            cached["size"],
+            cached["mtime"],
+            last_played,
+            steamgriddb,
+        )
     size = dir_size(path)
 
     
@@ -691,11 +726,12 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
         "mtime": mtime,
         "size": size,
         "last_played": last_played,
+        "steamgriddb": steamgriddb,
     }
 
     save_size_cache(SIZE_CACHE)
 
-    return size, mtime, last_played
+    return size, mtime, last_played, steamgriddb
 
 
 def game_list_changed(
@@ -874,12 +910,18 @@ class GameRow(ListItem):
         else:
             steam = " "
 
+        if self.game.steamgriddb and self.game.steamgriddb.get("id"):
+            sgdb = "G"
+        else:
+            sgdb = " "
+
         return (
             f"{mark} "
             f"{self.game.name:<45.45} "
             f"{size:>8} "
             f"{date} "
-            f"{steam}"
+            f"{steam} "
+            f"{sgdb} "
         )
 
     def refresh_row(self):
@@ -905,7 +947,16 @@ class GameRow(ListItem):
             if launch_options:
                 parts.append(
                     f"Steam LaunchOptions: {launch_options}"
-                )            
+                )
+        if self.game.steamgriddb:
+            if name := self.game.steamgriddb.get("name"):
+                parts.append(f"SteamGridDB: {name}")
+
+            if search := self.game.steamgriddb.get("search"):
+                parts.append(f"SteamGridDB Search: {search}")
+
+            if game_id := self.game.steamgriddb.get("id"):
+                parts.append(f"SteamGridDB ID: {game_id}")
         self.tooltip = "\n".join(part for part in parts if part)
 
 
@@ -965,6 +1016,7 @@ class GameArchiver(App):
 
         self.computing_sizes = True
         self.detecting_steam = True
+        self.dialog_open = False
         self.game_rows = {}
         self.sync_status = "Unknown"
 
@@ -1127,7 +1179,8 @@ class GameArchiver(App):
 
 
     def refresh_if_changed(self):
-
+        if self.dialog_open:
+            return
         if (
             game_list_changed(
                 SHARED_DIR,
@@ -1187,11 +1240,11 @@ class GameArchiver(App):
 
     def compute_sizes(self):
         for game in self.shared_games:
-            game.size, game.mtime, game.last_played = cached_dir_info(game.path)
+            game.size, game.mtime, game.last_played, game.steamgriddb = cached_dir_info(game.path)
             self.call_from_thread(self.refresh_game_row, game)
 
         for game in self.archived_games:
-            game.size, game.mtime, game.last_played = cached_dir_info(game.path)
+            game.size, game.mtime, game.last_played, game.steamgriddb = cached_dir_info(game.path)
             self.call_from_thread(self.refresh_game_row, game)
 
         self.call_from_thread(self.sizes_finished)
@@ -1458,6 +1511,7 @@ class GameArchiver(App):
             new_path = target / game.name
 
             shutil.move(old_path, new_path)
+            move_cache(old_path, new_path)
 
             game.path = new_path
             game.launcher = find_launcher(launch_path(game))
@@ -1670,15 +1724,139 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
         self.update_status()
+
+    async def link_steamgriddb(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+    ):
+        query = steamgriddb_search_name(game)
+        results = []
+        prompt_for_search = False
+
+        cache_key = str(game.path)
+        SIZE_CACHE.setdefault(cache_key, {})
+        while True:
+            if not prompt_for_search:
+                result = await client.search_game(query)
+
+                if not result["success"]:
+                    self.notify(result["error"])
+                    return
+
+                results = result["data"]
+
+            if not results or prompt_for_search:
+                prompt_for_search = False
+                query = await self.push_screen_wait(
+                    InputDialog(
+                        title="SteamGridDB Search",
+                        prompt="No matches found. Search for:",
+                        value=query,
+                    )
+                )
+
+                if query is None:
+                    return
+
+                query = query.strip()
+
+                game.steamgriddb["search"] = query
+                SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
+                save_size_cache(SIZE_CACHE)
+
+                continue
+
+            action, selected = await self.push_screen_wait(
+                SelectionDialog(
+                    title="SteamGridDB Matches",
+                    results=results,
+                )
+            )
+
+            if action == DialogAction.CANCEL:
+                return
+            elif action == DialogAction.SEARCH:
+                prompt_for_search = True
+                continue
+            elif action == DialogAction.SELECT:
+                if selected is None:
+                    return
+                game.steamgriddb = {
+                    "id": selected["id"],
+                    "name": selected["name"],
+                    "search": query,
+                }
+                SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
+                save_size_cache(SIZE_CACHE)
+
+                self.notify(f"Selected {selected['name']}")
+                self.refresh_game_row(game)
+            break
+    
+    async def manage_steamgriddb(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+    ):
+        while True:
+            action = await self.push_screen_wait(
+                SteamGridDBDialog(game)
+            )
+
+            match action:
+                case SteamGridDBAction.CANCEL:
+                    return
+
+                case SteamGridDBAction.BROWSE:
+                    webbrowser.open(
+                        f"https://www.steamgriddb.com/game/{game.steamgriddb['id']}"
+                    )
+
+                case SteamGridDBAction.CHANGE:
+                    game.steamgriddb.pop("id", None)
+                    return await self.link_steamgriddb(
+                        game,
+                        client,
+                    )
+
+                case SteamGridDBAction.DOWNLOAD:
+                    await self.download_steamgriddb_art(
+                        game,
+                        client,
+                    )
+    async def download_steamgriddb_art(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+    ):
+        self.notify("Download artwork not implemented yet.")
+
     @work
     async def action_download_steamgriddb(self):
-        key = await get_steamgriddb_api_key(self)
+        self.dialog_open = True
+        try:
+            key = await get_steamgriddb_api_key(self)
 
-        if key is None:
-            return
+            if key is None:
+                return
 
-        # Create the client
-        client = SteamGridDBClient(key)
+            # Create the client
+            client = SteamGridDBClient(key)
+            game = self.get_highlighted_game()
+            if game is None:
+                self.notify("No game highlighted.")
+                return
+
+            
+            if game.steamgriddb.get("id"):
+                await self.manage_steamgriddb(game, client)
+            else:
+                await self.link_steamgriddb(game, client)
+            
+        finally:
+            self.dialog_open = False
+
 
 # ============================================================
 # STEAM
@@ -1888,13 +2066,326 @@ class InputDialog(ModalScreen[str | None]):
         self.dismiss(None)
 
 # ============================================================
+# Selection Dialog
+# ============================================================
+class DialogAction(Enum):
+    SEARCH = "search"
+    CANCEL = "cancel"
+    SELECT = "select"
+
+class SelectionDialog(ModalScreen[dict | None]):
+    DEFAULT_CSS = """
+    SelectionDialog {
+        align: center middle;
+    }
+    #dialog {
+        width: 90%;
+        height: 80%;
+        layout: vertical;
+
+        border: round $primary;
+        background: $surface;
+        padding: 1;
+    }
+
+    #body {
+        height: 1fr;
+    }
+
+    #results {
+        height: 100%;
+    }
+
+    #buttons {
+        height: auto;
+        margin-top: 1;
+        align-horizontal: right;
+    }
+    """
+
+    def __init__(
+        self,
+        title: str,
+        results: list[dict],
+    ):
+        super().__init__()
+        self.title = title
+        self.results = results
+
+    def build_result_item(self, result: dict) -> ListItem:
+        text = result["name"]
+
+        if result.get("verified"):
+            text = f"✓ {text}"
+
+        details = [f"ID: {result['id']}"]
+
+        if types := result.get("types"):
+            details.append(", ".join(types))
+
+        if release := result.get("release_date"):
+            year = datetime.datetime.fromtimestamp(release).year
+            details.append(str(year))
+
+        text += "\n    " + " • ".join(details)
+
+        return ListItem(Label(text))
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"[b]{self.title}[/b]")
+
+            with Vertical(id="body"):
+                yield ListView(
+                    *(self.build_result_item(r) for r in self.results),
+                    id="results",
+                )
+
+            with Horizontal(id="buttons"):
+                yield Button(
+                    "Search Again",
+                    id="search",
+                )
+                yield Button(
+                    "Browse",
+                    id="browse",
+                )
+                yield Button(
+                    "Cancel",
+                    id="cancel",
+                )
+                yield Button(
+                    "Select",
+                    id="select",
+                    variant="primary",
+                )
+
+    def on_mount(self):
+        self.query_one(ListView).focus()
+
+    # def on_list_view_selected(
+    #     self,
+    #     event: ListView.Selected,
+    # ):
+    #     self.dismiss(
+    #         self.results[event.list_view.index]
+    #     )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        if event.button.id == "browse":
+            index = self.query_one(ListView).index
+
+            if index is not None:
+                webbrowser.open(
+                    f"https://www.steamgriddb.com/game/{self.results[index]['id']}"
+                )
+            return
+
+        if event.button.id == "cancel":
+            self.dismiss((DialogAction.CANCEL, None))
+            return
+        
+        if event.button.id == "search":
+            self.dismiss((DialogAction.SEARCH, None))
+            return
+
+        index = self.query_one(ListView).index
+
+        if index is not None:
+            self.dismiss((DialogAction.SELECT, self.results[index]))
+
+    def action_dismiss(self):
+        self.dismiss(None)
+
+# ============================================================
+# SteamGridDB Dialog
+# ============================================================
+class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
+    DEFAULT_CSS = """
+    SteamGridDBDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 85;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #buttons {
+        align-horizontal: right;
+        margin-top: 1;
+    }
+
+    Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(
+        self,
+        game: Game,
+    ):
+        super().__init__()
+        self.game = game
+
+    def compose(self) -> ComposeResult:
+        sgdb = self.game.steamgriddb
+
+        yield Vertical(
+            Label("[b]SteamGridDB[/b]"),
+            Label(
+                f"Name: {sgdb.get('name', 'Unknown')}\n"
+                f"ID: {sgdb.get('id', 'Unknown')}\n"
+                f"Search: {sgdb.get('search', '')}"
+            ),
+            Horizontal(
+                Button(
+                    "Browse",
+                    id="browse",
+                ),
+                Button(
+                    "Download Artwork",
+                    id="download",
+                    variant="primary",
+                ),
+                Button(
+                    "Change Match",
+                    id="change",
+                ),
+                Button(
+                    "Cancel",
+                    id="cancel",
+                ),
+                id="buttons",
+            ),
+            id="dialog",
+        )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        match event.button.id:
+            case "browse":
+                self.dismiss(
+                    SteamGridDBAction.BROWSE
+                )
+
+            case "download":
+                self.dismiss(
+                    SteamGridDBAction.DOWNLOAD
+                )
+
+            case "change":
+                self.dismiss(
+                    SteamGridDBAction.CHANGE
+                )
+
+            case "cancel":
+                self.dismiss(
+                    SteamGridDBAction.CANCEL
+                )
+
+    def action_dismiss(self):
+        self.dismiss(
+            SteamGridDBAction.CANCEL
+        )
+
+# ============================================================
 # SteamGridDB Client
 # ============================================================
+
+def steamgriddb_search_name(game: Game) -> str:
+    name = game.name
+    if game.steamgriddb and "search" in game.steamgriddb:
+        name = game.steamgriddb["search"]
+
+    # Strip common suffixes
+    name = re.sub(r"\s*-\s*v[\d.]+.*$", "", name, flags=re.I)
+    name = re.sub(r"\s+-\s+PC$", "", name, flags=re.I)
+    name = re.sub(r"\bR18\b", "", name, flags=re.I)
+
+    return name.strip()
+
 class SteamGridDBClient:
     BASE_URL = "https://www.steamgriddb.com/api/v2"
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+
+    async def get(self, endpoint: str) -> dict:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(
+                f"{self.BASE_URL}/{endpoint}",
+                headers=headers,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return {
+                "success": False,
+                "error": "SteamGridDB returned an invalid response.",
+            }
+
+        if not response.is_success:
+            return {
+                "success": False,
+                "error": payload.get(
+                    "errors",
+                    [response.reason_phrase],
+                )[0],
+            }
+
+        if not payload.get("success", False):
+            return {
+                "success": False,
+                "error": payload.get(
+                    "errors",
+                    ["Unknown SteamGridDB error."],
+                )[0],
+            }
+
+        return {
+            "success": True,
+            "data": payload["data"],
+        }
+
+    async def search_game(
+        self,
+        query: str,
+    ) -> dict:
+        query = quote(query)
+        return await self.get(f"search/autocomplete/{query}")
+
+    async def get_game(
+        self,
+        game: Game,
+    ) -> dict | None:
+        if not game.steamgriddb:
+            return None
+
+        game_id = game.steamgriddb.get("id")
+
+        if game_id is None:
+            return None
+
+        result = await self.get(f"games/id/{game_id}")
+
+        if not result["success"]:
+            return None
+
+        return result["data"]
+
 # ============================================================
 # MAIN
 # ============================================================
