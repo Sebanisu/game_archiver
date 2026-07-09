@@ -28,7 +28,7 @@ import vdf
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, Grid
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -1857,12 +1857,31 @@ class GameArchiver(App):
 
         data = art["data"]
 
-        self.notify(
-            f"Found {len(data['grids'])} grids.\n"
-            f"Found {len(data['heroes'])} heroes.\n"
-            f"Found {len(data['logos'])} logos.\n"
-            f"Found {len(data['icons'])} icons."
+        art_type = await self.push_screen_wait(
+            ArtworkTypeDialog(data)
         )
+
+        match art_type:
+            case ArtworkType.CANCEL:
+                return
+
+            case ArtworkType.GRID:
+                artwork = data["grids"]
+
+            case ArtworkType.HERO:
+                artwork = data["heroes"]
+
+            case ArtworkType.LOGO:
+                artwork = data["logos"]
+
+            case ArtworkType.ICON:
+                artwork = data["icons"]
+        action, selected = await self.push_screen_wait(
+        ArtworkSelectionDialog(
+            title=f"SteamGridDB {art_type.name.title()}",
+            artwork=artwork,
+        )
+    )
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
@@ -2095,6 +2114,273 @@ class InputDialog(ModalScreen[str | None]):
 
     def action_dismiss(self):
         self.dismiss(None)
+
+# ============================================================
+# Artwork Type Dialog
+# ============================================================
+
+class ArtworkType(Enum):
+    GRID = auto()
+    HERO = auto()
+    LOGO = auto()
+    ICON = auto()
+    CANCEL = auto()
+
+class ArtworkTypeDialog(ModalScreen[ArtworkType]):
+    DEFAULT_CSS = """
+    ArtworkTypeDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 60;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #art-grid {
+        width: 100%;
+        height: auto;
+
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-gutter: 1;
+    }
+    #art-grid Button {
+        width: 100%;
+    }
+
+    #cancel {
+        width: 100%;
+        margin-top: 1;
+    }   
+    """
+
+    def __init__(
+        self,
+        art: dict,
+    ):
+        super().__init__()
+        self.art = art
+
+    def compose(self) -> ComposeResult:
+        grids = len(self.art["grids"])
+        heroes = len(self.art["heroes"])
+        logos = len(self.art["logos"])
+        icons = len(self.art["icons"])
+
+        with Vertical(id="dialog"):
+            yield Label("[b]Download Artwork[/b]")
+            
+            with Grid(id="art-grid"):
+                yield Button(
+                    f"Grids ({grids})",
+                    id="grid",
+                    disabled=grids == 0,
+                )
+
+                yield Button(
+                    f"Heroes ({heroes})",
+                    id="hero",
+                    disabled=heroes == 0,
+                )
+
+                yield Button(
+                    f"Logos ({logos})",
+                    id="logo",
+                    disabled=logos == 0,
+                )
+
+                yield Button(
+                    f"Icons ({icons})",
+                    id="icon",
+                    disabled=icons == 0,
+                )
+
+            yield Button(
+                "Cancel",
+                id="cancel",
+            )
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        match event.button.id:
+            case "grid":
+                self.dismiss(ArtworkType.GRID)
+
+            case "hero":
+                self.dismiss(ArtworkType.HERO)
+
+            case "logo":
+                self.dismiss(ArtworkType.LOGO)
+
+            case "icon":
+                self.dismiss(ArtworkType.ICON)
+
+            case _:
+                self.dismiss(ArtworkType.CANCEL)
+
+    def action_dismiss(self):
+        self.dismiss(ArtworkType.CANCEL)
+
+
+# ============================================================
+# Artwork Selection Dialog
+# ============================================================
+class DialogAction(Enum):
+    SEARCH = "search"
+    CANCEL = "cancel"
+    SELECT = "select"
+
+class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
+    DEFAULT_CSS = """
+    ArtworkSelectionDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 90%;
+        height: 80%;
+        layout: vertical;
+
+        border: round $primary;
+        background: $surface;
+        padding: 1;
+    }
+
+    #body {
+        height: 1fr;
+    }
+
+    #results {
+        height: 100%;
+    }
+
+    #buttons {
+        height: auto;
+        margin-top: 1;
+        align-horizontal: right;
+    }
+    """
+
+    def __init__(
+        self,
+        title: str,
+        artwork: list[dict],
+    ):
+        super().__init__()
+        self.title = title
+        self.artwork = artwork
+
+    def build_item(
+        self,
+        art: dict,
+    ) -> ListItem:
+        details = []
+
+        if art.get("style"):
+            details.append(art["style"].title())
+
+        if art.get("width") and art.get("height"):
+            details.append(
+                f"{art['width']}×{art['height']}"
+            )
+
+        if art.get("score") is not None:
+            details.append(
+                f"★ {art['score']}"
+            )
+
+        if art.get("nsfw"):
+            details.append("NSFW")
+
+        if art.get("lock"):
+            details.append("🔒")
+
+        text = f"ID: {art['id']}"
+
+        if details:
+            text += "\n    " + " • ".join(details)
+
+        return ListItem(
+            Label(text)
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(
+                f"[b]{self.title}[/b]"
+            )
+
+            with Vertical(id="body"):
+                yield ListView(
+                    *(
+                        self.build_item(a)
+                        for a in self.artwork
+                    ),
+                    id="results",
+                )
+
+            with Horizontal(id="buttons"):
+                yield Button(
+                    "Browse",
+                    id="browse",
+                )
+                yield Button(
+                    "Cancel",
+                    id="cancel",
+                )
+                yield Button(
+                    "Download",
+                    id="select",
+                    variant="primary",
+                )
+
+    def on_mount(self):
+        self.query_one(ListView).focus()
+
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ):
+        index = self.query_one(
+            ListView
+        ).index
+
+        if event.button.id == "browse":
+            if index is not None:
+                webbrowser.open(
+                    self.artwork[index]["url"]
+                )
+            return
+
+        if event.button.id == "cancel":
+            self.dismiss(
+                (
+                    DialogAction.CANCEL,
+                    None,
+                )
+            )
+            return
+
+        if index is not None:
+            self.dismiss(
+                (
+                    DialogAction.SELECT,
+                    self.artwork[index],
+                )
+            )
+
+    def action_dismiss(self):
+        self.dismiss(
+            (
+                DialogAction.CANCEL,
+                None,
+            )
+        )
 
 # ============================================================
 # Selection Dialog
