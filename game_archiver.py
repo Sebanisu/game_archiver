@@ -28,7 +28,8 @@ import vdf
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, Grid
+from textual.containers import Horizontal, Vertical, Grid, Container
+from textual_image.widget import AutoImage
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -1877,11 +1878,12 @@ class GameArchiver(App):
             case ArtworkType.ICON:
                 artwork = data["icons"]
         action, selected = await self.push_screen_wait(
-        ArtworkSelectionDialog(
-            title=f"SteamGridDB {art_type.name.title()}",
-            artwork=artwork,
+            ArtworkSelectionDialog(
+                title=f"SteamGridDB {art_type.name.title()}",
+                artwork=artwork,
+                client=client,
+            )
         )
-    )
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
@@ -2228,6 +2230,130 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
 
 
 # ============================================================
+# Artwork Preview
+# ============================================================
+class ArtworkPreview(Container):
+    DEFAULT_CSS = """
+    ArtworkPreview {
+        width: 100%;
+        height: 100%;
+
+        border: round $primary;
+
+        layout: vertical;
+        align: center middle;
+    }
+
+    #placeholder,
+    #loading,
+    #error {
+        width: 100%;
+        height: 100%;
+        content-align: center middle;
+    }
+
+    #image {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    def __init__(
+        self,
+        client: SteamGridDBClient,
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+    ):
+        super().__init__(
+            id=id,
+            classes=classes,
+        )
+
+        self.client = client
+        self.art: dict | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "No artwork selected",
+            id="placeholder",
+        )
+
+    def cache_dir(self) -> Path:
+        path = (
+            Path.home()
+            / ".cache"
+            / "game_archiver"
+            / "steamgriddb"
+            / "thumbs"
+        )
+
+        path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        return path
+
+    def cache_file(
+        self,
+        art: dict,
+    ) -> Path:
+        return self.cache_dir() / f"{art['id']}.png"
+
+    async def show_art(
+        self,
+        art: dict,
+    ):
+        # Don't reload the same artwork.
+        if (
+            self.art is not None
+            and self.art["id"] == art["id"]
+        ):
+            return
+
+        self.art = art
+
+        path = self.cache_file(art)
+
+        # Show loading state.
+        await self.remove_children()
+
+        await self.mount(
+            Static(
+                "Downloading preview...",
+                id="loading",
+            )
+        )
+
+        if not path.exists():
+            result = await self.client.download_file(
+                art["thumb"],
+                path,
+            )
+
+            if not result["success"]:
+                await self.remove_children()
+
+                await self.mount(
+                    Static(
+                        result["error"],
+                        id="error",
+                    )
+                )
+                return
+
+        # Replace loading widget with image.
+        await self.remove_children()
+
+        await self.mount(
+            AutoImage(
+                path,
+                id="image",
+            )
+        )
+
+# ============================================================
 # Artwork Selection Dialog
 # ============================================================
 class DialogAction(Enum):
@@ -2255,8 +2381,26 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
         height: 1fr;
     }
 
+    #left {
+        width: 45%;
+        height: 100%;
+    }
+
+    #right {
+        width: 55%;
+        height: 100%;
+        padding-left: 1;
+    }
+
     #results {
         height: 100%;
+    }
+
+    #preview {
+        width: 100%;
+        height: 100%;
+        border: round $primary;
+        content-align: center middle;
     }
 
     #buttons {
@@ -2270,10 +2414,13 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
         self,
         title: str,
         artwork: list[dict],
+        client: SteamGridDBClient,
     ):
         super().__init__()
+
         self.title = title
         self.artwork = artwork
+        self.client = client
 
     def build_item(
         self,
@@ -2315,14 +2462,22 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
                 f"[b]{self.title}[/b]"
             )
 
-            with Vertical(id="body"):
-                yield ListView(
-                    *(
-                        self.build_item(a)
-                        for a in self.artwork
-                    ),
-                    id="results",
-                )
+            with Horizontal(id="body"):
+
+                with Vertical(id="left"):
+                    yield ListView(
+                        *(
+                            self.build_item(a)
+                            for a in self.artwork
+                        ),
+                        id="results",
+                    )
+
+                with Vertical(id="right"):
+                    yield ArtworkPreview(
+                        self.client,
+                        id="preview",
+                    )
 
             with Horizontal(id="buttons"):
                 yield Button(
@@ -2339,8 +2494,24 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
                     variant="primary",
                 )
 
-    def on_mount(self):
+    async def on_mount(self):
         self.query_one(ListView).focus()
+        await self.update_preview()
+    async def update_preview(self):
+        index = self.query_one(ListView).index
+
+        if index is None:
+            return
+
+        await self.query_one(ArtworkPreview).show_art(
+            self.artwork[index]
+        )
+   
+    async def on_list_view_highlighted(
+        self,
+        event: ListView.Highlighted,
+    ):
+        await self.update_preview()
 
     def on_button_pressed(
         self,
@@ -2385,10 +2556,6 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
 # ============================================================
 # Selection Dialog
 # ============================================================
-class DialogAction(Enum):
-    SEARCH = "search"
-    CANCEL = "cancel"
-    SELECT = "select"
 
 class SelectionDialog(ModalScreen[dict | None]):
     DEFAULT_CSS = """
@@ -2775,6 +2942,33 @@ class SteamGridDBClient:
             "success": True,
             "data": game.steamgriddb["art"],
         }
+    async def download_file(
+        self,
+        url: str,
+        path: Path,
+    ) -> dict:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url)
+
+                response.raise_for_status()
+
+            path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            path.write_bytes(response.content)
+
+            return {
+                "success": True,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+            }
         
 
 # ============================================================
