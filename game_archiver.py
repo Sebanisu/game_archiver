@@ -1829,8 +1829,26 @@ class GameArchiver(App):
         self,
         game: Game,
         client: SteamGridDBClient,
-    ):
-        self.notify("Download artwork not implemented yet.")
+    ):        
+        grids = await client.get_grids(game)
+        heroes = await client.get_heroes(game)
+        logos = await client.get_logos(game)
+        icons = await client.get_icons(game)
+
+        if not grids["success"]:
+            self.notify(grids["error"])
+            return
+        if not heroes["success"]:
+            self.notify(heroes["error"])
+            return
+        if not logos["success"]:
+            self.notify(logos["error"])
+            return
+        if not icons["success"]:
+            self.notify(icons["error"])
+            return
+
+        self.notify(f"Found {len(grids['data'])} grids.\nFound {len(heroes['data'])} heroes.\nFound {len(logos['data'])} logos.\nFound {len(icons['data'])} icons.")
 
     @work
     async def action_download_steamgriddb(self):
@@ -2385,6 +2403,38 @@ class SteamGridDBClient:
             return None
 
         return result["data"]
+    async def get_art(
+        self,
+        kind: str,
+        game: Game,
+    ) -> dict:
+        if not game.steamgriddb:
+            return {
+                "success": False,
+                "error": "Game is not linked to SteamGridDB.",
+            }
+
+        game_id = game.steamgriddb.get("id")
+
+        if game_id is None:
+            return {
+                "success": False,
+                "error": "Game is not linked to SteamGridDB.",
+            }
+
+        return await self.get(f"{kind}/game/{game_id}")
+    
+    async def get_grids(self, game: Game) -> dict:
+        return await self.get_art("grids", game)
+
+    async def get_heroes(self, game: Game) -> dict:
+        return await self.get_art("heroes", game)
+
+    async def get_logos(self, game: Game) -> dict:
+        return await self.get_art("logos", game)
+
+    async def get_icons(self, game: Game) -> dict:
+        return await self.get_art("icons", game)
 
 # ============================================================
 # MAIN
