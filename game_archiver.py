@@ -17,10 +17,11 @@ import tomllib
 import webbrowser
 import httpx
 import datetime
-from enum import Enum, auto
+from enum import Enum, auto, StrEnum
 from urllib.parse import quote
 from dataclasses import dataclass
 from pathlib import Path
+from hashlib import sha1
 
 from PIL import Image
 
@@ -111,6 +112,13 @@ ICON_CACHE = (
     / ".cache/game_archiver/icons"
 )
 ICON_CACHE.mkdir(parents=True, exist_ok=True)
+
+STEAM_ART_CACHE = (
+    Path.home()
+    / ".cache/game_archiver/steam"
+)
+
+STEAM_CDN = "https://shared.fastly.steamstatic.com/store_item_assets"
 
 
 
@@ -209,6 +217,199 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+class ArtworkType(StrEnum):
+    GRID_PORTRAIT = "grid_portrait"
+    GRID_SQUARE = "grid_square"
+    GRID_LANDSCAPE = "grid_landscape"
+    HERO = "hero"
+    LOGO = "logo"
+    ICON = "icon"
+    CANCEL = "cancel"
+
+def classify_grid(grid: dict) -> ArtworkType:
+    width = grid["width"]
+    height = grid["height"]
+
+    ratio = width / height
+
+    if ratio < 0.9:
+        return ArtworkType. GRID_PORTRAIT
+
+    if ratio <= 1.1:
+        return ArtworkType.GRID_SQUARE
+
+    return ArtworkType.GRID_LANDSCAPE
+
+def preferred_language(images: dict[str, str]) -> tuple[str, str] | None:
+    """
+    Returns (language, filename) for the preferred image.
+
+    Preference:
+        english -> en -> first available
+    """
+    if not images:
+        return None
+
+    for lang in ("english", "en"):
+        if lang in images:
+            return lang, images[lang]
+
+    lang = next(iter(images))
+    return lang, images[lang]
+
+
+FALLBACKS = {
+    "library_capsule": {
+        "thumb": "library_600x900.jpg",
+        "full": "library_600x900_2x.jpg",
+    },
+    "header_image": {
+        "thumb": "header.jpg",
+        "full": "header.jpg",
+    },
+    "library_hero": {
+        "thumb": "library_hero.jpg",
+        "full": "library_hero_2x.jpg",
+    },
+    "library_logo": {
+        "thumb": "logo.png",
+        "full": "logo_2x.png",
+    },
+}
+
+def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
+    """
+    Returns:
+    {
+        "grid": ("english", "https://..."),
+        "hero": ("english", "https://..."),
+        "logo": ("english", "https://...")
+    }
+    """
+
+    art = {
+        ArtworkType.GRID_PORTRAIT: None, 
+        ArtworkType.GRID_SQUARE: None, 
+        ArtworkType.GRID_LANDSCAPE: None, 
+        ArtworkType.HERO: None, 
+        ArtworkType.LOGO: None, 
+        ArtworkType.ICON: None,
+    }
+
+    if not metadata:
+        return art
+
+    app = (
+        metadata.get("external_platform_data", {})
+        .get("steam", [{}])[0]
+    )
+
+    appid = app.get("id")
+    meta = app.get("metadata", {})
+
+    if not appid:
+        return art
+
+    def build(steam_type: str) -> dict | None:
+        data = meta.get(f"{steam_type}_full")
+
+        if isinstance(data, dict):
+            thumb = preferred_language(data.get("image", data))
+            full = preferred_language(data.get("image2x", data.get("image", data)))
+
+            if thumb is None:
+                return None
+
+            language, thumb_file = thumb
+
+            if full is None:
+                full_file = thumb_file
+            else:
+                _, full_file = full
+        else:
+            fallback = FALLBACKS.get(steam_type)
+            if fallback is None:
+                return None
+
+            thumb_file, full_file = fallback["thumb"], fallback["full"]
+            language = "english"
+
+        mtime = meta.get("store_asset_mtime")
+
+        thumb_url = f"{STEAM_CDN}/steam/apps/{appid}/{thumb_file}"
+        full_url = f"{STEAM_CDN}/steam/apps/{appid}/{full_file}"
+
+        if mtime:
+            thumb_url += f"?t={mtime}"
+            full_url += f"?t={mtime}"
+
+        return {
+            "id": sha1(full_url.encode()).hexdigest(),
+            "language": language,
+            "thumb": thumb_url,
+            "url": full_url,
+            "author": {
+                "name": "Steam",
+                "avatar": None,
+                "steam64": None,
+            },
+            "style": "official",
+            "source": "steam",
+        }
+
+    # Add these here
+    # icon = meta.get("icon")
+    # if icon:
+    #     urls["icon"] = (
+    #         "steam",
+    #         f"{STEAM_CDN}/steam/apps/{appid}/{icon}.ico",
+    #     )
+
+    # clienticon = meta.get("clienticon")
+    # if clienticon:
+    #     urls["clienticon"] = (
+    #         "steam",
+    #         f"{STEAM_CDN}/steam/apps/{appid}/{clienticon}.ico",
+    #     )
+
+    art[ArtworkType.GRID_PORTRAIT] = build("library_capsule")
+    art[ArtworkType.GRID_LANDSCAPE] = build("header_image")
+    art[ArtworkType.HERO] = build("library_hero")
+    art[ArtworkType.LOGO] = build("library_logo")
+    return art
+
+
+# async def download_steam_art(game: Game) -> None:
+#     data = game.steamgriddb.get("steam_platform_data")
+#     if not data:
+#         return
+
+#     urls = steam_art_urls(data)
+#     if not urls:
+#         return
+
+#     appid = data["external_platform_data"]["steam"][0]["id"]
+
+#     cache_dir = STEAM_ART_CACHE / appid
+#     cache_dir.mkdir(parents=True, exist_ok=True)
+
+#     async with httpx.AsyncClient(follow_redirects=True) as client:
+#         for art_type, (_, url) in urls.items():
+#             ext = Path(url).suffix or ".jpg"
+#             dest = cache_dir / f"{art_type}{ext}"
+
+#             if dest.exists():
+#                 continue
+
+#             try:
+#                 response = await client.get(url)
+#                 response.raise_for_status()
+#             except httpx.HTTPError as e:
+#                 print(f"Failed to download {art_type}: {e}")
+#                 continue
+
+#             dest.write_bytes(response.content)
+
 def add_dict(parts: list[str], data: dict, prefix: str = ""):
     for key, value in data.items():
         name = f"{prefix}.{key}" if prefix else key
@@ -935,8 +1136,10 @@ class GameRow(ListItem):
         else:
             steam = " "
 
-        if self.game.steamgriddb and self.game.steamgriddb.get("id"):
-            sgdb = "G"
+        if self.game.steamgriddb and self.game.steamgriddb.get("game", {}).get("id"):
+            sgdb = "G"        
+        elif self.game.steamgriddb and self.game.steamgriddb.get("id"): #lowercase g needs to be refreshed
+            sgdb = "g"
         else:
             sgdb = " "
 
@@ -1809,60 +2012,70 @@ class GameArchiver(App):
                 )
             )
 
-            if action == DialogAction.CANCEL:
-                return
-            elif action == DialogAction.SEARCH:
-                prompt_for_search = True
-                continue
-            elif action == DialogAction.SELECT:
-                if selected is None:
+            match action:
+                case SelectionDialogAction.CANCEL:
                     return
-                game.steamgriddb = {
-                    "id": selected["id"],
-                    "name": selected["name"],
-                    "search": query,
+                case SelectionDialogAction.SEARCH:
+                    prompt_for_search = True
+                    continue
+                case SelectionDialogAction.BROWSE:
+                    continue  # show SelectionDialog again as shouldn't happen.                
+                case SelectionDialogAction.SELECT:
+                    pass
+            
+            assert selected is not None
+            game.steamgriddb = {
+                "search": query,
 
-                    # Full SteamGridDB game details.
-                    "game": None,
+                # Full SteamGridDB game details.
+                "game": None,
 
-                    # Steam platform data.
-                    "steam_platform_data": None,
+                # Steam platform data.
+                "steam_platform_data": None,
 
-                    # Unix timestamp of the last artwork metadata refresh.
-                    "cached": None,
+                # Unix timestamp of the last artwork metadata refresh.
+                "cached": None,
 
-                    # None = never fetched.
-                    "art": {
-                        "grids": None,
-                        "heroes": None,
-                        "logos": None,
-                        "icons": None,
-                    },
+                # None = never fetched.
+                "art": {
+                    ArtworkType.GRID_PORTRAIT: None,
+                    ArtworkType.GRID_SQUARE: None,
+                    ArtworkType.GRID_LANDSCAPE: None,
+                    ArtworkType.HERO: None,
+                    ArtworkType.LOGO: None,
+                    ArtworkType.ICON: None,
+                },
 
-                    # User's chosen artwork IDs.
-                    "selected": {
-                        "grid": None,
-                        "hero": None,
-                        "logo": None,
-                        "icon": None,
-                    },
-                }
-                game_details = await client.get_game(game)
+                # User's chosen artwork IDs.
+                "selected": {
+                    ArtworkType.GRID_PORTRAIT: None,
+                    ArtworkType.GRID_SQUARE: None,
+                    ArtworkType.GRID_LANDSCAPE: None,
+                    ArtworkType.HERO: None,
+                    ArtworkType.LOGO: None,
+                    ArtworkType.ICON: None,
+                },
+            }
+            game_details = await client.get_game(selected["id"])
 
-                if game_details is not None:
-                    game.steamgriddb["game"] = game_details
-                
-                steam_platform_data = await client.get_steam_platform_data(game)
+            if game_details is not None:
+                game.steamgriddb["game"] = game_details
+            
+            steam_platform_data = await client.get_steam_platform_data(game)
 
-                if steam_platform_data is not None:
-                    game.steamgriddb["steam_platform_data"] = steam_platform_data
+            if steam_platform_data is not None:
+                game.steamgriddb["steam_platform_data"] = steam_platform_data
+            
+            # await download_steam_art(game)
 
-                SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-                save_size_cache(SIZE_CACHE)
+            SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
+            save_size_cache(SIZE_CACHE)
 
-                self.notify(f"Selected {selected['name']}")
-                self.refresh_game_row(game)
-            break
+            self.notify(f"Selected {selected['name']}")
+            self.refresh_game_row(game)
+            await self.manage_steamgriddb(game, client)
+            return
+            
     
     async def manage_steamgriddb(
         self,
@@ -1880,15 +2093,12 @@ class GameArchiver(App):
 
                 case SteamGridDBAction.BROWSE:
                     webbrowser.open(
-                        f"https://www.steamgriddb.com/game/{game.steamgriddb['id']}"
+                        f"https://www.steamgriddb.com/game/{game.steamgriddb['game']['id']}"
                     )
 
                 case SteamGridDBAction.CHANGE:
-                    game.steamgriddb.pop("id", None)
-                    return await self.link_steamgriddb(
-                        game,
-                        client,
-                    )
+                    game.steamgriddb.pop("game", None)
+                    return await self.link_steamgriddb(game, client)
 
                 case SteamGridDBAction.DOWNLOAD:
                     await self.download_steamgriddb_art(
@@ -1908,32 +2118,42 @@ class GameArchiver(App):
 
         data = art["data"]
 
-        art_type = await self.push_screen_wait(
-            ArtworkTypeDialog(data)
-        )
-
-        match art_type:
-            case ArtworkType.CANCEL:
-                return
-
-            case ArtworkType.GRID:
-                artwork = data["grids"]
-
-            case ArtworkType.HERO:
-                artwork = data["heroes"]
-
-            case ArtworkType.LOGO:
-                artwork = data["logos"]
-
-            case ArtworkType.ICON:
-                artwork = data["icons"]
-        action, selected = await self.push_screen_wait(
-            ArtworkSelectionDialog(
-                title=f"SteamGridDB {art_type.name.title()}",
-                artwork=artwork,
-                client=client,
+        while True:
+            art_type = await self.push_screen_wait(
+                ArtworkTypeDialog(data)
             )
-        )
+
+            match art_type:
+                case ArtworkType.CANCEL:
+                    return
+
+                case ArtworkType.GRID_PORTRAIT:
+                    artwork = data[ArtworkType.GRID_PORTRAIT]
+
+                case ArtworkType.GRID_SQUARE:
+                    artwork = data[ArtworkType.GRID_SQUARE]
+
+                case ArtworkType.GRID_LANDSCAPE:
+                    artwork = data[ArtworkType.GRID_LANDSCAPE]
+
+                case ArtworkType.HERO:
+                    artwork = data[ArtworkType.HERO]
+
+                case ArtworkType.LOGO:
+                    artwork = data[ArtworkType.LOGO]
+
+                case ArtworkType.ICON:
+                    artwork = data[ArtworkType.ICON]
+            action, selected = await self.push_screen_wait(
+                ArtworkSelectionDialog(
+                    title=f"SteamGridDB {art_type.name.title()}",
+                    artwork=artwork,
+                    client=client,
+                )
+            )
+            if action is ArtworkSelectionDialogAction.CANCEL:
+                continue  # show ArtworkTypeDialog again
+            break
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
@@ -1951,7 +2171,7 @@ class GameArchiver(App):
                 return
 
             
-            if game.steamgriddb.get("id"):
+            if game.steamgriddb.get("game"):
                 await self.manage_steamgriddb(game, client)
             else:
                 await self.link_steamgriddb(game, client)
@@ -2091,6 +2311,7 @@ class InputDialog(ModalScreen[str | None]):
 
     #dialog {
         width: 70;
+        height: auto;
         border: round $primary;
         background: $surface;
         padding: 1 2;
@@ -2171,13 +2392,6 @@ class InputDialog(ModalScreen[str | None]):
 # Artwork Type Dialog
 # ============================================================
 
-class ArtworkType(Enum):
-    GRID = auto()
-    HERO = auto()
-    LOGO = auto()
-    ICON = auto()
-    CANCEL = auto()
-
 class ArtworkTypeDialog(ModalScreen[ArtworkType]):
     DEFAULT_CSS = """
     ArtworkTypeDialog {
@@ -2186,6 +2400,7 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
 
     #dialog {
         width: 60;
+        height: auto;
         border: round $primary;
         background: $surface;
         padding: 1 2;
@@ -2214,45 +2429,75 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
         art: dict,
     ):
         super().__init__()
-        self.art = art
+        self.art = {
+            ArtworkType.GRID_PORTRAIT: [],
+            ArtworkType.GRID_LANDSCAPE: [],
+            ArtworkType.GRID_SQUARE: [],
+            ArtworkType.HERO: [],
+            ArtworkType.LOGO: [],
+            ArtworkType.ICON: [],
+        }
+
+        self.art[ArtworkType.GRID_PORTRAIT]   = art.get(ArtworkType.GRID_PORTRAIT, [])
+        self.art[ArtworkType.GRID_SQUARE]     = art.get(ArtworkType.GRID_SQUARE, [])
+        self.art[ArtworkType.GRID_LANDSCAPE]  = art.get(ArtworkType.GRID_LANDSCAPE, [])
+        self.art[ArtworkType.HERO]   = art.get(ArtworkType.HERO, [])
+        self.art[ArtworkType.LOGO]   = art.get(ArtworkType.LOGO, [])
+        self.art[ArtworkType.ICON]   = art.get(ArtworkType.ICON, [])
+
+
 
     def compose(self) -> ComposeResult:
-        grids = len(self.art["grids"])
-        heroes = len(self.art["heroes"])
-        logos = len(self.art["logos"])
-        icons = len(self.art["icons"])
-
+        grids_portrait = len(self.art[ArtworkType.GRID_PORTRAIT])
+        grids_square = len(self.art[ArtworkType.GRID_SQUARE])
+        grids_landscape = len(self.art[ArtworkType.GRID_LANDSCAPE])
+        heroes = len(self.art[ArtworkType.HERO])
+        logos = len(self.art[ArtworkType.LOGO])
+        icons = len(self.art[ArtworkType.ICON])
+    
         with Vertical(id="dialog"):
             yield Label("[b]Download Artwork[/b]")
             
             with Grid(id="art-grid"):
                 yield Button(
-                    f"Grids ({grids})",
-                    id="grid",
-                    disabled=grids == 0,
+                    f"Grid Portrait ({grids_portrait})",
+                    id=ArtworkType.GRID_PORTRAIT,
+                    disabled=grids_portrait == 0,
+                )
+
+                yield Button(
+                    f"Grid Square ({grids_square})",
+                    id=ArtworkType.GRID_SQUARE,
+                    disabled=grids_square == 0,
+                )
+
+                yield Button(
+                    f"Grid Landscape ({grids_landscape})",
+                    id=ArtworkType.GRID_LANDSCAPE,
+                    disabled=grids_landscape == 0,
                 )
 
                 yield Button(
                     f"Heroes ({heroes})",
-                    id="hero",
+                    id=ArtworkType.HERO,
                     disabled=heroes == 0,
                 )
 
                 yield Button(
                     f"Logos ({logos})",
-                    id="logo",
+                    id=ArtworkType.LOGO,
                     disabled=logos == 0,
                 )
 
                 yield Button(
                     f"Icons ({icons})",
-                    id="icon",
+                    id=ArtworkType.ICON,
                     disabled=icons == 0,
                 )
 
             yield Button(
                 "Cancel",
-                id="cancel",
+                id=ArtworkType.CANCEL,
             )
 
     def on_button_pressed(
@@ -2260,16 +2505,22 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
         event: Button.Pressed,
     ):
         match event.button.id:
-            case "grid":
-                self.dismiss(ArtworkType.GRID)
+            case ArtworkType.GRID_PORTRAIT:
+                self.dismiss(ArtworkType.GRID_PORTRAIT)
 
-            case "hero":
+            case ArtworkType.GRID_SQUARE:
+                self.dismiss(ArtworkType.GRID_SQUARE)
+
+            case ArtworkType.GRID_LANDSCAPE:
+                self.dismiss(ArtworkType.GRID_LANDSCAPE)
+
+            case ArtworkType.HERO:
                 self.dismiss(ArtworkType.HERO)
 
-            case "logo":
+            case ArtworkType.LOGO:
                 self.dismiss(ArtworkType.LOGO)
 
-            case "icon":
+            case ArtworkType.ICON:
                 self.dismiss(ArtworkType.ICON)
 
             case _:
@@ -2406,12 +2657,12 @@ class ArtworkPreview(Container):
 # ============================================================
 # Artwork Selection Dialog
 # ============================================================
-class DialogAction(Enum):
-    SEARCH = "search"
+class ArtworkSelectionDialogAction(StrEnum):
+    BROWSE = "browse"
     CANCEL = "cancel"
-    SELECT = "select"
+    DOWNLOAD = "download"
 
-class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
+class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dict | None]]):
     DEFAULT_CSS = """
     ArtworkSelectionDialog {
         align: center middle;
@@ -2532,15 +2783,15 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
             with Horizontal(id="buttons"):
                 yield Button(
                     "Browse",
-                    id="browse",
+                    id=ArtworkSelectionDialogAction.BROWSE,
                 )
                 yield Button(
                     "Cancel",
-                    id="cancel",
+                    id=ArtworkSelectionDialogAction.CANCEL,
                 )
                 yield Button(
                     "Download",
-                    id="select",
+                    id=ArtworkSelectionDialogAction.DOWNLOAD,
                     variant="primary",
                 )
 
@@ -2571,17 +2822,17 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
             ListView
         ).index
 
-        if event.button.id == "browse":
+        if event.button.id == ArtworkSelectionDialogAction.BROWSE:
             if index is not None:
                 webbrowser.open(
                     self.artwork[index]["url"]
                 )
             return
 
-        if event.button.id == "cancel":
+        if event.button.id == ArtworkSelectionDialogAction.CANCEL:
             self.dismiss(
                 (
-                    DialogAction.CANCEL,
+                    ArtworkSelectionDialogAction.CANCEL,
                     None,
                 )
             )
@@ -2590,7 +2841,7 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
         if index is not None:
             self.dismiss(
                 (
-                    DialogAction.SELECT,
+                    ArtworkSelectionDialogAction.DOWNLOAD,
                     self.artwork[index],
                 )
             )
@@ -2598,7 +2849,7 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
     def action_dismiss(self):
         self.dismiss(
             (
-                DialogAction.CANCEL,
+                ArtworkSelectionDialogAction.CANCEL,
                 None,
             )
         )
@@ -2606,8 +2857,15 @@ class ArtworkSelectionDialog(ModalScreen[tuple[DialogAction, dict | None]]):
 # ============================================================
 # Selection Dialog
 # ============================================================
+class SelectionDialogAction(StrEnum):
+    SEARCH = "search"
+    BROWSE = "browse"
+    SELECT = "select"
+    CANCEL = "cancel"
 
-class SelectionDialog(ModalScreen[dict | None]):
+class SelectionDialog(
+    ModalScreen[tuple[SelectionDialogAction, dict | None]]
+):
     DEFAULT_CSS = """
     SelectionDialog {
         align: center middle;
@@ -2678,19 +2936,19 @@ class SelectionDialog(ModalScreen[dict | None]):
             with Horizontal(id="buttons"):
                 yield Button(
                     "Search Again",
-                    id="search",
+                    id=SelectionDialogAction.SEARCH,
                 )
                 yield Button(
                     "Browse",
-                    id="browse",
+                    id=SelectionDialogAction.BROWSE,
                 )
                 yield Button(
                     "Cancel",
-                    id="cancel",
+                    id=SelectionDialogAction.CANCEL,
                 )
                 yield Button(
                     "Select",
-                    id="select",
+                    id=SelectionDialogAction.SELECT,
                     variant="primary",
                 )
 
@@ -2709,30 +2967,34 @@ class SelectionDialog(ModalScreen[dict | None]):
         self,
         event: Button.Pressed,
     ):
-        if event.button.id == "browse":
-            index = self.query_one(ListView).index
+        match event.button.id:
+            case SelectionDialogAction.CANCEL:
+                self.dismiss((SelectionDialogAction.CANCEL, None))
 
-            if index is not None:
-                webbrowser.open(
-                    f"https://www.steamgriddb.com/game/{self.results[index]['id']}"
-                )
-            return
+            case SelectionDialogAction.SEARCH:
+                self.dismiss((SelectionDialogAction.SEARCH, None))
 
-        if event.button.id == "cancel":
-            self.dismiss((DialogAction.CANCEL, None))
-            return
-        
-        if event.button.id == "search":
-            self.dismiss((DialogAction.SEARCH, None))
-            return
+            case SelectionDialogAction.BROWSE | SelectionDialogAction.SELECT:
+                index = self.query_one(ListView).index
 
-        index = self.query_one(ListView).index
+                if index is None:
+                    self.notify("Please select a game first.")
+                    return
 
-        if index is not None:
-            self.dismiss((DialogAction.SELECT, self.results[index]))
+                match event.button.id:
+                    case SelectionDialogAction.BROWSE:
+                        webbrowser.open(
+                            f"https://www.steamgriddb.com/game/{self.results[index]['id']}"
+                        )
+
+                    case SelectionDialogAction.SELECT:
+                        self.dismiss(
+                            (SelectionDialogAction.SELECT, self.results[index])
+                        )
 
     def action_dismiss(self):
-        self.dismiss(None)
+        self.dismiss((SelectionDialogAction.CANCEL, None))
+
 
 # ============================================================
 # SteamGridDB Dialog
@@ -2882,6 +3144,12 @@ def steamgriddb_search_name(game: Game) -> str:
 
     return name.strip()
 
+class SteamGridDBArtType(StrEnum):
+    GRIDS = "grids"
+    HEROES = "heroes"
+    LOGOS = "logos"
+    ICONS = "icons"
+
 class SteamGridDBClient:
     BASE_URL = "https://www.steamgriddb.com/api/v2"
 
@@ -2941,16 +3209,8 @@ class SteamGridDBClient:
 
     async def get_game(
         self,
-        game: Game,
+        game_id: str,
     ) -> dict | None:
-        if not game.steamgriddb:
-            return None
-
-        game_id = game.steamgriddb.get("id")
-
-        if game_id is None:
-            return None
-
         result = await self.get(f"games/id/{game_id}")
 
         if not result["success"]:
@@ -2965,7 +3225,7 @@ class SteamGridDBClient:
         if not game.steamgriddb:
             return None
 
-        game_id = game.steamgriddb.get("id")
+        game_id = game.steamgriddb.get("game", {}).get("id")
 
         if game_id is None:
             return None
@@ -2984,7 +3244,7 @@ class SteamGridDBClient:
     
     async def get_art(
         self,
-        kind: str,
+        kind: SteamGridDBArtType,
         game: Game,
     ) -> dict:
         if not game.steamgriddb:
@@ -2993,7 +3253,7 @@ class SteamGridDBClient:
                 "error": "Game is not linked to SteamGridDB.",
             }
 
-        game_id = game.steamgriddb.get("id")
+        game_id = game.steamgriddb.get("game", {}).get("id")
 
         if game_id is None:
             return {
@@ -3004,16 +3264,16 @@ class SteamGridDBClient:
         return await self.get(f"{kind}/game/{game_id}")
     
     async def get_grids(self, game: Game) -> dict:
-        return await self.get_art("grids", game)
+        return await self.get_art(SteamGridDBArtType.GRIDS, game)
 
     async def get_heroes(self, game: Game) -> dict:
-        return await self.get_art("heroes", game)
+        return await self.get_art(SteamGridDBArtType.HEROES, game)
 
     async def get_logos(self, game: Game) -> dict:
-        return await self.get_art("logos", game)
+        return await self.get_art(SteamGridDBArtType.LOGOS, game)
 
     async def get_icons(self, game: Game) -> dict:
-        return await self.get_art("icons", game)
+        return await self.get_art(SteamGridDBArtType.ICONS, game)
     async def get_all_art(
         self,
         game: Game,
@@ -3039,12 +3299,33 @@ class SteamGridDBClient:
             if not result["success"]:
                 return result
 
+        steam_art = steam_art_urls(game.steamgriddb.get("steam_platform_data"))
+
         game.steamgriddb["art"] = {
-            "grids": grids["data"],
-            "heroes": heroes["data"],
-            "logos": logos["data"],
-            "icons": icons["data"],
+            ArtworkType.GRID_PORTRAIT: [
+                grid
+                for grid in grids.get("data", [])
+                if classify_grid(grid) is ArtworkType.GRID_PORTRAIT
+            ],
+            ArtworkType.GRID_SQUARE: [
+                grid
+                for grid in grids.get("data", [])
+                if classify_grid(grid) is ArtworkType.GRID_SQUARE
+            ],
+            ArtworkType.GRID_LANDSCAPE: [
+                grid
+                for grid in grids.get("data", [])
+                if classify_grid(grid) is ArtworkType.GRID_LANDSCAPE
+            ],
+            ArtworkType.HERO: heroes.get("data", []),
+            ArtworkType.LOGO: logos.get("data", []),
+            ArtworkType.ICON: icons.get("data", []),
         }
+
+
+        for artwork_type, artwork in steam_art.items():
+            if artwork is not None:
+                game.steamgriddb["art"][artwork_type].insert(0, artwork)
 
         game.steamgriddb["cached"] = time.time()
 
