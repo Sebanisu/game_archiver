@@ -1,8 +1,6 @@
-# 1. Ignore everything
+# Ignore everything
 *
-# 2. Re-include the .gitignore file itself (highly recommended)
+
+# Keep these files
 !.gitignore
-!add_steam_entries.py
 !game_archiver.py
-!make_desktop_entries.sh
-!games.csv
