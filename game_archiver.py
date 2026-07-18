@@ -630,10 +630,16 @@ def steam_running() -> bool:
     except subprocess.CalledProcessError:
         return False
 
-def find_icon(root: Path) -> Path:
-    best_icon: Path | None = None
+@dataclass(order=True)
+class IconCandidate:
+    score: tuple
+    path: Path
+    kind: Literal["png", "ico", "exe"]
+
+
+def find_icons(root: Path) -> list[IconCandidate]:
+    icons: list[IconCandidate] = []
     best_exe: Path | None = None
-    best_size = -1
 
     for current, dirs, files in os.walk(root):
         depth = len(Path(current).relative_to(root).parts)
@@ -645,6 +651,7 @@ def find_icon(root: Path) -> Path:
         for file in sorted(files):
             path = Path(current) / file
             name = file.casefold()
+
             if path.suffix.casefold() == ".exe":
                 if (
                     best_exe is None
@@ -652,36 +659,88 @@ def find_icon(root: Path) -> Path:
                     < launcher_score(best_exe, root)
                 ):
                     best_exe = path
+                continue
 
             # Best possible icon
             if name == "window_icon.png":
-                return path
+                icons.append(
+                    IconCandidate(
+                        score=(0, 0),
+                        path=path,
+                        kind="png",
+                    )
+                )
+                continue
 
             # icon256.png / icon-512.png / icon_128.png
             if match := re.search(r"icon[-_]?(\d+)", name):
                 size = int(match.group(1))
-                if size > best_size:
-                    best_size = size
-                    best_icon = path
+                icons.append(
+                    IconCandidate(
+                        score=(1, -size),
+                        path=path,
+                        kind="png",
+                    )
+                )
                 continue
 
             # Fallbacks
-            if best_icon is None:
-                if (
-                    name == "icon.png"
-                    or name == "android-icon_foreground.png"
-                    or path.suffix.casefold() == ".ico"
-                ):
-                    best_icon = path
+            if name == "icon.png":
+                icons.append(
+                    IconCandidate(
+                        score=(2,0),
+                        path=path,
+                        kind="png",
+                    )
+                )
+                continue
 
-    if best_icon is not None:
-        return best_icon
+            if name == "android-icon_foreground.png":
+                icons.append(
+                    IconCandidate(
+                        score=(3,0),
+                        path=path,
+                        kind="png",
+                    )
+                )
+                continue
+
+            if path.suffix.casefold() == ".ico":
+                icons.append(
+                    IconCandidate(
+                        score=(4,0),
+                        path=path,
+                        kind="ico",
+                    )
+                )
 
     if best_exe is not None:
-        if icon := extract_exe_icon(best_exe):
-            return icon
+        icons.append(
+            IconCandidate(
+                score=(5,) + launcher_score(best_exe, root),
+                path=best_exe,
+                kind="exe",
+            )
+        )
 
-    return ICON_FALLBACK
+    icons.sort()
+    return icons
+
+
+def find_icon(root: Path) -> Path:
+    icons = find_icons(root)
+
+    if not icons:
+        return ICON_FALLBACK
+
+    best = icons[0]
+
+    if best.kind == "exe":
+        if icon := extract_exe_icon(best.path):
+            return icon
+        return ICON_FALLBACK
+
+    return best.path
 
 def launcher_score(path: Path, root: Path):
     name = path.stem.casefold()
@@ -2129,17 +2188,18 @@ class GameArchiver(App):
         game: Game,
         client: SteamGridDBClient,
     ):
-        art = await client.get_all_art(game)
+        art_data = await client.get_all_art(game)
+        local_icons = find_icons(launch_path(game))
 
-        if not art["success"]:
+        if not art_data["success"]:
             self.notify(art["error"])
             return
 
-        data = art["data"]
+        art = art_data["data"]
 
         while True:
             art_type = await self.push_screen_wait(
-                ArtworkTypeDialog(data)
+                ArtworkTypeDialog(art, local_icons)
             )
 
             match art_type:
@@ -2147,27 +2207,28 @@ class GameArchiver(App):
                     return
 
                 case ArtworkType.GRID_PORTRAIT:
-                    artwork = data[ArtworkType.GRID_PORTRAIT]
+                    artwork = art[ArtworkType.GRID_PORTRAIT]
 
                 case ArtworkType.GRID_SQUARE:
-                    artwork = data[ArtworkType.GRID_SQUARE]
+                    artwork = art[ArtworkType.GRID_SQUARE]
 
                 case ArtworkType.GRID_LANDSCAPE:
-                    artwork = data[ArtworkType.GRID_LANDSCAPE]
+                    artwork = art[ArtworkType.GRID_LANDSCAPE]
 
                 case ArtworkType.HERO:
-                    artwork = data[ArtworkType.HERO]
+                    artwork = art[ArtworkType.HERO]
 
                 case ArtworkType.LOGO:
-                    artwork = data[ArtworkType.LOGO]
+                    artwork = art[ArtworkType.LOGO]
 
                 case ArtworkType.ICON:
-                    artwork = data[ArtworkType.ICON]
+                    artwork = art[ArtworkType.ICON]
             action, selected = await self.push_screen_wait(
                 ArtworkSelectionDialog(
                     title=f"SteamGridDB {art_type.name.title()}",
                     artwork=artwork,
                     client=client,
+                    local_icons = local_icons if art_type == ArtworkType.ICON else None,
                 )
             )
             if action is ArtworkSelectionDialogAction.CANCEL:
@@ -2446,6 +2507,7 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
     def __init__(
         self,
         art: dict,
+        local_icons: list[IconCandidate]
     ):
         super().__init__()
         self.art = {
@@ -2464,6 +2526,8 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
         self.art[ArtworkType.LOGO]   = art.get(ArtworkType.LOGO, [])
         self.art[ArtworkType.ICON]   = art.get(ArtworkType.ICON, [])
 
+        self.local_icons = local_icons
+
 
 
     def compose(self) -> ComposeResult:
@@ -2472,7 +2536,7 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
         grids_landscape = len(self.art[ArtworkType.GRID_LANDSCAPE])
         heroes = len(self.art[ArtworkType.HERO])
         logos = len(self.art[ArtworkType.LOGO])
-        icons = len(self.art[ArtworkType.ICON])
+        icons = len(self.art[ArtworkType.ICON]) + len(self.local_icons)
     
         with Vertical(id="dialog"):
             yield Label("[b]Download Artwork[/b]")
@@ -2621,6 +2685,27 @@ class ArtworkPreview(Container):
     ) -> Path:
         return self.cache_dir() / f"{art['id']}.png"
 
+    async def show_local_art(self, art: dict):
+        if art["kind"] == "exe":
+            path = extract_exe_icon(art["path"])
+        else:
+            path = art["path"]
+
+        if path is None or not path.exists():
+            self.image = None
+            return
+
+        # load/display image from path
+        await self.remove_children()
+
+        await self.mount(
+            AutoImage(
+                path,
+                id="image",
+            )
+        )
+
+
     async def show_art(
         self,
         art: dict,
@@ -2645,6 +2730,10 @@ class ArtworkPreview(Container):
                 id="loading",
             )
         )
+
+        if art.get("source") == "local":
+            await self.show_local_art(art)
+            return
 
         if not path.exists():
             result = await self.client.download_file(
@@ -2735,12 +2824,25 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         title: str,
         artwork: list[dict],
         client: SteamGridDBClient,
+        local_icons: list[IconCandidate] | None
     ):
         super().__init__()
 
         self.title = title
         self.artwork = artwork
         self.client = client
+
+        if local_icons:
+            for icon in local_icons:
+                self.artwork.append({
+                    "id": icon.path.name,
+                    "path": icon.path,
+                    "url": icon.path.as_uri(),      # optional
+                    "score": icon.score,
+                    "style": "Local",
+                    "source": "local",
+                    "kind": icon.kind,
+                })
 
     def build_item(
         self,
@@ -2767,7 +2869,12 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         if art.get("lock"):
             details.append("🔒")
 
-        text = f"ID: {art['id']}"
+        text = art.get("path", art["id"])
+
+        if isinstance(text, Path):
+            text = text.name
+
+        text = f"{text}"
 
         if details:
             text += "\n    " + " • ".join(details)
@@ -2832,6 +2939,17 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         event: ListView.Highlighted,
     ):
         await self.update_preview()
+
+        index = event.list_view.index
+        if index is None:
+            return
+
+        art = self.artwork[index]
+
+        self.query_one(
+            f"#{ArtworkSelectionDialogAction.BROWSE}",
+            Button,
+        ).disabled = art.get("source") == "local"
 
     def on_button_pressed(
         self,
@@ -3087,7 +3205,8 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
                 ),
                 Button(
                     "Copy JSON", 
-                    id="copy"
+                    id="copy",
+                    disabled = self.game.steamgriddb != None
                 ),
                 Button(
                     "Cancel",
@@ -3099,13 +3218,20 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
         )
 
     def on_mount(self) -> None:
+
+        def json_default(obj):
+            if isinstance(obj, Path):
+                return str(obj)
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+        game_info_json = ""
         if self.game.steamgriddb:
-            self.query_one("#details", TextArea).text = json.dumps(
+            game_info_json = json.dumps(
                 self.game.steamgriddb,
-                indent=4,
+                indent=2,
                 sort_keys=True,
-                default=str,
+                default=json_default,
             )
+            self.query_one("#details", TextArea).text = game_info_json
 
     def on_button_pressed(
         self,
@@ -3129,12 +3255,7 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
 
             case "copy":
                 self.app.copy_to_clipboard(
-                    json.dumps(
-                        self.game.steamgriddb or {},
-                        indent=4,
-                        sort_keys=True,
-                        default=str,
-                    )
+                    game_info_json
                 )
 
             case "cancel":
