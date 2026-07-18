@@ -37,6 +37,7 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    TextArea,
     ListItem,
     ListView,
     Static,
@@ -208,6 +209,29 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+def add_dict(parts: list[str], data: dict, prefix: str = ""):
+    for key, value in data.items():
+        name = f"{prefix}.{key}" if prefix else key
+
+        if isinstance(value, dict):
+            add_dict(parts, value, name)
+
+        elif isinstance(value, list):
+            if not value:
+                parts.append(f"{name}: []")
+                continue
+
+            for i, item in enumerate(value):
+                if isinstance(item, dict):
+                    add_dict(parts, item, f"{name}[{i}]")
+                elif isinstance(item, list):
+                    parts.append(f"{name}[{i}]: {len(item)} items")
+                else:
+                    parts.append(f"{name}[{i}]: {item}")
+
+        else:
+            parts.append(f"{name}: {value}")
+
 def move_cache(
     old_path: Path,
     new_path: Path,
@@ -958,6 +982,16 @@ class GameRow(ListItem):
 
             if game_id := self.game.steamgriddb.get("id"):
                 parts.append(f"SteamGridDB ID: {game_id}")
+            # if game_details := self.game.steamgriddb.get("game"):
+            #     parts.append("")
+            #     parts.append("SteamGridDB Game Details")
+
+            #     add_dict(parts, game_details)
+            # if steam_platform_data := self.game.steamgriddb.get("steam_platform_data"):
+            #     parts.append("")
+            #     parts.append("SteamGridDB Steam Platform Data")
+
+            #     add_dict(parts, steam_platform_data)
         self.tooltip = "\n".join(part for part in parts if part)
 
 
@@ -1788,6 +1822,12 @@ class GameArchiver(App):
                     "name": selected["name"],
                     "search": query,
 
+                    # Full SteamGridDB game details.
+                    "game": None,
+
+                    # Steam platform data.
+                    "steam_platform_data": None,
+
                     # Unix timestamp of the last artwork metadata refresh.
                     "cached": None,
 
@@ -1807,6 +1847,16 @@ class GameArchiver(App):
                         "icon": None,
                     },
                 }
+                game_details = await client.get_game(game)
+
+                if game_details is not None:
+                    game.steamgriddb["game"] = game_details
+                
+                steam_platform_data = await client.get_steam_platform_data(game)
+
+                if steam_platform_data is not None:
+                    game.steamgriddb["steam_platform_data"] = steam_platform_data
+
                 SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
                 save_size_cache(SIZE_CACHE)
 
@@ -2694,15 +2744,21 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
     }
 
     #dialog {
-        width: 85;
+        width: 100;
+        height: 90%;
         border: round $primary;
         background: $surface;
         padding: 1 2;
     }
 
+    #details {
+        height: 1fr;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
     #buttons {
         align-horizontal: right;
-        margin-top: 1;
     }
 
     Button {
@@ -2727,6 +2783,13 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
                 f"ID: {sgdb.get('id', 'Unknown')}\n"
                 f"Search: {sgdb.get('search', '')}"
             ),
+
+            TextArea(
+                "",
+                id="details",
+                read_only=True,
+            ),
+
             Horizontal(
                 Button(
                     "Browse",
@@ -2742,6 +2805,10 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
                     id="change",
                 ),
                 Button(
+                    "Copy JSON", 
+                    id="copy"
+                ),
+                Button(
                     "Cancel",
                     id="cancel",
                 ),
@@ -2749,6 +2816,15 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
             ),
             id="dialog",
         )
+
+    def on_mount(self) -> None:
+        if self.game.steamgriddb:
+            self.query_one("#details", TextArea).text = json.dumps(
+                self.game.steamgriddb,
+                indent=4,
+                sort_keys=True,
+                default=str,
+            )
 
     def on_button_pressed(
         self,
@@ -2768,6 +2844,16 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
             case "change":
                 self.dismiss(
                     SteamGridDBAction.CHANGE
+                )
+
+            case "copy":
+                self.app.copy_to_clipboard(
+                    json.dumps(
+                        self.game.steamgriddb or {},
+                        indent=4,
+                        sort_keys=True,
+                        default=str,
+                    )
                 )
 
             case "cancel":
@@ -2802,7 +2888,7 @@ class SteamGridDBClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
 
-    async def get(self, endpoint: str) -> dict:
+    async def get(self, endpoint: str, params: dict | None = None) -> dict:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
         }
@@ -2811,6 +2897,7 @@ class SteamGridDBClient:
             response = await client.get(
                 f"{self.BASE_URL}/{endpoint}",
                 headers=headers,
+                params=params,
             )
 
         try:
@@ -2844,6 +2931,7 @@ class SteamGridDBClient:
             "data": payload["data"],
         }
 
+
     async def search_game(
         self,
         query: str,
@@ -2869,6 +2957,31 @@ class SteamGridDBClient:
             return None
 
         return result["data"]
+
+    async def get_steam_platform_data(
+        self,
+        game: Game,
+    ) -> dict | None:
+        if not game.steamgriddb:
+            return None
+
+        game_id = game.steamgriddb.get("id")
+
+        if game_id is None:
+            return None
+
+        result = await self.get(
+            f"games/id/{game_id}",
+            params={
+                "platformdata": "steam",
+            },
+        )
+
+        if not result["success"]:
+            return None
+
+        return result["data"]
+    
     async def get_art(
         self,
         kind: str,
