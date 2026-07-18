@@ -19,10 +19,11 @@ import httpx
 import datetime
 from enum import Enum, auto, StrEnum
 from urllib.parse import quote
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from hashlib import sha1
-
+from asyncio import to_thread
+from typing import Literal
 from PIL import Image
 
 import vdf
@@ -53,15 +54,32 @@ except ImportError:
 # ============================================================
 # CONFIG
 # ============================================================
-CONFIG_DIR = Path.home() / ".config/game_archiver"
+CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
+GAME_DATA = CONFIG_DIR / "game_data.json"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_DIR = Path.home() / ".cache" / "game_archiver"
+ICON_CACHE = CACHE_DIR / "icons"
+IMAGE_CACHE = CACHE_DIR / "steamgriddb" / "url"
+THUMB_CACHE = CACHE_DIR / "steamgriddb" / "thumbs"
+#STEAM_ART_CACHE = CACHE_DIR / "steam"
+
+ICON_CACHE.mkdir(parents=True, exist_ok=True)
+IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
+THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+#STEAM_ART_CACHE.mkdir(parents=True, exist_ok=True)
+
+STEAM_STORE_CDN = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"
+STEAM_ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/apps/"
+STEAM_CLIENTICON_CDN = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
+
+
 LOCAL_SHARED_DIR = Path.home() / "Games/shared"
 REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
 REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
 POOL_DIR = Path("/mnt/media/pool")
-CACHE_FILE = Path.home() / ".cache/game_archiver_sizes.json"
 PROTON = (
     Path.home()
     / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
@@ -107,20 +125,21 @@ LAUNCHER_EXTS = (
     ".apk"
 )
 
-ICON_CACHE = (
-    Path.home()
-    / ".cache/game_archiver/icons"
-)
-ICON_CACHE.mkdir(parents=True, exist_ok=True)
 
-STEAM_ART_CACHE = (
-    Path.home()
-    / ".cache/game_archiver/steam"
-)
+Filter = Literal["false", "true", "any"]
 
-STEAM_STORE_CDN = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"
-STEAM_ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/apps/"
-STEAM_CLIENTICON_CDN = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
+@dataclass(slots=True)
+class SearchOptions:
+    nsfw: Filter = "any"
+    humor: Filter = "any"
+    epilepsy: Filter = "any"
+
+    def params(self) -> dict[str, str]:
+        return {
+            k: v
+            for k, v in asdict(self).items()
+            if v is not None
+        }
 
 # ============================================================
 # MODEL
@@ -217,6 +236,29 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+async def get_asset_file(client: SteamGridDBClient, art: dict) -> Path | None:
+    if art.get("source") == "local":
+        if art.get("kind") == "exe":
+            return extract_exe_icon(art["path"])
+        return art["path"]
+
+    path = IMAGE_CACHE / f"{art['id']}.png"
+    if not path.exists():
+        result = await client.download_file(
+            art["url"],
+            path,
+        )
+
+        if not result["success"]:
+            return None    
+    return path
+
+def json_default(obj):
+    if isinstance(obj, Path):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
 class ArtworkType(StrEnum):
     GRID_PORTRAIT = "grid_portrait"
     GRID_SQUARE = "grid_square"
@@ -558,17 +600,17 @@ def extract_exe_icon(exe: Path) -> Path | None:
     key = hashlib.sha1(
         f"{exe.resolve()}:{exe.stat().st_mtime_ns}".encode()
     ).hexdigest()
-
+    def image_width(path: Path) -> int:
+        with Image.open(path) as img:
+            return img.width
     out_dir = ICON_CACHE / key
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    pngs = list(out_dir.glob("*.png"))
-    if pngs:
-        return max(
-            pngs,
-            key=lambda p: Image.open(p).width,
-        )
-
+    if out_dir.exists():
+        pngs = list(out_dir.glob("*.png"))
+        if pngs:
+            return max(pngs, key=image_width)
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
             [
@@ -607,10 +649,7 @@ def extract_exe_icon(exe: Path) -> Path | None:
         if not pngs:
             return None
 
-        return max(
-            pngs,
-            key=lambda p: Image.open(p).width,
-        )
+        return max(pngs, key=image_width)
 
     except (
         subprocess.CalledProcessError,
@@ -974,17 +1013,17 @@ def find_launcher(path: Path) -> Path | None:
 
 def load_size_cache() -> dict:
     try:
-        with CACHE_FILE.open() as f:
+        with GAME_DATA.open() as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def save_size_cache(cache: dict):
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+def save_game_data(cache: dict):
+    GAME_DATA.parent.mkdir(parents=True, exist_ok=True)
 
-    with CACHE_FILE.open("w") as f:
-        json.dump(cache, f)
+    with GAME_DATA.open("w") as f:
+        json.dump(cache, f,indent=2,sort_keys=True,default=json_default)
 
 
 SIZE_CACHE = load_size_cache()
@@ -1033,7 +1072,7 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
         "steamgriddb": steamgriddb,
     }
 
-    save_size_cache(SIZE_CACHE)
+    save_game_data(SIZE_CACHE)
 
     return size, mtime, last_played, steamgriddb
 
@@ -1255,13 +1294,13 @@ class GameRow(ListItem):
                     f"Steam LaunchOptions: {launch_options}"
                 )
         if self.game.steamgriddb:
-            if name := self.game.steamgriddb.get("name"):
+            if name := self.game.steamgriddb.get("name", self.game.steamgriddb.get("game", {}).get("name")):
                 parts.append(f"SteamGridDB: {name}")
 
             if search := self.game.steamgriddb.get("search"):
                 parts.append(f"SteamGridDB Search: {search}")
 
-            if game_id := self.game.steamgriddb.get("id"):
+            if game_id := self.game.steamgriddb.get("id", self.game.steamgriddb.get("game", {}).get("id")):
                 parts.append(f"SteamGridDB ID: {game_id}")
             # if game_details := self.game.steamgriddb.get("game"):
             #     parts.append("")
@@ -1863,7 +1902,7 @@ class GameArchiver(App):
         SIZE_CACHE[key]["last_played"] = time.time()
         game.last_played = SIZE_CACHE[key]["last_played"]
 
-        save_size_cache(SIZE_CACHE)
+        save_game_data(SIZE_CACHE)
 
         if game in self.shared_games:
             sort_games(self.shared_games)
@@ -2079,7 +2118,7 @@ class GameArchiver(App):
 
                 game.steamgriddb["search"] = query
                 SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-                save_size_cache(SIZE_CACHE)
+                save_game_data(SIZE_CACHE)
 
                 continue
 
@@ -2147,7 +2186,7 @@ class GameArchiver(App):
             # await download_steam_art(game)
 
             SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-            save_size_cache(SIZE_CACHE)
+            save_game_data(SIZE_CACHE)
 
             self.notify(f"Selected {selected['name']}")
             self.refresh_game_row(game)
@@ -2189,7 +2228,7 @@ class GameArchiver(App):
         client: SteamGridDBClient,
     ):
         art_data = await client.get_all_art(game)
-        local_icons = find_icons(launch_path(game))
+        local_icons = await to_thread(find_icons, launch_path(game))
 
         if not art_data["success"]:
             self.notify(art["error"])
@@ -2231,9 +2270,19 @@ class GameArchiver(App):
                     local_icons = local_icons if art_type == ArtworkType.ICON else None,
                 )
             )
-            if action is ArtworkSelectionDialogAction.CANCEL:
-                continue  # show ArtworkTypeDialog again
-            break
+            match action:
+                case ArtworkSelectionDialogAction.CANCEL:
+                    continue  # show ArtworkTypeDialog again
+                    break
+                case ArtworkSelectionDialogAction.DOWNLOAD:
+                    selected_info = game.steamgriddb["selected"].get(art_type)
+                    if selected_info is None:
+                        selected_info = {}
+                        game.steamgriddb["selected"][art_type] = selected_info
+                    selected_info["asset"] = selected
+                    selected_info["downloaded_path"] = await get_asset_file(client, selected)
+                    save_game_data(SIZE_CACHE)
+                    continue  # stay in the artwork picker
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
@@ -2663,31 +2712,15 @@ class ArtworkPreview(Container):
             id="placeholder",
         )
 
-    def cache_dir(self) -> Path:
-        path = (
-            Path.home()
-            / ".cache"
-            / "game_archiver"
-            / "steamgriddb"
-            / "thumbs"
-        )
-
-        path.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        return path
-
     def cache_file(
         self,
         art: dict,
     ) -> Path:
-        return self.cache_dir() / f"{art['id']}.png"
+        return THUMB_CACHE / f"{art['id']}.png"
 
     async def show_local_art(self, art: dict):
         if art["kind"] == "exe":
-            path = extract_exe_icon(art["path"])
+            path = await to_thread(extract_exe_icon, art["path"])
         else:
             path = art["path"]
 
@@ -3178,8 +3211,8 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
         yield Vertical(
             Label("[b]SteamGridDB[/b]"),
             Label(
-                f"Name: {sgdb.get('name', 'Unknown')}\n"
-                f"ID: {sgdb.get('id', 'Unknown')}\n"
+                f"Name: {sgdb.get('game',{}).get('name', 'Unknown')}\n"
+                f"ID: {sgdb.get('game',{}).get('id', 'Unknown')}\n"
                 f"Search: {sgdb.get('search', '')}"
             ),
 
@@ -3219,10 +3252,6 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
 
     def on_mount(self) -> None:
 
-        def json_default(obj):
-            if isinstance(obj, Path):
-                return str(obj)
-            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
         game_info_json = ""
         if self.game.steamgriddb:
             game_info_json = json.dumps(
@@ -3400,8 +3429,8 @@ class SteamGridDBClient:
                 "success": False,
                 "error": "Game is not linked to SteamGridDB.",
             }
-
-        return await self.get(f"{kind}/game/{game_id}")
+        options = SearchOptions()
+        return await self.get(f"{kind}/game/{game_id}", params=options.params())
     
     async def get_grids(self, game: Game) -> dict:
         return await self.get_art(SteamGridDBArtType.GRIDS, game)
@@ -3470,7 +3499,7 @@ class SteamGridDBClient:
         game.steamgriddb["cached"] = time.time()
 
         SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-        save_size_cache(SIZE_CACHE)
+        save_game_data(SIZE_CACHE)
 
         return {
             "success": True,
