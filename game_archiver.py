@@ -118,9 +118,9 @@ STEAM_ART_CACHE = (
     / ".cache/game_archiver/steam"
 )
 
-STEAM_CDN = "https://shared.fastly.steamstatic.com/store_item_assets"
-
-
+STEAM_STORE_CDN = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"
+STEAM_ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/apps/"
+STEAM_CLIENTICON_CDN = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
 
 # ============================================================
 # MODEL
@@ -312,33 +312,51 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
 
     def build(steam_type: str) -> dict | None:
         data = meta.get(f"{steam_type}_full")
+        icon = meta.get("icon")
+        clienticon = meta.get("clienticon")
 
-        if isinstance(data, dict):
-            thumb = preferred_language(data.get("image", data))
-            full = preferred_language(data.get("image2x", data.get("image", data)))
+        language = "english"
 
-            if thumb is None:
-                return None
-
-            language, thumb_file = thumb
-
-            if full is None:
-                full_file = thumb_file
+        if steam_type == "icon":
+            if clienticon:
+                thumb_url = full_url = (
+                    f"{STEAM_CLIENTICON_CDN}{appid}/{clienticon}.ico"
+                )
+            elif icon:
+                thumb_url = full_url = (
+                    f"{STEAM_ICON_CDN}{appid}/{icon}.jpg"
+                )
             else:
-                _, full_file = full
-        else:
-            fallback = FALLBACKS.get(steam_type)
-            if fallback is None:
                 return None
 
-            thumb_file, full_file = fallback["thumb"], fallback["full"]
-            language = "english"
+        else:
+            if isinstance(data, dict):
+                thumb = preferred_language(data.get("image", data))
+                full = preferred_language(
+                    data.get("image2x", data.get("image", data))
+                )
+
+                if thumb is None:
+                    return None
+
+                language, thumb_file = thumb
+
+                if full is None:
+                    full_file = thumb_file
+                else:
+                    _, full_file = full
+            else:
+                fallback = FALLBACKS.get(steam_type)
+                if fallback is None:
+                    return None
+
+                thumb_file = fallback["thumb"]
+                full_file = fallback["full"]
+
+            thumb_url = f"{STEAM_STORE_CDN}{appid}/{thumb_file}"
+            full_url = f"{STEAM_STORE_CDN}{appid}/{full_file}"
 
         mtime = meta.get("store_asset_mtime")
-
-        thumb_url = f"{STEAM_CDN}/steam/apps/{appid}/{thumb_file}"
-        full_url = f"{STEAM_CDN}/steam/apps/{appid}/{full_file}"
-
         if mtime:
             thumb_url += f"?t={mtime}"
             full_url += f"?t={mtime}"
@@ -362,20 +380,21 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
     # if icon:
     #     urls["icon"] = (
     #         "steam",
-    #         f"{STEAM_CDN}/steam/apps/{appid}/{icon}.ico",
+    #         f"{STEAM_STORE_CDN}/steam/apps/{appid}/{icon}.ico",
     #     )
 
     # clienticon = meta.get("clienticon")
     # if clienticon:
     #     urls["clienticon"] = (
     #         "steam",
-    #         f"{STEAM_CDN}/steam/apps/{appid}/{clienticon}.ico",
+    #         f"{STEAM_STORE_CDN}/steam/apps/{appid}/{clienticon}.ico",
     #     )
 
     art[ArtworkType.GRID_PORTRAIT] = build("library_capsule")
     art[ArtworkType.GRID_LANDSCAPE] = build("header_image")
     art[ArtworkType.HERO] = build("library_hero")
     art[ArtworkType.LOGO] = build("library_logo")
+    art[ArtworkType.ICON] = build("icon") # uses clienticon and falls back to icon
     return art
 
 
