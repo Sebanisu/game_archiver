@@ -17,7 +17,9 @@ import tomllib
 import webbrowser
 import httpx
 import copy
+import stat
 import datetime
+from typing import cast
 from enum import Enum, auto, StrEnum
 from urllib.parse import quote
 from dataclasses import asdict, dataclass
@@ -25,6 +27,7 @@ from pathlib import Path
 from hashlib import sha1
 from asyncio import to_thread
 from typing import Literal
+from typing import TypedDict
 from PIL import Image
 
 import vdf
@@ -58,6 +61,8 @@ except ImportError:
 CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
+RESCAN_INTERVAL_SEC = 1 * 60
+SYNC_STATUS_INTERVAL_SEC = 30
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -172,6 +177,15 @@ class SearchOptions:
 # MODEL
 # ============================================================
 
+
+class CacheEntry(TypedDict):
+    mtime: float
+    size: int
+    last_played: float
+    steamgriddb: dict[str, object]
+    file_count: int
+
+SizeCache = dict[str, CacheEntry]
 @dataclass
 class LaunchInfo:
     cmd: list[str]
@@ -181,10 +195,11 @@ class LaunchInfo:
 def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
     if game.launcher is None:
         game.launcher = find_launcher(launch_path(game))
-        save_game_data(SIZE_CACHE)
+        save_game_data()
 
     if game.launcher is None:
-        raise ValueError("Game has no launcher")
+        self.notify(f"No launcher found for '{game.name}'.")
+        return
     launcher = game.launcher
     env = os.environ.copy()
 
@@ -258,8 +273,8 @@ ls "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows/system32" | grep -i d3d
 echo
 
 echo "=== Installed DLLs ==="
-find "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows" \
-    \( -iname "d3d*.dll" -o -iname "d3dx*.dll" -o -iname "xinput*.dll" \)
+find "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows" \\
+    \\( -iname "d3d*.dll" -o -iname "d3dx*.dll" -o -iname "xinput*.dll" \\)
 echo
 
 echo "=== Looking for D3DX ==="
@@ -313,9 +328,36 @@ class Game:
     steamgriddb: dict | None = None
 
 
+
 # ============================================================
 # HELPERS
 # ============================================================
+def merge_games(existing, scanned):
+    # Existing games by unique key
+    existing_map = {g.path: g for g in existing}
+    scanned_map = {g.path: g for g in scanned}
+
+    # Remove games that no longer exist
+    existing[:] = [g for g in existing if g.path in scanned_map]
+
+    # Add newly discovered games
+    for path, game in scanned_map.items():
+        if path not in existing_map:
+            existing.append(game)
+
+    sort_games(existing)
+
+def executable_files(root: Path) -> list[Path]:
+    executables = []
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+
+        exec_bits = path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP)
+        if exec_bits:
+            executables.append(path.relative_to(root))
+    return executables
 
 async def get_asset_file(client: SteamGridDBClient, art: dict) -> Path | None:
     if art.get("source") == "local":
@@ -528,12 +570,13 @@ def move_cache(
 
     entry = SIZE_CACHE.pop(old_key, None)
     if entry is None:
-        return
+        return None
 
     entry["mtime"] = new_path.stat().st_mtime
     SIZE_CACHE[new_key] = entry
 
-    save_game_data(SIZE_CACHE)
+    save_game_data()
+    return entry
 
 def launcher_signature(path: str | Path) -> tuple[str, str]:
     path = Path(normalize_exe(str(path)))
@@ -814,10 +857,15 @@ def launcher_score(path: Path, root: Path):
     if any(bad in name for bad in BAD_LAUNCHER_NAMES):
         score += 1000
 
+    try:
+        ext_score = LAUNCHER_EXTS.index(path.suffix)
+    except ValueError:
+        ext_score = len(LAUNCHER_EXTS)
+
     return (
         score,
         len(path.relative_to(root).parts),
-        LAUNCHER_EXTS.index(path.suffix),
+        ext_score,
         natural_key(path.stem),
     )
 
@@ -952,7 +1000,7 @@ def shortcut_target(entry: dict) -> str:
 def find_existing_shortcut(
     entries: dict,
     game: Game,
-):
+) -> str | None:
     target_name = game.name.casefold()
     target_exe = (
         normalize_exe(str(game.launcher))
@@ -1030,12 +1078,24 @@ def find_launcher(path: Path) -> Path | None:
     launchers: list[Path] = []
 
     for p in path.iterdir():
-        if p.is_file() and p.suffix in LAUNCHER_EXTS:
-            launchers.append(p)
+        if p.is_file():
+            if p.suffix in LAUNCHER_EXTS or (p.stat().st_mode & (
+                stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH
+            )):
+                launchers.append(p)
 
-        if p.is_dir():
+        elif p.is_dir():
             for child in p.iterdir():
-                if child.is_file() and child.suffix in LAUNCHER_EXTS:
+                if child.is_file() and (
+                    child.suffix in LAUNCHER_EXTS
+                    or child.stat().st_mode & (
+                        stat.S_IXUSR
+                        | stat.S_IXGRP
+                        | stat.S_IXOTH
+                    )
+                ):
                     launchers.append(child)
 
     if not launchers:
@@ -1046,22 +1106,26 @@ def find_launcher(path: Path) -> Path | None:
         key=lambda p: launcher_score(p, path),
     )
 
-def load_size_cache() -> dict:
+def load_size_cache() -> SizeCache:
     try:
         with GAME_DATA.open() as f:
-            return json.load(f)
+            return cast(SizeCache, json.load(f))
     except Exception:
         return {}
 
+SIZE_CACHE: SizeCache = load_size_cache()
 
-def save_game_data(cache: dict):
+def save_game_data():
     GAME_DATA.parent.mkdir(parents=True, exist_ok=True)
 
     with GAME_DATA.open("w") as f:
-        json.dump(cache, f,indent=2,sort_keys=True,default=json_default)
-
-
-SIZE_CACHE = load_size_cache()
+        json.dump(
+            SIZE_CACHE,
+            f,
+            indent=2,
+            sort_keys=True,
+            default=json_default,
+        )
 
 def cached_dir_info(path: Path) -> tuple[int, float]:
     key = str(path)
@@ -1071,7 +1135,7 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
     except Exception:
         return 0, 0.0
 
-    cached = SIZE_CACHE.get(key)
+    cached = SIZE_CACHE.get(key) or {}
     
     last_played = (
         cached.get("last_played", 0.0)
@@ -1091,7 +1155,7 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
 
     if (
         cached is not None
-        and cached["mtime"] == mtime
+        and cached.get("mtime", 0) == mtime
         and file_count == cached_file_count
     ):
         return (        
@@ -1112,7 +1176,7 @@ def cached_dir_info(path: Path) -> tuple[int, float]:
         "file_count": file_count,
     }
 
-    save_game_data(SIZE_CACHE)
+    save_game_data()
 
     return size, mtime, last_played, steamgriddb
 
@@ -1399,8 +1463,9 @@ class GameArchiver(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.computing_sizes = True
-        self.detecting_steam = True
+        self.computing_sizes = False
+        self.detecting_steam = False
+        self.moving = False
         self.dialog_open = False
         self.game_rows = {}
         self.sync_status = "Unknown"
@@ -1469,25 +1534,37 @@ class GameArchiver(App):
         game.in_steam = True
 
         return changed
-
-    def can_modify_steam(self) -> bool:
+    def is_scan_running(self) -> bool:
         if self.detecting_steam:
             self.notify(
                 "Please wait for the Steam scan to finish."
             )
-            return False
+            return True
+        if self.computing_sizes:
+            self.notify(
+                "Please wait for the size scan to finish."
+            )
+            return True
+        if self.moving:
+            self.notify(
+                "Please wait for moving to complete."
+            )
+            return True
+        return False
+
+    def can_modify_steam(self) -> bool:
+        
         if steam_running():
             self.notify(
                 "Steam is running. Close Steam before modifying shortcuts."
             )
             return False
-
-        return True
+        return not self.is_scan_running()
 
     def update_game_steam_status(
         self,
         game: Game,
-        entries: dict,
+        entries: dict[str, dict],
     ):
         if game.launcher is None:
             game.launcher = find_launcher(launch_path(game))
@@ -1498,40 +1575,39 @@ class GameArchiver(App):
         game.in_steam = False
         game.steam_broken = False
         game.duplicate_steam = False
-        game.steam_key = None
         game.steam_entry = None
 
         if game.launcher is None:
             return
 
-        key = find_existing_shortcut(
-            entries,
-            game,
-        )
+        key = game.steam_key
+
+        # Reuse the cached shortcut if it still exists.
+        if key is None or key not in entries:
+            key = find_existing_shortcut(
+                entries,
+                game,
+            )
+
+            # Only replace the cached key with what we actually found.
+            game.steam_key = key
 
         if key is None:
             return
 
-        game.in_steam = True
-
         entry = entries[key]
+
+        game.in_steam = True
+        game.steam_entry = entry
+
         exe = shortcut_target(entry)
         expected = normalize_exe(str(game.launcher))
 
         if exe != expected:
             if Path(exe).exists():
                 game.duplicate_steam = True
-                self.notify(
-                    f"{repr(exe)} == {repr(expected)}"
-                )
-                self.notify(
-                    f"{len(exe)} == {len(expected)}"
-                )
             else:
                 game.steam_broken = True
-
-        game.steam_key = key
-        game.steam_entry = entry
 
     def compute_steam_status(self):
         user = self.current_steam_user()
@@ -1555,13 +1631,6 @@ class GameArchiver(App):
 
         self.call_from_thread(self.steam_scan_finished)
         self.call_from_thread(self.update_status)
-
-    def start_steam_scan(self):
-        self.run_worker(
-            self.compute_steam_status,
-            thread=True,
-            name="compute-steam",
-        )
 
     def current_steam_user(self) -> SteamUser | None:
         if not self.steam_users:
@@ -1659,17 +1728,25 @@ class GameArchiver(App):
     def steam_scan_finished(self):
         self.detecting_steam = False
 
-    def start_scan(self):
-        self.computing_sizes = True
-        self.detecting_steam = True
+    def start_scan(self) -> bool:
         self.refresh_bindings()
         self.update_status()
+        if self.is_scan_running() or self.dialog_open:
+            return False
 
+        self.computing_sizes = True
         self.run_worker(
             self.compute_sizes,
             thread=True,
             name="compute-sizes",
         )
+        self.detecting_steam = True
+        self.run_worker(
+            self.compute_steam_status,
+            thread=True,
+            name="compute-steam",
+        )
+        return True
 
     def on_mount(self):
         self.shared_view.border_title = " Shared / Synced "
@@ -1687,14 +1764,13 @@ class GameArchiver(App):
         self.shared_view.focus()
 
         self.start_scan()
-        self.start_steam_scan()
         
         self.set_interval(
-            5,
+            SYNC_STATUS_INTERVAL_SEC,
             self.refresh_sync_status,
         )
         self.set_interval(
-            60,
+            RESCAN_INTERVAL_SEC,
             self.refresh_if_changed,
         )
         if len(self.steam_users) > 1:
@@ -1813,11 +1889,6 @@ class GameArchiver(App):
 
     def action_auto_select(self):
         game_saved = self.get_highlighted_game()
-        if self.computing_sizes:
-            self.notify(
-                "Please wait for size scan to finish."
-            )
-            return
 
         for g in self.shared_games:
             g.selected = False
@@ -1845,55 +1916,42 @@ class GameArchiver(App):
 
         self.refresh_views(game_saved)
 
-    def action_move_selected(self):
+    async def action_move_selected(self):
         if not self.can_modify_steam():
             return
+        self.moving = True
         game_saved = self.get_highlighted_game()
-        if self.computing_sizes:
-            self.notify(
-                "Please wait for size scan to finish."
-            )
-            return
+        
 
         if self.shared_view.has_focus:
-            moving = [g for g in self.shared_games if g.selected]
-
-            if not moving:
-                self.notify("No games selected")
-                return
-
-            self.move_games(
-                self.shared_games,
-                ARCHIVED_DIR
-            )
-
+            source = self.shared_games
+            destination = self.archived_games
+            target = ARCHIVED_DIR
         else:
-            moving = [g for g in self.archived_games if g.selected]
+            source = self.archived_games
+            destination = self.shared_games
+            target = SHARED_DIR
 
-            if not moving:
-                self.notify("No games selected")
-                return
+        moved = await self.move_games(source, destination, target)
 
-            self.move_games(
-                self.archived_games,
-                SHARED_DIR
-            )
+        
+        if not moved:
+            self.moving = False
+            self.notify("No games selected")
+            return        
 
-        for g in self.shared_games:
-            g.selected = False
 
-        for g in self.archived_games:
-            g.selected = False
-
-        self.shared_games = scan_games(SHARED_DIR)
-        self.archived_games = scan_games(ARCHIVED_DIR)
+        #self.shared_games = scan_games(SHARED_DIR)
+        #self.archived_games = scan_games(ARCHIVED_DIR)
         self.refresh_views(game_saved)
-        self.start_scan()
-        self.start_steam_scan()
+        #self.start_scan()
+        self.moving = False
 
-    async def move_games(self, games: list[Game], target: Path):
+    async def move_games(self, source_games: list[Game], destination_games: list[Game], target: Path) -> bool:
 
-        moving = [g for g in games if g.selected]
+        moving = [g for g in source_games if g.selected]
+        if not moving:
+            return False
 
         target.mkdir(
             parents=True,
@@ -1903,33 +1961,56 @@ class GameArchiver(App):
         for game in moving:
             self.notify(f"Moving {game.name}")
             old_path = game.path
-
             new_path = target / game.name
 
-            shutil.move(old_path, new_path)
-            move_cache(old_path, new_path)
+            executables = executable_files(old_path)
+
+            await to_thread(shutil.move, old_path, new_path)
+
+            for rel_path in executables:
+                path = new_path / rel_path
+
+                if path.exists():
+                    mode = path.stat().st_mode
+                    path.chmod(
+                        mode
+                        | stat.S_IXUSR
+                        | stat.S_IXGRP
+                    )
 
             game.path = new_path
             game.launcher = find_launcher(launch_path(game))
             game.icon = find_icon(launch_path(game))
 
+            entry = move_cache(old_path, new_path)
+            if entry:
+                #not sure how these are linked really. heh
+                entry["path"] = game.path
+                entry["launcher"] = game.launcher
+                entry["icon"] = game.icon
+
+                save_game_data()
+
+                
+
             await self.sync_shortcut(game)
+            game.selected = False
+            source_games.remove(game)
+            destination_games.append(game)
+        sort_games(source_games)
+        sort_games(destination_games)
+        return True
 
 
     def action_refresh(self):
         game_saved = self.get_highlighted_game()
-        if self.computing_sizes:
-            self.notify(
-                "Please wait for size scan to finish."
-            )
+        if self.is_scan_running():
             return
 
-        self.shared_games = scan_games(SHARED_DIR)
-        self.archived_games = scan_games(ARCHIVED_DIR)
-
+        merge_games(self.shared_games, scan_games(SHARED_DIR))
+        merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
         self.refresh_views(game_saved)
         self.start_scan()
-        self.start_steam_scan()
 
     def action_launch(self):
         game = self.get_highlighted_game()
@@ -1943,7 +2024,7 @@ class GameArchiver(App):
         SIZE_CACHE[key]["last_played"] = time.time()
         game.last_played = SIZE_CACHE[key]["last_played"]
 
-        save_game_data(SIZE_CACHE)
+        save_game_data()
 
         if game in self.shared_games:
             sort_games(self.shared_games)
@@ -2159,7 +2240,7 @@ class GameArchiver(App):
 
                 game.steamgriddb["search"] = query
                 SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-                save_game_data(SIZE_CACHE)
+                save_game_data()
 
                 continue
 
@@ -2227,7 +2308,7 @@ class GameArchiver(App):
             # await download_steam_art(game)
 
             SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-            save_game_data(SIZE_CACHE)
+            save_game_data()
 
             self.notify(f"Selected {selected['name']}")
             self.refresh_game_row(game)
@@ -2322,7 +2403,7 @@ class GameArchiver(App):
                         game.steamgriddb["selected"][art_type] = selected_info
                     selected_info["asset"] = selected
                     selected_info["downloaded_path"] = await get_asset_file(client, selected)
-                    save_game_data(SIZE_CACHE)
+                    save_game_data()
                     if selected_info["downloaded_path"]:
                         await self.install_artwork(
                             game,
@@ -2387,6 +2468,8 @@ class GameArchiver(App):
                 continue
 
             for ext in ImageExtension:
+                if ext == ImageExtension.EXE:
+                    continue
                 old = grid_dir / f"{old_appid}{suffix}{ext}"
 
                 if not old.exists():
@@ -3616,7 +3699,7 @@ class SteamGridDBClient:
         game.steamgriddb["cached"] = time.time()
 
         SIZE_CACHE[cache_key]["steamgriddb"] = game.steamgriddb
-        save_game_data(SIZE_CACHE)
+        save_game_data()
 
         return {
             "success": True,
