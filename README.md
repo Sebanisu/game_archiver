@@ -16,6 +16,10 @@ This is primarily a personal project that I work on here and there. It isn't bug
 
 I also used AI to help build parts of this project. I didn't know about [Textual](https://textual.textualize.io/) before starting this project, and it ended up being a good way to build the terminal interface. The application also supports displaying images directly in the terminal.
 
+<img width="1706" height="922" alt="image" src="https://github.com/user-attachments/assets/8768cbac-e2e7-458b-a500-82ac538f4868" />
+
+>**Note:** Screenshot sanitized for privacy; game names and Steam account information have been replaced with fictional data.
+
 ## How It Works
 
 Basic layout:
