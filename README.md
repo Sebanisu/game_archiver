@@ -1,7 +1,3 @@
-Here’s a cleaned-up version with more straightforward language, less repetition, and your requested license wording fixed:
-
----
-
 # Game Archiver
 
 A Linux terminal application for managing games across a synced game library and a remote archive.
