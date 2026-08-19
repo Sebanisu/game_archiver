@@ -63,6 +63,7 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
+MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -127,6 +128,7 @@ IGNORE_DIRS = {
     "compatdata",
     "cache",
     ".cache",
+    "__pycache__",
 }
 
 LAUNCHER_EXTS = (
@@ -1127,60 +1129,6 @@ def save_game_data():
             default=json_default,
         )
 
-def cached_dir_info(path: Path) -> tuple[int, float]:
-    key = str(path)
-
-    try:
-        mtime = path.stat().st_mtime
-    except Exception:
-        return 0, 0.0
-
-    cached = SIZE_CACHE.get(key) or {}
-    
-    last_played = (
-        cached.get("last_played", 0.0)
-        if cached
-        else 0.0
-    )
-
-    steamgriddb = (
-        cached.get("steamgriddb", {})
-        if cached
-        else {}
-    )
-
-
-    file_count = sum(1 for _ in os.scandir(path))
-    cached_file_count = cached.get("file_count", 0)
-
-    if (
-        cached is not None
-        and cached.get("mtime", 0) == mtime
-        and file_count == cached_file_count
-    ):
-        return (        
-            cached["size"],
-            cached["mtime"],
-            last_played,
-            steamgriddb,
-        )
-    size = dir_size(path)
-
-    
-
-    SIZE_CACHE[key] = {
-        "mtime": mtime,
-        "size": size,
-        "last_played": last_played,
-        "steamgriddb": steamgriddb,
-        "file_count": file_count,
-    }
-
-    save_game_data()
-
-    return size, mtime, last_played, steamgriddb
-
-
 def game_list_changed(
         path: Path,
         games: list[Game],
@@ -1229,20 +1177,47 @@ def fmt_size(num: int) -> str:
     if gb >= 1:
         return f"{gb:.1f} GB"
 
-    return f"{num / (1024 ** 2):.0f} MB"
+    mb = num / (1024 ** 2)
+
+    if mb >= 1:
+        return f"{mb:.1f} MB"
+    if mb == 0:
+        return ""
+
+    return f"{num / 1024:.1f} KB"
 
 
 def dir_size(path: Path) -> int:
     try:
+        if path.is_symlink():
+            target = path.resolve()
+        else:
+            target = path
+
+        exclude_args = [
+            f"--exclude={name}"
+            for name in IGNORE_DIRS
+        ]
+
         result = subprocess.run(
-            ["du", "-sb", str(path)],
+            [
+                "du",
+                "-sb",
+                *exclude_args,
+                str(target),
+            ],
             capture_output=True,
             text=True,
             check=True,
         )
+
         return int(result.stdout.split()[0])
-    except Exception:
-        return 0
+
+    except Exception as e:
+        raise RuntimeError(
+            f"dir_size failed for {path}: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 def latest_activity(path: Path) -> float:
     newest = 0.0
@@ -1287,10 +1262,9 @@ def scan_games(base: Path) -> list[Game]:
             continue
 
         # ignore hidden dirs
-        if item.name.startswith("."):
+        if item.name.startswith(".") or item.name in IGNORE_DIRS:
             continue
 
-        print(f"Scanning {item.name}")
 
         games.append(
             Game(
@@ -1702,19 +1676,70 @@ class GameArchiver(App):
                 row.refresh_row()
                 self.update_status()
                 return
+    def cached_dir_info(self, path: Path):
+        key = str(path)
+
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return 0, 0.0, 0.0, {}
+
+        cached = SIZE_CACHE.get(key) or {}
+
+        last_played = cached.get("last_played", 0.0)
+        steamgriddb = cached.get("steamgriddb", {})
+
+        file_count = sum(1 for _ in os.scandir(path))
+        cached_file_count = cached.get("file_count", 0)
+
+        # Use cached size when nothing relevant has changed.
+        if (
+            cached.get("mtime", 0) == mtime
+            and file_count == cached_file_count
+        ):
+            return (
+                cached["size"],
+                cached["mtime"],
+                last_played,
+                steamgriddb,
+            )
+
+        # Cache is stale, so recalculate.
+        try:
+            size = dir_size(path)
+        except Exception as e:
+            self.notify(
+                f"Error computing size for {path}: "
+                f"{type(e).__name__}: {e}"
+            )
+            size = 0
+
+        SIZE_CACHE[key] = {
+            "mtime": mtime,
+            "size": size,
+            "last_played": last_played,
+            "steamgriddb": steamgriddb,
+            "file_count": file_count,
+        }
+
+        save_game_data()
+
+        return size, mtime, last_played, steamgriddb
 
     def compute_sizes(self):
-        for game in self.shared_games:
-            game.size, game.mtime, game.last_played, game.steamgriddb = cached_dir_info(game.path)
-            self.call_from_thread(self.refresh_game_row, game)
+        for games in (self.shared_games, self.archived_games):
+            for game in games:
+                game.size, game.mtime, game.last_played, game.steamgriddb = self.cached_dir_info(
+                    game.path
+                )
+                self.call_from_thread(self.refresh_game_row, game)
 
-        for game in self.archived_games:
-            game.size, game.mtime, game.last_played, game.steamgriddb = cached_dir_info(game.path)
-            self.call_from_thread(self.refresh_game_row, game)
+            games[:] = [game for game in games if game.size > MIN_GAME_SIZE]
 
         self.call_from_thread(self.sizes_finished)
         self.call_from_thread(self.update_status)
         self.call_from_thread(self.resort_games)
+        self.call_from_thread(self.refresh_views)
 
     def resort_games(self):
         game = self.get_highlighted_game()
