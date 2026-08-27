@@ -36,6 +36,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, Grid, Container
 from textual_image.widget import AutoImage
 from textual.screen import ModalScreen
+from rich.markup import escape
 from textual.widgets import (
     Button,
     Footer,
@@ -57,6 +58,7 @@ except ImportError:
 # ============================================================
 # CONFIG
 # ============================================================
+STEAM_DIR = Path.home() / ".steam" / "steam"
 CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
@@ -72,9 +74,13 @@ IMAGE_CACHE = CACHE_DIR / "steamgriddb" / "url"
 THUMB_CACHE = CACHE_DIR / "steamgriddb" / "thumbs"
 #STEAM_ART_CACHE = CACHE_DIR / "steam"
 
+DATA_DIR = Path.home() / ".local" / "share" / "game_archiver"
+STEAM_ICON_DIR = DATA_DIR / "icons"
+
 ICON_CACHE.mkdir(parents=True, exist_ok=True)
 IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
 THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+STEAM_ICON_DIR.mkdir(parents=True, exist_ok=True)
 #STEAM_ART_CACHE.mkdir(parents=True, exist_ok=True)
 
 STEAM_STORE_CDN = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"
@@ -312,6 +318,7 @@ class Game:
     selected: bool = False
     launcher: Path | None = None
     icon: Path | None = None
+    icon_manual: bool = False
     steam_key: str | None = None
     steam_entry: dict | None = None
     in_steam: bool = False
@@ -897,6 +904,15 @@ def shortcuts_path(user: SteamUser) -> Path:
         / "shortcuts.vdf"
     )
 
+def steam_grid_dir(user: SteamUser) -> Path:
+    return (
+        STEAM_DIR
+        / "userdata"
+        / user.userdata_id
+        / "config"
+        / "grid"
+    )
+
 def load_shortcuts(user: SteamUser) -> dict:
     path = shortcuts_path(user)
 
@@ -1384,6 +1400,7 @@ class GameArchiver(App):
         Binding("s", "remote_terminal", "SSH"),
         Binding("u", "sync_shortcut", "Sync Steam"),
         Binding("ctrl+a", "select_all", "Select All"),
+        Binding("ctrl+shift+a", "select_none", "Select None"),
         Binding("g", "download_steamgriddb", "SteamGridDB"),
     ]
 
@@ -1568,7 +1585,7 @@ class GameArchiver(App):
         if game.launcher is None:
             game.launcher = find_launcher(launch_path(game))
 
-        if game.icon is None:
+        if game.icon is None and game.icon_manual is False:
             game.icon = find_icon(launch_path(game))
 
         game.in_steam = False
@@ -1724,8 +1741,11 @@ class GameArchiver(App):
             game.size = dir_size(path)
         except Exception as e:
             self.notify(
-                f"Error computing size for {path}: "
-                f"{type(e).__name__}: {e}"
+                escape(
+                    f"Error computing size for {path}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                severity="error",
             )
             game.size = 0
 
@@ -2241,6 +2261,23 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
         self.update_status()
+    
+    def action_select_none(self):
+        if self.shared_view.has_focus:
+            games = self.shared_games
+        else:
+            games = self.archived_games
+
+        if not games:
+            self.notify("No games.")
+            return
+
+        for game in games:
+            if game.selected:
+                game.selected = False
+                self.refresh_game_row(game)
+
+        self.update_status()
 
     async def link_steamgriddb(
         self,
@@ -2455,19 +2492,31 @@ class GameArchiver(App):
     ) -> bool:
         appid = game_appid(game)
         suffix = suffixes[art_type]
+        if art_type == ArtworkType.ICON:
+            dest_dir = STEAM_ICON_DIR
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            dest = dest_dir / f"{appid}{image.suffix.lower()}"
+
+            await to_thread(shutil.copy2, image, dest)
+
+            game.icon = dest
+            game.icon_manual = True
+            self.save_game_data()
+            if not steam_running():
+                await self.sync_shortcut(game)
+            else:
+                self.notify(
+                    "Icon saved. Close Steam and sync shortcuts to apply it."
+                )
+            return True
         if suffix is None:
             return False
         user = self.current_steam_user()
 
         if user is None:
             return False
-        grid_dir = (
-            STEAM_DIR
-            / "userdata"
-            / user.userdata_id
-            / "config"
-            / "grid"
-        )
+        grid_dir = steam_grid_dir(user)
         grid_dir.mkdir(parents=True, exist_ok=True)
 
         dest = grid_dir / f"{appid}{suffix}{image.suffix.lower()}"
@@ -2489,13 +2538,8 @@ class GameArchiver(App):
         if user is None:
             return False
 
-        grid_dir = (
-            STEAM_DIR
-            / "userdata"
-            / user.userdata_id
-            / "config"
-            / "grid"
-        )
+        grid_dir = steam_grid_dir(user)
+        grid_dir.mkdir(parents=True, exist_ok=True)
 
         changed = False
 
@@ -2515,7 +2559,31 @@ class GameArchiver(App):
 
                 await to_thread(old.replace, new)
                 changed = True
+        if game.icon_manual:
+            for ext in ImageExtension:
+                if ext == ImageExtension.EXE:
+                    continue
 
+                old = STEAM_ICON_DIR / f"{old_appid}{ext}"
+
+                if not old.exists():
+                    continue
+
+                new = STEAM_ICON_DIR / f"{new_appid}{ext}"
+
+                await to_thread(old.replace, new)
+
+                game.icon = new
+                changed = True
+
+                if not steam_running():
+                    await self.sync_shortcut(game)
+                else:
+                    self.notify(
+                        "Icon saved. Close Steam and sync shortcuts to apply it."
+                    )
+                break
+            self.save_game_data()
         return changed
     
     @work
@@ -2548,7 +2616,7 @@ class GameArchiver(App):
 # STEAM
 # ============================================================
 
-STEAM_DIR = Path.home() / ".steam/steam"
+
 
 
 @dataclass
@@ -2567,7 +2635,7 @@ def get_steam_users() -> list[SteamUser]:
     users: list[SteamUser] = []
 
     userdata = STEAM_DIR / "userdata"
-    loginusers = STEAM_DIR / "config/loginusers.vdf"
+    loginusers = STEAM_DIR / "config" / "loginusers.vdf"
 
     persona_lookup = {}
 
