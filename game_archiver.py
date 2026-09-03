@@ -1413,12 +1413,13 @@ class GameArchiver(App):
         self.moving = False
         self.dialog_open = False
         self.game_rows = {}
-        self.sync_status = "Unknown"
+        self.sync_status = "Detecting"
 
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
+        self.highlighted_game_path: Path | None = None
 
     def load_game_data(self) -> tuple[list[Game], list[Game]]:
         if not GAME_DATA.exists():
@@ -1662,6 +1663,10 @@ class GameArchiver(App):
     def refresh_if_changed(self):
         if self.dialog_open:
             return
+
+        if self.is_scan_running():
+            return
+
         if (
             game_list_changed(
                 SHARED_DIR,
@@ -1674,6 +1679,7 @@ class GameArchiver(App):
         ):
             self.action_refresh()
             return
+
         self.refresh_launchers()
 
     async def refresh_launchers(self):
@@ -1766,15 +1772,8 @@ class GameArchiver(App):
 
         self.call_from_thread(self.sizes_finished)
         self.call_from_thread(self.update_status)
-        self.call_from_thread(self.resort_games)
         self.call_from_thread(self.refresh_views)
         self.call_from_thread(self.save_game_data)
-
-    def resort_games(self):
-        game = self.get_highlighted_game()
-        sort_games(self.shared_games)
-        sort_games(self.archived_games)
-        self.refresh_views(game)
 
     def sizes_finished(self):
         self.computing_sizes = False
@@ -1836,20 +1835,31 @@ class GameArchiver(App):
 
     # ========================================================
 
+    async def on_list_view_highlighted(self, event: ListView.Highlighted):
+        row = event.item
+
+        if isinstance(row, GameRow):
+            self.highlighted_game_path = row.game.path
+
     def get_highlighted_game(self) -> Game | None:
         view = self.current_view()
 
         if view.index is None:
             return None
 
-        row = view.children[view.index]
-        game = row.game
-        return game
+        if not (0 <= view.index < len(view.children)):
+            view.index = None
+            return None
 
-    def refresh_views(
-            self,
-            highlighted_game: Game | None = None,
-        ):
+        row = view.children[view.index]
+        return row.game
+
+    def refresh_views(self):
+        selected_path = self.highlighted_game_path
+
+        sort_games(self.shared_games)
+        sort_games(self.archived_games)
+
         self.shared_view.clear()
         self.archived_view.clear()
 
@@ -1863,16 +1873,18 @@ class GameArchiver(App):
 
         self.update_status()
 
-        if highlighted_game is not None:
-            for view in (
-                self.shared_view,
-                self.archived_view,
-            ):
+        if selected_path is None:
+            return
+
+        def restore_highlight():
+            for view in (self.shared_view, self.archived_view):
                 for i, row in enumerate(view.children):
-                    if row.game.path == highlighted_game.path:
+                    if row.game.path == selected_path:
                         view.focus()
                         view.index = i
                         return
+
+        self.call_after_refresh(restore_highlight)
 
     def update_status(self):
 
@@ -1881,12 +1893,12 @@ class GameArchiver(App):
         selected_archive = sum(
             g.size for g in self.shared_games
             if g.selected
-        )
+        ) or None
 
         selected_restore = sum(
             g.size for g in self.archived_games
             if g.selected
-        )
+        ) or None
 
         steam = self.current_steam_user()
 
@@ -1901,13 +1913,20 @@ class GameArchiver(App):
 
         parts = [
             f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB",
-            f"To Archive: {fmt_size(selected_archive)}",
-            f"To Restore: {fmt_size(selected_restore)}",
+        ]
+
+        if selected_archive is not None:
+            parts.append(f"To Archive: {fmt_size(selected_archive)}")
+
+        if selected_restore is not None:
+            parts.append(f"To Restore: {fmt_size(selected_restore)}")
+
+        parts.extend([
             f"Sync: {self.sync_status}",
             f"Steam: {steam_text}",
-            f"{scan_text}",
-            f"{steam_scan_text}"
-        ]
+            scan_text,
+            steam_scan_text,
+        ])
 
         text = "   ".join(part for part in parts if part)
         self.query_one("#status", Static).update(text)
@@ -1929,16 +1948,18 @@ class GameArchiver(App):
             self.shared_view.focus()
 
     def action_toggle(self):
-
         view = self.current_view()
 
         if view.index is None:
             return
 
+        if not (0 <= view.index < len(view.children)):
+            view.index = None
+            return
+
         row = view.children[view.index]
 
         row.game.selected = not row.game.selected
-
         row.refresh_row()
 
         self.update_status()
@@ -1970,7 +1991,7 @@ class GameArchiver(App):
             game.selected = True
             freed += game.size
 
-        self.refresh_views(game_saved)
+        self.refresh_views()
 
     async def action_move_selected(self):
         if not self.can_modify_steam():
@@ -1999,7 +2020,7 @@ class GameArchiver(App):
 
         #self.shared_games = scan_games(SHARED_DIR)
         #self.archived_games = scan_games(ARCHIVED_DIR)
-        self.refresh_views(game_saved)
+        self.refresh_views()
         #self.start_scan()
         self.moving = False
 
@@ -2024,7 +2045,8 @@ class GameArchiver(App):
 
             old_path = game.path
             new_path = target / game.name
-
+            if old_path == self.highlighted_game_path:
+                self.highlighted_game_path = new_path
             executables = executable_files(old_path)
 
             await to_thread(shutil.move, old_path, new_path)
@@ -2068,7 +2090,7 @@ class GameArchiver(App):
 
         merge_games(self.shared_games, scan_games(SHARED_DIR))
         merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
-        self.refresh_views(game_saved)
+        self.refresh_views()
         self.start_scan()
 
     def action_launch(self):
@@ -2085,7 +2107,7 @@ class GameArchiver(App):
 
         self.save_game_data()
 
-        self.refresh_views(game)
+        self.refresh_views()
 
         try:
             info = get_launch_info(game)
