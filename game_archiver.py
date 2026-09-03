@@ -1965,8 +1965,6 @@ class GameArchiver(App):
         self.update_status()
 
     def action_auto_select(self):
-        game_saved = self.get_highlighted_game()
-
         for g in self.shared_games:
             g.selected = False
 
@@ -1997,7 +1995,6 @@ class GameArchiver(App):
         if not self.can_modify_steam():
             return
         self.moving = True
-        game_saved = self.get_highlighted_game()
         
 
         if self.shared_view.has_focus:
@@ -2018,10 +2015,7 @@ class GameArchiver(App):
             return        
 
 
-        #self.shared_games = scan_games(SHARED_DIR)
-        #self.archived_games = scan_games(ARCHIVED_DIR)
         self.refresh_views()
-        #self.start_scan()
         self.moving = False
 
     async def move_games(
@@ -2084,7 +2078,6 @@ class GameArchiver(App):
 
 
     def action_refresh(self):
-        game_saved = self.get_highlighted_game()
         if self.is_scan_running():
             return
 
