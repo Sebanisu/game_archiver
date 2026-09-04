@@ -1062,7 +1062,7 @@ def natural_key(s: str):
 
 def launch_path(game: Game) -> Path:
     # Only games in shared can have a local mirror.
-    if game.path.parent == SHARED_DIR:
+    if game.path.parent in (SHARED_DIR, LOCAL_SHARED_DIR):
         local = LOCAL_SHARED_DIR / game.name
 
         if local.is_dir():
@@ -1071,6 +1071,9 @@ def launch_path(game: Game) -> Path:
     return game.path
 
 def find_launcher(path: Path) -> Path | None:
+    if not path.is_dir():
+        return None
+
     launchers: list[Path] = []
 
     for p in path.iterdir():
@@ -1103,13 +1106,18 @@ def find_launcher(path: Path) -> Path | None:
     )
 
 def game_list_changed(
-        path: Path,
+        path: Path | None,
         games: list[Game],
     ) -> bool:
     cached = {
         (g.name, g.mtime)
         for g in games
     }
+
+    if path is None:
+        return False
+    if not path.exists():
+        return False
 
     current = {
         (
@@ -1123,15 +1131,30 @@ def game_list_changed(
 
     return current != cached
 
-def local_sync_status():
+def local_sync_status() -> str:
     if not LOCAL_SHARED_DIR.exists():
         return "Local copy missing"
 
-    remote = {p.name for p in REMOTE_SHARED_DIR.iterdir() if p.is_dir()}
-    local = {p.name for p in LOCAL_SHARED_DIR.iterdir() if p.is_dir()}
+    if not REMOTE_SHARED_DIR.exists():
+        return "Remote storage offline"
+
+    try:
+        remote = {
+            p.name
+            for p in REMOTE_SHARED_DIR.iterdir()
+            if p.is_dir()
+        }
+
+        local = {
+            p.name
+            for p in LOCAL_SHARED_DIR.iterdir()
+            if p.is_dir()
+        }
+    except FileNotFoundError:
+        return "Remote storage offline"
 
     if remote == local:
-        return "Synced"
+        return "In Sync"
 
     missing = remote - local
     extra = local - remote
@@ -1223,8 +1246,11 @@ def latest_activity(path: Path) -> float:
 
     return path.stat().st_mtime
 
-def scan_games(base: Path) -> list[Game]:
+def scan_games(base: Path | None) -> list[Game]:
     games = []
+
+    if base is None:
+        return games
 
     if not base.exists():
         return games
@@ -1257,15 +1283,6 @@ def sort_games(games: list[Game]):
         )
     )
 
-def verify_storage():
-    if not POOL_DIR.is_mount():
-        raise RuntimeError(f"{POOL_DIR} is not mounted!")
-
-    if not SHARED_DIR.exists():
-        raise RuntimeError(f"{SHARED_DIR} is missing!")
-
-    if not ARCHIVED_DIR.exists():
-        raise RuntimeError(f"{ARCHIVED_DIR} is missing!")
 
 # ============================================================
 # UI
@@ -1404,7 +1421,6 @@ class GameArchiver(App):
         Binding("g", "download_steamgriddb", "SteamGridDB"),
     ]
 
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -1414,6 +1430,7 @@ class GameArchiver(App):
         self.dialog_open = False
         self.game_rows = {}
         self.sync_status = "Detecting"
+        self.storage_online = False
 
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
@@ -1635,7 +1652,11 @@ class GameArchiver(App):
         shortcuts = load_shortcuts(user)
         entries = shortcuts["shortcuts"]
 
-        for game in self.shared_games + self.archived_games:
+        games = list(self.shared_games)
+        if self.storage_online:
+            games += self.archived_games
+
+        for game in games:
             self.update_game_steam_status(
                 game,
                 entries,
@@ -1664,17 +1685,16 @@ class GameArchiver(App):
         if self.dialog_open:
             return
 
+        self.verify_storage()
+
         if self.is_scan_running():
             return
 
         if (
-            game_list_changed(
-                SHARED_DIR,
-                self.shared_games,
-            )
-            or game_list_changed(
-                ARCHIVED_DIR,
-                self.archived_games,
+            game_list_changed(self.shared_dir(), self.shared_games)
+            or (
+                self.storage_online
+                and game_list_changed(ARCHIVED_DIR, self.archived_games)
             )
         ):
             self.action_refresh()
@@ -1686,8 +1706,16 @@ class GameArchiver(App):
         if not self.can_modify_steam():
             return
 
-        for game in self.shared_games + self.archived_games:
+        games = list(self.shared_games)
+        if self.storage_online:
+            games += self.archived_games
+
+        for game in games:
             launcher = find_launcher(launch_path(game))
+
+            # The game directory may have disappeared if remote storage went offline.
+            if launcher is None:
+                continue
 
             if (launcher != game.launcher):
                 game.launcher = launcher
@@ -1801,14 +1829,39 @@ class GameArchiver(App):
         )
         return True
 
+    def verify_storage(self):
+        self.storage_online = True
+
+        if not POOL_DIR.is_mount():
+            self.notify(f"{POOL_DIR} is not mounted!")
+            self.storage_online = False
+            return
+
+        if not SHARED_DIR.exists():
+            self.notify(f"{SHARED_DIR} is missing!")
+            self.storage_online = False
+
+        if not ARCHIVED_DIR.exists():
+            self.notify(f"{ARCHIVED_DIR} is missing!")
+            self.storage_online = False
+
+    def shared_dir(self) -> Path:
+        if self.storage_online:
+            return SHARED_DIR
+        else:
+            return LOCAL_SHARED_DIR
+
     def on_mount(self):
         self.shared_view.border_title = " Shared / Synced "
         self.archived_view.border_title = " Archived / Remote "
-        verify_storage()
+        self.verify_storage()
 
         self.shared_games, self.archived_games = self.load_game_data()        
-        merge_games(self.shared_games, scan_games(SHARED_DIR))
-        merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+
+        merge_games(self.shared_games, scan_games(self.shared_dir()))
+        
+        if self.storage_online:
+            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
 
         self.shared_view = self.query_one("#shared", ListView)
         self.archived_view = self.query_one("#archived", ListView)
@@ -1856,9 +1909,14 @@ class GameArchiver(App):
 
     def refresh_views(self):
         selected_path = self.highlighted_game_path
+        
+        archived_display = self.archived_games if self.storage_online else []
+        self.archived_view.display = bool(archived_display)
 
         sort_games(self.shared_games)
-        sort_games(self.archived_games)
+
+        if self.storage_online:
+            sort_games(self.archived_games)
 
         self.shared_view.clear()
         self.archived_view.clear()
@@ -1868,7 +1926,7 @@ class GameArchiver(App):
         )
 
         self.archived_view.extend(
-            [GameRow(g) for g in self.archived_games]
+            [GameRow(g) for g in archived_display]
         )
 
         self.update_status()
@@ -1921,8 +1979,12 @@ class GameArchiver(App):
         if selected_restore is not None:
             parts.append(f"To Restore: {fmt_size(selected_restore)}")
 
+        if self.storage_online:
+            parts.append(f"Sync: {self.sync_status}")
+        else:
+            parts.append(f"Remote Storage: Offline")
+        
         parts.extend([
-            f"Sync: {self.sync_status}",
             f"Steam: {steam_text}",
             scan_text,
             steam_scan_text,
@@ -1994,6 +2056,9 @@ class GameArchiver(App):
     async def action_move_selected(self):
         if not self.can_modify_steam():
             return
+        if not self.storage_online:
+            self.notify("Storage Offline, can't move")
+            return
         self.moving = True
         
 
@@ -2024,6 +2089,8 @@ class GameArchiver(App):
         destination_games: list[Game],
         target: Path,
     ) -> bool:
+        if not self.storage_online:
+            return
 
         moving = [g for g in source_games if g.selected]
         if not moving:
@@ -2080,9 +2147,14 @@ class GameArchiver(App):
     def action_refresh(self):
         if self.is_scan_running():
             return
+        
+        self.verify_storage()
 
-        merge_games(self.shared_games, scan_games(SHARED_DIR))
-        merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+        merge_games(self.shared_games, scan_games(self.shared_dir()))
+        
+        if self.storage_online:
+            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+
         self.refresh_views()
         self.start_scan()
 
@@ -2138,6 +2210,9 @@ class GameArchiver(App):
 
 
     def action_open_remote_folder(self):
+        if not self.storage_online:
+            self.notify("Storage Offline")
+            return
         view = self.current_view()
 
         if view.index is None:
@@ -2181,6 +2256,9 @@ class GameArchiver(App):
         )
 
     def action_remote_terminal(self):
+        if not self.storage_online:
+            self.notify("Storage Offline")
+            return
         view = self.current_view()
 
         if view.index is None:
@@ -2262,7 +2340,7 @@ class GameArchiver(App):
 
     def action_select_all(self):
         if self.shared_view.has_focus:
-            games = self.shared_games
+            games = list(self.shared_games)
         else:
             games = self.archived_games
 
@@ -2279,7 +2357,7 @@ class GameArchiver(App):
     
     def action_select_none(self):
         if self.shared_view.has_focus:
-            games = self.shared_games
+            games = list(self.shared_games)
         else:
             games = self.archived_games
 
