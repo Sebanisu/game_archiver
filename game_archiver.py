@@ -75,7 +75,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 4
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -211,9 +211,10 @@ def get_db() -> sqlite3.Connection:
 
 
 def create_database(db: sqlite3.Connection):
-    db.executescript("""
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS games (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
             size INTEGER NOT NULL DEFAULT 0,
@@ -223,8 +224,12 @@ def create_database(db: sqlite3.Connection):
             launcher TEXT,
             icon TEXT,
             icon_manual INTEGER NOT NULL DEFAULT 0
-        );
+        )
+        """
+    )
 
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS steam_games (
             game_id INTEGER PRIMARY KEY,
             steam_key TEXT,
@@ -236,8 +241,12 @@ def create_database(db: sqlite3.Connection):
             FOREIGN KEY (game_id)
                 REFERENCES games(id)
                 ON DELETE CASCADE
-        );
+        )
+        """
+    )
 
+    db.execute(
+        """
         CREATE TABLE IF NOT EXISTS steamgriddb_games (
             game_id INTEGER PRIMARY KEY,
             sgdb_id INTEGER,
@@ -250,29 +259,51 @@ def create_database(db: sqlite3.Connection):
             FOREIGN KEY (game_id)
                 REFERENCES games(id)
                 ON DELETE CASCADE
-        );
+        )
+        """
+    )
 
-        CREATE TABLE IF NOT EXISTS steamgriddb_artwork (
-            id INTEGER PRIMARY KEY,
-            sgdb_game_id INTEGER NOT NULL,
-            sgdb_art_id INTEGER NOT NULL,
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS artwork (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            external_id TEXT,
             url TEXT,
             thumb_url TEXT,
             author TEXT,
-            data TEXT,
+            data TEXT NOT NULL
+        )
+        """
+    )
 
-            UNIQUE (sgdb_game_id, sgdb_art_id, type),
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS steamgriddb_artwork (
+            artwork_id INTEGER PRIMARY KEY,
+            sgdb_game_id INTEGER NOT NULL,
+            sgdb_art_id TEXT NOT NULL,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES artwork(id)
+                ON DELETE CASCADE,
 
             FOREIGN KEY (sgdb_game_id)
                 REFERENCES steamgriddb_games(game_id)
-                ON DELETE CASCADE
-        );
+                ON DELETE CASCADE,
 
-        CREATE TABLE IF NOT EXISTS game_artwork (
+            UNIQUE (sgdb_game_id, sgdb_art_id)
+        )
+        """
+    )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS selected_artwork (
             game_id INTEGER NOT NULL,
             artwork_id INTEGER NOT NULL,
-            selected INTEGER NOT NULL DEFAULT 0,
+            downloaded_path TEXT,
 
             PRIMARY KEY (game_id, artwork_id),
 
@@ -281,10 +312,11 @@ def create_database(db: sqlite3.Connection):
                 ON DELETE CASCADE,
 
             FOREIGN KEY (artwork_id)
-                REFERENCES steamgriddb_artwork(id)
+                REFERENCES artwork(id)
                 ON DELETE CASCADE
-        );
-    """)
+        )
+        """
+    )
 
 
 def get_schema_version(db: sqlite3.Connection) -> int:
@@ -326,6 +358,11 @@ def migrate_database(
         migrate_to_v3(db)
         set_schema_version(db, 3)
         current_version = 3
+
+    if current_version < 4:
+        migrate_to_v4(db)
+        set_schema_version(db, 4)
+        current_version = 4
 
     # Future migrations go here
 
@@ -386,6 +423,140 @@ def migrate_to_v3(db: sqlite3.Connection):
         """
         ALTER TABLE games
         ADD COLUMN icon_manual INTEGER NOT NULL DEFAULT 0
+        """
+    )
+
+def migrate_to_v4(db: sqlite3.Connection):
+    db.execute(
+        """
+        CREATE TABLE artwork_v4 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            external_id TEXT,
+            url TEXT,
+            thumb_url TEXT,
+            author TEXT,
+            data TEXT NOT NULL
+        )
+        """
+    )
+
+    db.execute(
+        """
+        INSERT INTO artwork_v4 (
+            id,
+            type,
+            source,
+            external_id,
+            url,
+            thumb_url,
+            author,
+            data
+        )
+        SELECT
+            id,
+            type,
+            'steamgriddb',
+            sgdb_art_id,
+            url,
+            thumb_url,
+            author,
+            data
+        FROM steamgriddb_artwork
+        """
+    )
+
+    db.execute(
+        """
+        CREATE TABLE steamgriddb_artwork_v4 (
+            artwork_id INTEGER PRIMARY KEY,
+            sgdb_game_id INTEGER NOT NULL,
+            sgdb_art_id TEXT NOT NULL,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES artwork_v4(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (sgdb_game_id)
+                REFERENCES steamgriddb_games(game_id)
+                ON DELETE CASCADE,
+
+            UNIQUE (sgdb_game_id, sgdb_art_id)
+        )
+        """
+    )
+
+    db.execute(
+        """
+        INSERT INTO steamgriddb_artwork_v4 (
+            artwork_id,
+            sgdb_game_id,
+            sgdb_art_id
+        )
+        SELECT
+            id,
+            sgdb_game_id,
+            sgdb_art_id
+        FROM steamgriddb_artwork
+        """
+    )
+
+    db.execute(
+        """
+        CREATE TABLE selected_artwork_v4 (
+            game_id INTEGER NOT NULL,
+            artwork_id INTEGER NOT NULL,
+            downloaded_path TEXT,
+
+            PRIMARY KEY (game_id, artwork_id),
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES artwork_v4(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    db.execute(
+        """
+        INSERT INTO selected_artwork_v4 (
+            game_id,
+            artwork_id
+        )
+        SELECT
+            game_id,
+            artwork_id
+        FROM game_artwork
+        WHERE selected = 1
+        """
+    )
+
+    db.execute("DROP TABLE game_artwork")
+    db.execute("DROP TABLE steamgriddb_artwork")
+
+    db.execute(
+        """
+        ALTER TABLE artwork_v4
+        RENAME TO artwork
+        """
+    )
+
+    db.execute(
+        """
+        ALTER TABLE steamgriddb_artwork_v4
+        RENAME TO steamgriddb_artwork
+        """
+    )
+
+    db.execute(
+        """
+        ALTER TABLE selected_artwork_v4
+        RENAME TO selected_artwork
         """
     )
 
@@ -455,6 +626,7 @@ def save_game(
 
     save_steam(db, game_id, game)
     save_steamgriddb(db, game_id, game)
+    save_steamgriddb_artwork(db, game_id, game)
 
 def save_steam(
     db: sqlite3.Connection,
@@ -566,6 +738,162 @@ def save_steamgriddb(
             sgdb.get("cached"),
         ),
     )
+
+def save_steamgriddb_artwork(
+    db: sqlite3.Connection,
+    game_id: int,
+    game: Game,
+):
+    sgdb = game.steamgriddb
+
+    artwork_by_type = sgdb.get("art", {})
+
+    sgdb_game = sgdb.get("game") or {}
+    sgdb_game_id = sgdb_game.get("id")
+
+    if sgdb_game_id is None:
+        return
+
+    selected = sgdb.get("selected", {})
+
+    for artwork_type, artwork_list in artwork_by_type.items():
+        if not artwork_list:
+            continue
+
+        for artwork in artwork_list:
+            source = artwork.get("source", "steamgriddb")
+
+            external_id = artwork.get("id")
+
+            if external_id is None:
+                continue
+
+            if source != "steamgriddb":
+                continue
+
+            data = json.dumps(artwork)
+
+            author = artwork.get("author")
+
+            if author is not None:
+                author = json.dumps(author)
+
+            row = db.execute(
+                """
+                SELECT artwork_id
+                FROM steamgriddb_artwork
+                WHERE sgdb_game_id = ?
+                  AND sgdb_art_id = ?
+                """,
+                (
+                    game_id,
+                    str(external_id),
+                ),
+            ).fetchone()
+
+            if row is None:
+                cursor = db.execute(
+                    """
+                    INSERT INTO artwork (
+                        type,
+                        source,
+                        external_id,
+                        url,
+                        thumb_url,
+                        author,
+                        data
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artwork_type.name,
+                        source,
+                        str(external_id),
+                        artwork.get("url"),
+                        artwork.get("thumb"),
+                        author,
+                        data,
+                    ),
+                )
+
+                artwork_id = cursor.lastrowid
+
+                db.execute(
+                    """
+                    INSERT INTO steamgriddb_artwork (
+                        artwork_id,
+                        sgdb_game_id,
+                        sgdb_art_id
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        artwork_id,
+                        game_id,
+                        str(external_id),
+                    ),
+                )
+
+            else:
+                artwork_id = row["artwork_id"]
+
+                db.execute(
+                    """
+                    UPDATE artwork
+                    SET
+                        type = ?,
+                        source = ?,
+                        external_id = ?,
+                        url = ?,
+                        thumb_url = ?,
+                        author = ?,
+                        data = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        artwork_type.name,
+                        source,
+                        str(external_id),
+                        artwork.get("url"),
+                        artwork.get("thumb"),
+                        author,
+                        data,
+                        artwork_id,
+                    ),
+                )
+
+            selected_info = selected.get(artwork_type)
+
+            if (
+                selected_info is not None
+                and selected_info.get("asset", {}).get("id")
+                == external_id
+            ):
+                downloaded_path = selected_info.get(
+                    "downloaded_path"
+                )
+
+                db.execute(
+                    """
+                    INSERT INTO selected_artwork (
+                        game_id,
+                        artwork_id,
+                        downloaded_path
+                    )
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(game_id, artwork_id)
+                    DO UPDATE SET
+                        downloaded_path =
+                            excluded.downloaded_path
+                    """,
+                    (
+                        game_id,
+                        artwork_id,
+                        str(downloaded_path)
+                        if downloaded_path is not None
+                        else None,
+                    ),
+                )
 
 # ============================================================
 # JSON to SQLite
@@ -3149,10 +3477,12 @@ class GameArchiver(App):
         local_icons = await to_thread(find_icons, launch_path(game))
 
         if not art_data["success"]:
-            self.notify(art["error"])
+            self.notify(art_data["error"])
             return
-        self.save_game_data()
+
         art = art_data["data"]
+        game.steamgriddb["art"] = art
+        self.save_game_data()
 
         while True:
             art_type = await self.push_screen_wait(
@@ -3207,6 +3537,7 @@ class GameArchiver(App):
                             selected_info["downloaded_path"],
                         )
                     continue  # stay in the artwork picker
+
     async def install_artwork(
         self,
         game: Game,
