@@ -768,9 +768,6 @@ def save_steamgriddb_artwork(
             if external_id is None:
                 continue
 
-            if source != "steamgriddb":
-                continue
-
             data = json.dumps(artwork)
 
             author = artwork.get("author")
@@ -943,6 +940,47 @@ def load_selected_artwork(
         }
 
     return selected
+
+def load_steamgriddb_artwork(
+    db: sqlite3.Connection,
+    game_id: int,
+) -> tuple[dict, bool]:
+    art = {
+        ArtworkType.GRID_PORTRAIT: [],
+        ArtworkType.GRID_SQUARE: [],
+        ArtworkType.GRID_LANDSCAPE: [],
+        ArtworkType.HERO: [],
+        ArtworkType.LOGO: [],
+        ArtworkType.ICON: [],
+    }
+
+    rows = db.execute(
+        """
+        SELECT
+            a.type,
+            a.data
+        FROM steamgriddb_artwork AS sa
+        JOIN artwork AS a
+            ON a.id = sa.artwork_id
+        WHERE sa.sgdb_game_id = ?
+        """,
+        (game_id,),
+    ).fetchall()
+
+    for row in rows:
+        try:
+            artwork_type = ArtworkType[row["type"]]
+        except KeyError:
+            continue
+
+        try:
+            artwork = json.loads(row["data"])
+        except json.JSONDecodeError:
+            continue
+
+        art[artwork_type].append(artwork)
+
+    return art, bool(rows)
 
 # ============================================================
 # JSON to SQLite
@@ -2469,24 +2507,18 @@ class GameArchiver(App):
                                 else None
                             ),
                             "cached": row["cached"],
-                            "art": {
-                                ArtworkType.GRID_PORTRAIT: [],
-                                ArtworkType.GRID_SQUARE: [],
-                                ArtworkType.GRID_LANDSCAPE: [],
-                                ArtworkType.HERO: [],
-                                ArtworkType.LOGO: [],
-                                ArtworkType.ICON: [],
-                            },
-                            "selected": {
-                                ArtworkType.GRID_PORTRAIT: None,
-                                ArtworkType.GRID_SQUARE: None,
-                                ArtworkType.GRID_LANDSCAPE: None,
-                                ArtworkType.HERO: None,
-                                ArtworkType.LOGO: None,
-                                ArtworkType.ICON: None,
-                            },
+                            "art": {},
+                            "selected": {},
                         }
                         game_id = row["id"]
+
+                        (
+                            game.steamgriddb["art"],
+                            game.steamgriddb["artwork_cached"],
+                        ) = load_steamgriddb_artwork(
+                            db,
+                            game_id,
+                        )
                         game.steamgriddb["selected"] = load_selected_artwork(
                             db,
                             game_id,
@@ -4899,9 +4931,11 @@ class SteamGridDBClient:
         game: Game,
     ) -> dict:
         cached = game.steamgriddb.get("cached")
+        artwork_cached = game.steamgriddb.get("artwork_cached")
 
         if (
             cached is not None
+            and artwork_cached
             and time.time() - cached < 60 * 60 * 24 * 30
         ):
             return {
