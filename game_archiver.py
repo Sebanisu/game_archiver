@@ -75,7 +75,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -221,7 +221,8 @@ def create_database(db: sqlite3.Connection):
             file_count INTEGER NOT NULL DEFAULT 0,
             last_played REAL NOT NULL DEFAULT 0,
             launcher TEXT,
-            icon TEXT
+            icon TEXT,
+            icon_manual INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS steam_games (
@@ -321,6 +322,11 @@ def migrate_database(
         set_schema_version(db, 2)
         current_version = 2
 
+    if current_version < 3:
+        migrate_to_v3(db)
+        set_schema_version(db, 3)
+        current_version = 3
+
     # Future migrations go here
 
 
@@ -375,6 +381,192 @@ def migrate_to_v2(db: sqlite3.Connection):
         """
     )
 
+def migrate_to_v3(db: sqlite3.Connection):
+    db.execute(
+        """
+        ALTER TABLE games
+        ADD COLUMN icon_manual INTEGER NOT NULL DEFAULT 0
+        """
+    )
+
+def save_game(
+    db: sqlite3.Connection,
+    game: Game,
+):
+    if game.path is None:
+        raise RuntimeError(
+            f"Cannot save game without a path: {game.name}"
+        )
+
+    path = str(game.path)
+
+    db.execute(
+        """
+        INSERT INTO games (
+            path,
+            name,
+            size,
+            mtime,
+            file_count,
+            last_played,
+            launcher,
+            icon,
+            icon_manual
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            name = excluded.name,
+            size = excluded.size,
+            mtime = excluded.mtime,
+            file_count = excluded.file_count,
+            last_played = excluded.last_played,
+            launcher = excluded.launcher,
+            icon = excluded.icon,
+            icon_manual = excluded.icon_manual
+        """,
+        (
+            path,
+            game.name,
+            game.size,
+            game.mtime,
+            game.file_count,
+            game.last_played,
+            str(game.launcher)
+            if game.launcher is not None
+            else None,
+            str(game.icon)
+            if game.icon is not None
+            else None,
+            int(game.icon_manual),
+        ),
+    )
+
+    row = db.execute(
+        "SELECT id FROM games WHERE path = ?",
+        (path,),
+    ).fetchone()
+
+    if row is None:
+        raise RuntimeError(
+            f"Failed to retrieve database ID for game: {path}"
+        )
+
+    game_id = row["id"]
+
+    save_steam(db, game_id, game)
+    save_steamgriddb(db, game_id, game)
+
+def save_steam(
+    db: sqlite3.Connection,
+    game_id: int,
+    game: Game,
+):
+    if not any(
+        value is not None
+        for value in (
+            game.steam_key,
+            game.steam_entry,
+        )
+    ) and not any(
+        (
+            game.in_steam,
+            game.steam_broken,
+            game.duplicate_steam,
+        )
+    ):
+        db.execute(
+            "DELETE FROM steam_games WHERE game_id = ?",
+            (game_id,),
+        )
+        return
+
+    db.execute(
+        """
+        INSERT INTO steam_games (
+            game_id,
+            steam_key,
+            steam_entry,
+            in_steam,
+            steam_broken,
+            duplicate_steam
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_id) DO UPDATE SET
+            steam_key = excluded.steam_key,
+            steam_entry = excluded.steam_entry,
+            in_steam = excluded.in_steam,
+            steam_broken = excluded.steam_broken,
+            duplicate_steam = excluded.duplicate_steam
+        """,
+        (
+            game_id,
+            game.steam_key,
+            (
+                json.dumps(game.steam_entry)
+                if game.steam_entry is not None
+                else None
+            ),
+            int(game.in_steam),
+            int(game.steam_broken),
+            int(game.duplicate_steam),
+        ),
+    )
+
+def save_steamgriddb(
+    db: sqlite3.Connection,
+    game_id: int,
+    game: Game,
+):
+    sgdb = game.steamgriddb
+
+    if not sgdb:
+        db.execute(
+            "DELETE FROM steamgriddb_games WHERE game_id = ?",
+            (game_id,),
+        )
+        return
+
+    sgdb_game = sgdb.get("game")
+
+    db.execute(
+        """
+        INSERT INTO steamgriddb_games (
+            game_id,
+            sgdb_id,
+            name,
+            search,
+            game_data,
+            steam_platform_data,
+            cached
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_id) DO UPDATE SET
+            sgdb_id = excluded.sgdb_id,
+            name = excluded.name,
+            search = excluded.search,
+            game_data = excluded.game_data,
+            steam_platform_data = excluded.steam_platform_data,
+            cached = excluded.cached
+        """,
+        (
+            game_id,
+            sgdb_game.get("id") if sgdb_game else None,
+            sgdb_game.get("name") if sgdb_game else None,
+            sgdb.get("search"),
+            (
+                json.dumps(sgdb_game)
+                if sgdb_game is not None
+                else None
+            ),
+            (
+                json.dumps(sgdb.get("steam_platform_data"))
+                if sgdb.get("steam_platform_data") is not None
+                else None
+            ),
+            sgdb.get("cached"),
+        ),
+    )
+
 # ============================================================
 # JSON to SQLite
 # ============================================================
@@ -412,9 +604,10 @@ def migrate_game(
             file_count,
             last_played,
             launcher,
-            icon
+            icon,
+            icon_manual
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
             size = excluded.size,
@@ -422,7 +615,8 @@ def migrate_game(
             file_count = excluded.file_count,
             last_played = excluded.last_played,
             launcher = excluded.launcher,
-            icon = excluded.icon
+            icon = excluded.icon,
+            icon_manual = excluded.icon_manual
         """,
         (
             path,
@@ -437,6 +631,7 @@ def migrate_game(
             str(game_data["icon"])
                 if game_data.get("icon") is not None
                 else None,
+            int(game_data.get("icon_manual", False))
         ),
     )
 
@@ -1820,6 +2015,7 @@ class GameArchiver(App):
                         g.last_played,
                         g.launcher,
                         g.icon,
+                        g.icon_manual,
 
                         s.steam_key,
                         s.steam_entry,
@@ -1865,6 +2061,7 @@ class GameArchiver(App):
                             if row["icon"] is not None
                             else None
                         ),
+                        icon_manual=bool(row["icon_manual"]),
                     )
 
                     if row["steam_key"] is not None:
@@ -1924,19 +2121,20 @@ class GameArchiver(App):
             return [], []
 
     def save_game_data(self):
-        data = {
-            "shared": [asdict(game) for game in self.shared_games],
-            "archived": [asdict(game) for game in self.archived_games],
-        }
+        try:
+            with get_db() as db:
+                for game in self.shared_games:
+                    save_game(db, game)
 
-        GAME_DATA.parent.mkdir(parents=True, exist_ok=True)
+                for game in self.archived_games:
+                    save_game(db, game)
 
-        with GAME_DATA.open("w") as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                default=json_default,
+                db.commit()
+
+        except Exception as e:
+            self.notify(
+                f"Error saving game data: "
+                f"{type(e).__name__}: {e}"
             )
 
     async def sync_shortcut(self, game: Game) -> bool:
