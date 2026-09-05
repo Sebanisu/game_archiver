@@ -102,7 +102,7 @@ STEAM_ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/
 STEAM_CLIENTICON_CDN = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
 
 
-LOCAL_SHARED_DIR = Path.home() / "Games/shared"
+LOCAL_SHARED_DIR = Path.home() / "Games" / "shared"
 REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
 REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
 POOL_DIR = Path("/mnt/media/pool")
@@ -1806,50 +1806,115 @@ class GameArchiver(App):
         self.highlighted_game_path: Path | None = None
 
     def load_game_data(self) -> tuple[list[Game], list[Game]]:
-        if not GAME_DATA.exists():
-            return [], []
-
         try:
-            with GAME_DATA.open() as f:
-                data = json.load(f)
-            def restore_paths(data):
-                if isinstance(data, dict):
-                    for key, value in data.items():
-                        if key == "downloaded_path" and isinstance(value, str):
-                            data[key] = Path(value)
-                        else:
-                            restore_paths(value)
+            with get_db() as db:
+                rows = db.execute(
+                    """
+                    SELECT
+                        g.id,
+                        g.name,
+                        g.path,
+                        g.size,
+                        g.mtime,
+                        g.file_count,
+                        g.last_played,
+                        g.launcher,
+                        g.icon,
 
-                elif isinstance(data, list):
-                    for item in data:
-                        restore_paths(item)
-            def load_game(game_data: dict) -> Game:
-                game_data["path"] = Path(game_data["path"])
+                        s.steam_key,
+                        s.steam_entry,
+                        s.in_steam,
+                        s.steam_broken,
+                        s.duplicate_steam,
 
-                if game_data.get("launcher") is not None:
-                    game_data["launcher"] = Path(game_data["launcher"])
+                        sg.sgdb_id,
+                        sg.search AS sgdb_search,
+                        sg.game_data,
+                        sg.steam_platform_data,
+                        sg.cached
 
-                if game_data.get("icon") is not None:
-                    game_data["icon"] = Path(game_data["icon"])                
+                    FROM games g
 
-                if game_data.get("steamgriddb") is not None:
-                    restore_paths(game_data["steamgriddb"])
-                return Game(**game_data)
-                
+                    LEFT JOIN steam_games s
+                        ON s.game_id = g.id
 
-            
+                    LEFT JOIN steamgriddb_games sg
+                        ON sg.game_id = g.id
 
-            shared_games = [
-                load_game(game)
-                for game in data.get("shared", [])
-            ]
+                    ORDER BY g.id
+                    """
+                ).fetchall()
 
-            archived_games = [
-                load_game(game)
-                for game in data.get("archived", [])
-            ]
+                games = []
 
-            return shared_games, archived_games
+                for row in rows:
+                    game = Game(
+                        name=row["name"],
+                        path=Path(row["path"]) if row["path"] else None,
+                        size=row["size"],
+                        mtime=row["mtime"],
+                        file_count=row["file_count"],
+                        last_played=row["last_played"],
+                        launcher=(
+                            Path(row["launcher"])
+                            if row["launcher"] is not None
+                            else None
+                        ),
+                        icon=(
+                            Path(row["icon"])
+                            if row["icon"] is not None
+                            else None
+                        ),
+                    )
+
+                    if row["steam_key"] is not None:
+                        game.steam_key = row["steam_key"]
+
+                    if row["steam_entry"] is not None:
+                        game.steam_entry = json.loads(row["steam_entry"])
+
+                    game.in_steam = bool(row["in_steam"])
+                    game.steam_broken = bool(row["steam_broken"])
+                    game.duplicate_steam = bool(row["duplicate_steam"])
+
+                    if (
+                        row["sgdb_id"] is not None
+                        or row["sgdb_search"] is not None
+                        or row["game_data"] is not None
+                    ):
+                        game.steamgriddb = {
+                            "search": row["sgdb_search"],
+                            "game": (
+                                json.loads(row["game_data"])
+                                if row["game_data"] is not None
+                                else None
+                            ),
+                            "steam_platform_data": (
+                                json.loads(row["steam_platform_data"])
+                                if row["steam_platform_data"] is not None
+                                else None
+                            ),
+                            "cached": row["cached"],
+                            "art": {},
+                            "selected": {},
+                        }
+
+                    games.append(game)
+
+                shared_games = []
+                archived_games = []
+
+                for game in games:
+                    # Determine archive status from the path for now.
+                    # A dedicated database field can be added later if needed.
+                    if game.path is not None and game.path.is_relative_to(
+                        REMOTE_ARCHIVED_DIR
+                    ):
+                        archived_games.append(game)
+                    else:
+                        shared_games.append(game)
+
+                return shared_games, archived_games
 
         except Exception as e:
             self.notify(
@@ -4327,4 +4392,5 @@ class SteamGridDBClient:
 
 if __name__ == "__main__":
     init_database()
+    # migrate_game_data()
     GameArchiver().run()
