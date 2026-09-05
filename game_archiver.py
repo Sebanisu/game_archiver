@@ -75,7 +75,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -239,7 +239,7 @@ def create_database(db: sqlite3.Connection):
 
         CREATE TABLE IF NOT EXISTS steamgriddb_games (
             game_id INTEGER PRIMARY KEY,
-            sgdb_id INTEGER NOT NULL,
+            sgdb_id INTEGER,
             name TEXT,
             search TEXT,
             game_data TEXT,
@@ -313,13 +313,15 @@ def migrate_database(
 
     if current_version < 1:
         create_database(db)
-        set_schema_version(db, 1)
+        set_schema_version(db, DATABASE_SCHEMA_VERSION)
+        current_version = DATABASE_SCHEMA_VERSION
 
-    # Future migrations go here:
-    #
-    # if current_version < 2:
-    #     migrate_to_v2(db)
-    #     set_schema_version(db, 2)
+    if current_version < 2:
+        migrate_to_v2(db)
+        set_schema_version(db, 2)
+        current_version = 2
+
+    # Future migrations go here
 
 
 def init_database():
@@ -332,6 +334,218 @@ def init_database():
         )
 
         db.commit()
+
+def migrate_to_v2(db: sqlite3.Connection):
+    db.executescript(
+        """
+        CREATE TABLE steamgriddb_games_new (
+            game_id INTEGER PRIMARY KEY,
+            sgdb_id INTEGER,
+            name TEXT,
+            search TEXT,
+            game_data TEXT,
+            steam_platform_data TEXT,
+            cached REAL,
+            FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO steamgriddb_games_new (
+            game_id,
+            sgdb_id,
+            name,
+            search,
+            game_data,
+            steam_platform_data,
+            cached
+        )
+        SELECT
+            game_id,
+            sgdb_id,
+            name,
+            search,
+            game_data,
+            steam_platform_data,
+            cached
+        FROM steamgriddb_games;
+
+        DROP TABLE steamgriddb_games;
+
+        ALTER TABLE steamgriddb_games_new
+        RENAME TO steamgriddb_games;
+        """
+    )
+
+# ============================================================
+# JSON to SQLite
+# ============================================================
+
+def migrate_game_data():
+    if not GAME_DATA.exists():
+        return
+
+    with GAME_DATA.open() as f:
+        data = json.load(f)
+
+    with get_db() as db:
+        for game_data in data.get("shared", []):
+            migrate_game(db, game_data)
+
+        for game_data in data.get("archived", []):
+            migrate_game(db, game_data)
+
+        db.commit()
+
+def migrate_game(
+    db: sqlite3.Connection,
+    game_data: dict,
+):
+    path = str(game_data["path"])
+    name = game_data["name"]
+
+    db.execute(
+        """
+        INSERT INTO games (
+            path,
+            name,
+            size,
+            mtime,
+            file_count,
+            last_played,
+            launcher,
+            icon
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET
+            name = excluded.name,
+            size = excluded.size,
+            mtime = excluded.mtime,
+            file_count = excluded.file_count,
+            last_played = excluded.last_played,
+            launcher = excluded.launcher,
+            icon = excluded.icon
+        """,
+        (
+            path,
+            name,
+            game_data.get("size", 0),
+            game_data.get("mtime", 0),
+            game_data.get("file_count", 0),
+            game_data.get("last_played", 0),
+            str(game_data["launcher"])
+                if game_data.get("launcher") is not None
+                else None,
+            str(game_data["icon"])
+                if game_data.get("icon") is not None
+                else None,
+        ),
+    )
+
+    row = db.execute(
+        "SELECT id FROM games WHERE path = ?",
+        (path,),
+    ).fetchone()
+
+    if row is None:
+        raise RuntimeError(
+            f"Failed to retrieve database ID for game: {path}"
+        )
+
+    game_id = row["id"]
+
+    migrate_steam(db, game_id, game_data)
+    migrate_steamgriddb(db, game_id, game_data)
+
+def migrate_steam(
+    db: sqlite3.Connection,
+    game_id: int,
+    game_data: dict,
+):
+    if not any(
+        game_data.get(key) is not None
+        for key in (
+            "steam_key",
+            "steam_entry",
+            "in_steam",
+            "steam_broken",
+            "duplicate_steam",
+        )
+    ):
+        return
+
+    db.execute(
+        """
+        INSERT INTO steam_games (
+            game_id,
+            steam_key,
+            steam_entry,
+            in_steam,
+            steam_broken,
+            duplicate_steam
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_id) DO UPDATE SET
+            steam_key = excluded.steam_key,
+            steam_entry = excluded.steam_entry,
+            in_steam = excluded.in_steam,
+            steam_broken = excluded.steam_broken,
+            duplicate_steam = excluded.duplicate_steam
+        """,
+        (
+            game_id,
+            game_data.get("steam_key"),
+            json.dumps(game_data.get("steam_entry"))
+                if game_data.get("steam_entry") is not None
+                else None,
+            int(game_data.get("in_steam", False)),
+            int(game_data.get("steam_broken", False)),
+            int(game_data.get("duplicate_steam", False)),
+        ),
+    )
+
+def migrate_steamgriddb(
+    db: sqlite3.Connection,
+    game_id: int,
+    game_data: dict,
+):
+    sgdb = game_data.get("steamgriddb")
+
+    if not sgdb:
+        return
+
+    game = sgdb.get("game")
+
+    db.execute(
+        """
+        INSERT INTO steamgriddb_games (
+            game_id,
+            sgdb_id,
+            name,
+            search,
+            game_data,
+            steam_platform_data,
+            cached
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(game_id) DO UPDATE SET
+            sgdb_id = excluded.sgdb_id,
+            name = excluded.name,
+            search = excluded.search,
+            game_data = excluded.game_data,
+            steam_platform_data = excluded.steam_platform_data,
+            cached = excluded.cached
+        """,
+        (
+            game_id,
+            game.get("id") if game else None,
+            game.get("name") if game else None,
+            sgdb.get("search"),
+            json.dumps(game) if game is not None else None,
+            json.dumps(sgdb.get("steam_platform_data"))
+                if sgdb.get("steam_platform_data") is not None
+                else None,
+            sgdb.get("cached"),
+        ),
+    )
 
 # ============================================================
 # MODEL
