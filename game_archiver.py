@@ -895,6 +895,55 @@ def save_steamgriddb_artwork(
                     ),
                 )
 
+def load_selected_artwork(
+    db: sqlite3.Connection,
+    game_id: int,
+) -> dict:
+    selected = {
+        ArtworkType.GRID_PORTRAIT: None,
+        ArtworkType.GRID_SQUARE: None,
+        ArtworkType.GRID_LANDSCAPE: None,
+        ArtworkType.HERO: None,
+        ArtworkType.LOGO: None,
+        ArtworkType.ICON: None,
+    }
+
+    rows = db.execute(
+        """
+        SELECT
+            a.type,
+            a.data,
+            sa.downloaded_path
+        FROM selected_artwork AS sa
+        JOIN artwork AS a
+            ON a.id = sa.artwork_id
+        WHERE sa.game_id = ?
+        """,
+        (game_id,),
+    ).fetchall()
+
+    for row in rows:
+        try:
+            artwork_type = ArtworkType[row["type"]]
+        except KeyError:
+            continue
+
+        try:
+            artwork = json.loads(row["data"])
+        except json.JSONDecodeError:
+            continue
+
+        downloaded_path = row["downloaded_path"]
+        if downloaded_path is not None:
+            downloaded_path = Path(downloaded_path)
+
+        selected[artwork_type] = {
+            "asset": artwork,
+            "downloaded_path": downloaded_path,
+        }
+
+    return selected
+
 # ============================================================
 # JSON to SQLite
 # ============================================================
@@ -2420,10 +2469,28 @@ class GameArchiver(App):
                                 else None
                             ),
                             "cached": row["cached"],
-                            "art": {},
-                            "selected": {},
+                            "art": {
+                                ArtworkType.GRID_PORTRAIT: [],
+                                ArtworkType.GRID_SQUARE: [],
+                                ArtworkType.GRID_LANDSCAPE: [],
+                                ArtworkType.HERO: [],
+                                ArtworkType.LOGO: [],
+                                ArtworkType.ICON: [],
+                            },
+                            "selected": {
+                                ArtworkType.GRID_PORTRAIT: None,
+                                ArtworkType.GRID_SQUARE: None,
+                                ArtworkType.GRID_LANDSCAPE: None,
+                                ArtworkType.HERO: None,
+                                ArtworkType.LOGO: None,
+                                ArtworkType.ICON: None,
+                            },
                         }
-
+                        game_id = row["id"]
+                        game.steamgriddb["selected"] = load_selected_artwork(
+                            db,
+                            game_id,
+                        )
                     games.append(game)
 
                 shared_games = []
