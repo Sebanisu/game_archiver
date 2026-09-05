@@ -19,21 +19,33 @@ import httpx
 import copy
 import stat
 import datetime
+import sqlite3
+import vdf
 from enum import Enum, auto, StrEnum
 from urllib.parse import quote
-from dataclasses import asdict, dataclass, field
+from dataclasses import (
+    asdict, 
+    dataclass, 
+    field
+    )
 from pathlib import Path
 from hashlib import sha1
 from asyncio import to_thread
 from typing import Literal
 from typing import TypedDict
 from PIL import Image
-
-import vdf
 from textual import work
-from textual.app import App, ComposeResult
+from textual.app import (
+    App, 
+    ComposeResult
+)
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, Grid, Container
+from textual.containers import (
+    Horizontal, 
+    Vertical, 
+    Grid, 
+    Container
+)
 from textual_image.widget import AutoImage
 from textual.screen import ModalScreen
 from rich.markup import escape
@@ -62,6 +74,8 @@ STEAM_DIR = Path.home() / ".steam" / "steam"
 CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
+DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
+DATABASE_SCHEMA_VERSION = 1
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -179,6 +193,145 @@ class SearchOptions:
             for k, v in asdict(self).items()
             if v is not None
         }
+
+# ============================================================
+# SQLite
+# ============================================================
+
+
+
+def get_db() -> sqlite3.Connection:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    db = sqlite3.connect(DATABASE_FILE)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+
+    return db
+
+
+def create_database(db: sqlite3.Connection):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS games (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime REAL NOT NULL DEFAULT 0,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            last_played REAL NOT NULL DEFAULT 0,
+            launcher TEXT,
+            icon TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS steam_games (
+            game_id INTEGER PRIMARY KEY,
+            steam_key TEXT,
+            steam_entry TEXT,
+            in_steam INTEGER NOT NULL DEFAULT 0,
+            steam_broken INTEGER NOT NULL DEFAULT 0,
+            duplicate_steam INTEGER NOT NULL DEFAULT 0,
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS steamgriddb_games (
+            game_id INTEGER PRIMARY KEY,
+            sgdb_id INTEGER NOT NULL,
+            name TEXT,
+            search TEXT,
+            game_data TEXT,
+            steam_platform_data TEXT,
+            cached REAL,
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS steamgriddb_artwork (
+            id INTEGER PRIMARY KEY,
+            sgdb_game_id INTEGER NOT NULL,
+            sgdb_art_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            url TEXT,
+            thumb_url TEXT,
+            author TEXT,
+            data TEXT,
+
+            UNIQUE (sgdb_game_id, sgdb_art_id, type),
+
+            FOREIGN KEY (sgdb_game_id)
+                REFERENCES steamgriddb_games(game_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS game_artwork (
+            game_id INTEGER NOT NULL,
+            artwork_id INTEGER NOT NULL,
+            selected INTEGER NOT NULL DEFAULT 0,
+
+            PRIMARY KEY (game_id, artwork_id),
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES steamgriddb_artwork(id)
+                ON DELETE CASCADE
+        );
+    """)
+
+
+def get_schema_version(db: sqlite3.Connection) -> int:
+    row = db.execute(
+        "PRAGMA user_version"
+    ).fetchone()
+
+    return row[0]
+
+
+def set_schema_version(
+    db: sqlite3.Connection,
+    version: int,
+):
+    db.execute(f"PRAGMA user_version = {version}")
+
+
+def migrate_database(
+    db: sqlite3.Connection,
+    current_version: int,
+):
+    if current_version > DATABASE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema version {current_version} "
+            f"is newer than supported version {DATABASE_SCHEMA_VERSION}"
+        )
+
+    if current_version < 1:
+        create_database(db)
+        set_schema_version(db, 1)
+
+    # Future migrations go here:
+    #
+    # if current_version < 2:
+    #     migrate_to_v2(db)
+    #     set_schema_version(db, 2)
+
+
+def init_database():
+    with get_db() as db:
+        current_version = get_schema_version(db)
+
+        migrate_database(
+            db,
+            current_version,
+        )
+
+        db.commit()
 
 # ============================================================
 # MODEL
@@ -3959,4 +4112,5 @@ class SteamGridDBClient:
 # ============================================================
 
 if __name__ == "__main__":
+    init_database()
     GameArchiver().run()
