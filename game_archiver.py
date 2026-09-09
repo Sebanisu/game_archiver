@@ -2159,7 +2159,6 @@ def fmt_size(num: int) -> str:
 
     return f"{num / 1024:.1f} KB"
 
-
 def dir_size(path: Path) -> int:
     try:
         if path.is_symlink():
@@ -2167,29 +2166,29 @@ def dir_size(path: Path) -> int:
         else:
             target = path
 
-        exclude_args = [
-            f"--exclude={name}"
-            for name in IGNORE_DIRS
-        ]
+        exclude_args = [f"--exclude={name}" for name in IGNORE_DIRS]
 
         result = subprocess.run(
-            [
-                "du",
-                "-sb",
-                *exclude_args,
-                str(target),
-            ],
+            ["du", "-sb", *exclude_args, str(target)],
             capture_output=True,
             text=True,
-            check=True,
+            # do NOT use check=True
         )
+
+        if result.returncode != 0:
+            # du often returns non-zero on permission errors; still try to parse what we got
+            if result.stdout.strip():
+                return int(result.stdout.split()[0])
+            raise RuntimeError(
+                f"du failed (exit {result.returncode}): {result.stderr.strip() or 'unknown error'}"
+            )
 
         return int(result.stdout.split()[0])
 
     except Exception as e:
+        # Keep the message short and free of [ ] characters
         raise RuntimeError(
-            f"dir_size failed for {path}: "
-            f"{type(e).__name__}: {e}"
+            f"dir_size failed for {path}: {type(e).__name__}"
         ) from e
 
 def latest_activity(path: Path) -> float:
@@ -2832,11 +2831,9 @@ class GameArchiver(App):
             game.size = dir_size(path)
         except Exception as e:
             self.notify(
-                escape(
-                    f"Error computing size for {path}: "
-                    f"{type(e).__name__}: {e}"
-                ),
+                f"Error computing size for {path}: {type(e).__name__}",
                 severity="error",
+                markup=False,
             )
             game.size = 0
 
