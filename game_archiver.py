@@ -2294,10 +2294,15 @@ class GameRow(ListItem):
         else:
             steam = " "
 
-        if self.game.steamgriddb and self.game.steamgriddb.get("game", {}).get("id"):
-            sgdb = "G"        
-        elif self.game.steamgriddb and self.game.steamgriddb.get("id"): #lowercase g needs to be refreshed
-            sgdb = "g"
+        if self.game.steamgriddb:
+            sgdb_game = self.game.steamgriddb.get("game")
+
+            if isinstance(sgdb_game, dict) and sgdb_game.get("id"):
+                sgdb = "G"
+            elif self.game.steamgriddb.get("id"):
+                sgdb = "g"
+            else:
+                sgdb = " "
         else:
             sgdb = " "
 
