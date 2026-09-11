@@ -2339,15 +2339,28 @@ class GameRow(ListItem):
                 parts.append(
                     f"Steam LaunchOptions: {launch_options}"
                 )
-        if self.game.steamgriddb:
-            if name := self.game.steamgriddb.get("name", self.game.steamgriddb.get("game", {}).get("name")):
-                parts.append(f"SteamGridDB: {name}")
+            if self.game.steamgriddb:
+                sgdb_game = self.game.steamgriddb.get("game")
 
-            if search := self.game.steamgriddb.get("search"):
-                parts.append(f"SteamGridDB Search: {search}")
+                if isinstance(sgdb_game, dict):
+                    name = self.game.steamgriddb.get("name") or sgdb_game.get("name")
+                else:
+                    name = self.game.steamgriddb.get("name")
 
-            if game_id := self.game.steamgriddb.get("id", self.game.steamgriddb.get("game", {}).get("id")):
-                parts.append(f"SteamGridDB ID: {game_id}")
+                if name:
+                    parts.append(f"SteamGridDB: {name}")
+
+                if search := self.game.steamgriddb.get("search"):
+                    parts.append(f"SteamGridDB Search: {search}")
+
+                game_id = self.game.steamgriddb.get("id")
+
+                if game_id is None and isinstance(sgdb_game, dict):
+                    game_id = sgdb_game.get("id")
+
+                if game_id:
+                    parts.append(f"SteamGridDB ID: {game_id}")
+
         self.tooltip = "\n".join(part for part in parts if part)
 
 
