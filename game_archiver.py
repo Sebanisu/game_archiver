@@ -170,6 +170,22 @@ class ArtworkType(StrEnum):
     ICON = "icon"
     CANCEL = "cancel"
 
+class SteamArtworkAuthor(TypedDict):
+    name: str
+    avatar: str | None
+    steam64: str | None
+
+
+class SteamArtwork(TypedDict):
+    id: str
+    language: str
+    thumb: str
+    url: str
+    urls: list[str]
+    author: SteamArtworkAuthor
+    style: str
+    source: str
+
 suffixes = {
     ArtworkType.GRID_PORTRAIT: "p",
     ArtworkType.GRID_LANDSCAPE: "",
@@ -1342,15 +1358,23 @@ async def get_asset_file(client: SteamGridDBClient, art: dict) -> Path | None:
         return art["path"]
 
     path = IMAGE_CACHE / f"{art['id']}{ImageExtension.PNG}"
-    if not path.exists():
-        result = await client.download_file(
-            art["url"],
-            path,
-        )
 
-        if not result["success"]:
-            return None    
+    if not path.exists():
+        urls = art.get("urls", [art["url"]])
+
+        for url in urls:
+            result = await client.download_file(
+                url,
+                path,
+            )
+
+            if result["success"]:
+                return path
+
+        return None
+
     return path
+
 
 def json_default(obj):
     if isinstance(obj, Path):
@@ -1409,7 +1433,7 @@ FALLBACKS = {
     },
 }
 
-def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
+def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | None]:
     """
     Returns:
     {
@@ -1442,24 +1466,32 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
     if not appid:
         return art
 
-    def build(steam_type: str) -> dict | None:
+    def build(steam_type: str) -> SteamArtwork | None:
         data = meta.get(f"{steam_type}_full")
         icon = meta.get("icon")
         clienticon = meta.get("clienticon")
 
         language = "english"
+        urls: list[str] = []
 
         if steam_type == "icon":
             if clienticon:
-                thumb_url = full_url = (
-                    f"{STEAM_CLIENTICON_CDN}{appid}/{clienticon}{ImageExtension.ICO}"
+                urls.append(
+                    f"{STEAM_CLIENTICON_CDN}{appid}/"
+                    f"{clienticon}{ImageExtension.ICO}"
                 )
-            elif icon:
-                thumb_url = full_url = (
-                    f"{STEAM_ICON_CDN}{appid}/{icon}{ImageExtension.JPG}"
+
+            if icon:
+                urls.append(
+                    f"{STEAM_ICON_CDN}{appid}/"
+                    f"{icon}{ImageExtension.JPG}"
                 )
-            else:
+
+            if not urls:
                 return None
+
+            # First URL remains the preferred URL.
+            thumb_url = full_url = urls[0]
 
         else:
             if isinstance(data, dict):
@@ -1487,6 +1519,7 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
 
             thumb_url = f"{STEAM_STORE_CDN}{appid}/{thumb_file}"
             full_url = f"{STEAM_STORE_CDN}{appid}/{full_file}"
+            urls = [full_url]
 
         mtime = meta.get("store_asset_mtime")
         if mtime:
@@ -1498,6 +1531,7 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
             "language": language,
             "thumb": thumb_url,
             "url": full_url,
+            "urls": urls,
             "author": {
                 "name": "Steam",
                 "avatar": None,
@@ -1506,12 +1540,11 @@ def steam_art_urls(metadata: dict | None) -> dict[str, tuple[str, str]]:
             "style": "official",
             "source": "steam",
         }
-
     art[ArtworkType.GRID_PORTRAIT] = build("library_capsule")
     art[ArtworkType.GRID_LANDSCAPE] = build("header_image")
     art[ArtworkType.HERO] = build("library_hero")
     art[ArtworkType.LOGO] = build("library_logo")
-    art[ArtworkType.ICON] = build("icon") # uses clienticon and falls back to icon
+    art[ArtworkType.ICON] = build("icon")
     return art
 
 def add_dict(parts: list[str], data: dict, prefix: str = ""):
@@ -4248,10 +4281,18 @@ class ArtworkPreview(Container):
             return
 
         if not path.exists():
-            result = await self.client.download_file(
-                art["thumb"],
-                path,
-            )
+            urls = art.get("urls", [art["thumb"]])
+
+            result = {"success": False}
+
+            for url in urls:
+                result = await self.client.download_file(
+                    url,
+                    path,
+                )
+
+                if result["success"]:
+                    break
 
             if not result["success"]:
                 await self.remove_children()
