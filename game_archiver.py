@@ -75,7 +75,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -318,10 +318,11 @@ def create_database(db: sqlite3.Connection):
         """
         CREATE TABLE IF NOT EXISTS selected_artwork (
             game_id INTEGER NOT NULL,
+            artwork_type TEXT NOT NULL,
             artwork_id INTEGER NOT NULL,
             downloaded_path TEXT,
 
-            PRIMARY KEY (game_id, artwork_id),
+            PRIMARY KEY (game_id, artwork_type),
 
             FOREIGN KEY (game_id)
                 REFERENCES games(id)
@@ -379,6 +380,12 @@ def migrate_database(
         migrate_to_v4(db)
         set_schema_version(db, 4)
         current_version = 4
+
+
+    if current_version < 5:
+        migrate_to_v5(db)
+        set_schema_version(db, 5)
+        current_version = 5
 
     # Future migrations go here
 
@@ -575,6 +582,42 @@ def migrate_to_v4(db: sqlite3.Connection):
         RENAME TO selected_artwork
         """
     )
+
+def migrate_to_v5(db: sqlite3.Connection) -> None:
+    db.execute("""
+        CREATE TABLE selected_artwork_v5 (
+            game_id INTEGER NOT NULL,
+            artwork_type TEXT NOT NULL,
+            artwork_id INTEGER NOT NULL,
+            downloaded_path TEXT,
+            PRIMARY KEY (game_id, artwork_type),
+            FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE,
+            FOREIGN KEY (artwork_id) REFERENCES artwork(id) ON DELETE CASCADE
+        )
+    """)
+
+    db.execute("""
+        INSERT INTO selected_artwork_v5 (
+            game_id, artwork_type, artwork_id, downloaded_path
+        )
+        SELECT
+            sa.game_id,
+            a.type,
+            sa.artwork_id,
+            sa.downloaded_path
+        FROM selected_artwork sa
+        JOIN artwork a ON a.id = sa.artwork_id
+        WHERE sa.artwork_id = (
+            SELECT MAX(sa2.artwork_id)
+            FROM selected_artwork sa2
+            JOIN artwork a2 ON a2.id = sa2.artwork_id
+            WHERE sa2.game_id = sa.game_id
+              AND a2.type = a.type
+        )
+    """)
+
+    db.execute("DROP TABLE selected_artwork")
+    db.execute("ALTER TABLE selected_artwork_v5 RENAME TO selected_artwork")
 
 def save_game(
     db: sqlite3.Connection,
@@ -890,17 +933,19 @@ def save_steamgriddb_artwork(
                     """
                     INSERT INTO selected_artwork (
                         game_id,
+                        artwork_type,
                         artwork_id,
                         downloaded_path
                     )
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(game_id, artwork_id)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(game_id, artwork_type)
                     DO UPDATE SET
-                        downloaded_path =
-                            excluded.downloaded_path
+                        artwork_id = excluded.artwork_id,
+                        downloaded_path = excluded.downloaded_path
                     """,
                     (
                         game_id,
+                        artwork_type.name,
                         artwork_id,
                         str(downloaded_path)
                         if downloaded_path is not None
@@ -924,7 +969,7 @@ def load_selected_artwork(
     rows = db.execute(
         """
         SELECT
-            a.type,
+            sa.artwork_type,
             a.data,
             sa.downloaded_path
         FROM selected_artwork AS sa
@@ -937,7 +982,7 @@ def load_selected_artwork(
 
     for row in rows:
         try:
-            artwork_type = ArtworkType[row["type"]]
+            artwork_type = ArtworkType[row["artwork_type"]]
         except KeyError:
             continue
 
