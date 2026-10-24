@@ -1184,6 +1184,26 @@ class LaunchInfo:
     env: dict[str, str]
 
 def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
+    def wrap_gamescope(cmd: list[str]) -> list[str]:
+        if for_steam:
+            return cmd
+
+        if not shutil.which("gamescope"):
+            return cmd
+
+        return [
+            "gamescope",
+            "-f",
+            "-w", "1920",
+            "-h", "1080",
+            "-W", "1920",
+            "-H", "1080",
+            "--force-grab-cursor",
+            "--backend", "sdl",
+            "--",
+            *cmd,
+        ]
+    
     if game.launcher is None:
         game.launcher = find_launcher(launch_path(game))
 
@@ -1192,16 +1212,18 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
         return
     launcher = game.launcher
     env = os.environ.copy()
+    env["SDL_VIDEODRIVER"] = "x11"
 
-    if launcher.suffix == ".sh":
-        cmd = (
-            [str(launcher)]
-            if for_steam
-            else ["bash", str(launcher)]
-        )
+
+    if launcher.suffix.casefold() == ".sh":
+        if for_steam:
+            cmd = [str(launcher)]
+        else:
+            cmd = wrap_gamescope(["bash", str(launcher)])           
+
 
     elif launcher.suffix == ".swf":
-        cmd = ["ruffle", str(launcher)]
+        cmd = wrap_gamescope(["ruffle", str(launcher)])
         
     elif launcher.suffix == ".apk" and for_steam == False:
         cmd = [
@@ -1209,7 +1231,7 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
             "app",
             "install",
             str(launcher),
-        ]
+            ]
 
     elif launcher.suffix == ".exe":
         if for_steam:
@@ -1284,8 +1306,10 @@ exec {shlex.quote(str(PROTON))} run {shlex.quote(str(launcher))}
                 "--hold",
                 "bash",
                 "-lc",
-                bash_cmd,
-            ]
+                wrap_gamescope(
+                bash_cmd)
+                ]
+    
     else:
         cmd = [str(launcher)]
 
@@ -1294,6 +1318,7 @@ exec {shlex.quote(str(PROTON))} run {shlex.quote(str(launcher))}
         cwd=launcher.parent,
         env=env,
     )
+
 class SteamGridDBAction(Enum):
     BROWSE = auto()
     DOWNLOAD = auto()
