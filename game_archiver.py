@@ -1726,21 +1726,28 @@ async def get_steamgriddb_api_key(app) -> str | None:
 
 
 def extract_exe_icon(exe: Path) -> Path | None:
-    key = hashlib.sha1(
-        f"{exe.resolve()}:{exe.stat().st_mtime_ns}".encode()
-    ).hexdigest()
-    def image_width(path: Path) -> int:
-        with Image.open(path) as img:
-            return img.width
-    out_dir = ICON_CACHE / key
+    try:
+        if not exe.is_file():
+            return None
 
-    if out_dir.exists():
+        key = hashlib.sha1(
+            f"{exe.resolve()}:{exe.stat().st_mtime_ns}".encode()
+        ).hexdigest()
+
+        def image_width(path: Path) -> int:
+            with Image.open(path) as img:
+                return img.width
+
+        out_dir = ICON_CACHE / key
+        out_dir.mkdir(parents=True, exist_ok=True)
+
         pngs = list(out_dir.glob("*" + ImageExtension.PNG))
         if pngs:
-            return max(pngs, key=image_width)
-    else:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    try:
+            try:
+                return max(pngs, key=image_width)
+            except (OSError, ValueError):
+                pass
+
         subprocess.run(
             [
                 "wrestool",
@@ -1756,7 +1763,6 @@ def extract_exe_icon(exe: Path) -> Path | None:
         )
 
         ico_files = list(out_dir.glob("*" + ImageExtension.ICO))
-
         if not ico_files:
             return None
 
@@ -1774,7 +1780,6 @@ def extract_exe_icon(exe: Path) -> Path | None:
         )
 
         pngs = list(out_dir.glob("*" + ImageExtension.PNG))
-
         if not pngs:
             return None
 
@@ -1783,8 +1788,12 @@ def extract_exe_icon(exe: Path) -> Path | None:
     except (
         subprocess.CalledProcessError,
         FileNotFoundError,
+        PermissionError,
+        OSError,
+        ValueError,
     ):
         return None
+
 
 def steam_running() -> bool:
     try:
@@ -4311,23 +4320,25 @@ class ArtworkPreview(Container):
         else:
             path = art["path"]
 
-        if path is None or not path.exists():
+        await self.remove_children()
+
+        if path is None or not path.is_file():
             self.image = None
+            await self.mount(
+                Static(
+                    "Could not load local artwork.\n"
+                    "The file may be unsupported, or executable icon extraction may have failed.",
+                    id="preview-error",
+                )
+            )
             return
 
-        # load/display image from path
-        await self.remove_children()
-        # self.notify(
-        #     f"path type: {type(path).__name__}\n"
-        #     f"path: {path}"
-        # )
         await self.mount(
             AutoImage(
                 str(path),
                 id="image",
             )
         )
-
 
     async def show_art(
         self,
