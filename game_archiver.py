@@ -1351,9 +1351,8 @@ exec {shlex.quote(str(PROTON))} run {shlex.quote(str(launcher))}
                 "--hold",
                 "bash",
                 "-lc",
-                wrap_gamescope(
-                bash_cmd)
-                ]
+                shlex.join(wrap_gamescope(["bash", "-c", bash_cmd])),
+            ]
     
     else:
         cmd = [str(launcher)]
@@ -3703,7 +3702,15 @@ class GameArchiver(App):
 
         while True:
             art_type = await self.push_screen_wait(
-                ArtworkTypeDialog(art, local_icons)
+                ArtworkTypeDialog(
+                    art, 
+                    local_icons,
+                    selected_types={
+                        art_type
+                        for art_type, info in (game.steamgriddb.get("selected") or {}).items()
+                        if isinstance(info, dict) and info.get("asset") is not None
+                    },
+                )
             )
 
             match art_type:
@@ -3733,6 +3740,10 @@ class GameArchiver(App):
                     artwork=artwork,
                     client=client,
                     local_icons = local_icons if art_type == ArtworkType.ICON else None,
+                    selected_artwork=(
+                        (game.steamgriddb.get("selected") or {})
+                        .get(art_type) or {}
+                    ).get("asset"),
                 )
             )
             match action:
@@ -4130,9 +4141,11 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
     def __init__(
         self,
         art: dict,
-        local_icons: list[IconCandidate]
+        local_icons: list[IconCandidate],
+        selected_types: set[ArtworkType] | None = None,
     ):
         super().__init__()
+        self.selected_types = selected_types or set()
         self.art = {
             ArtworkType.GRID_PORTRAIT: [],
             ArtworkType.GRID_LANDSCAPE: [],
@@ -4166,37 +4179,37 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
             
             with Grid(id="art-grid"):
                 yield Button(
-                    f"Grid Portrait ({grids_portrait})",
+                    f"{'✓ ' if ArtworkType.GRID_PORTRAIT in self.selected_types else ''}Grid Portrait ({grids_portrait})",
                     id=ArtworkType.GRID_PORTRAIT,
                     disabled=grids_portrait == 0,
                 )
 
                 yield Button(
-                    f"Grid Square ({grids_square})",
+                    f"{'✓ ' if ArtworkType.GRID_SQUARE in self.selected_types else ''}Grid Square ({grids_square})",
                     id=ArtworkType.GRID_SQUARE,
                     disabled=grids_square == 0,
                 )
 
                 yield Button(
-                    f"Grid Landscape ({grids_landscape})",
+                    f"{'✓ ' if ArtworkType.GRID_LANDSCAPE in self.selected_types else ''}Grid Landscape ({grids_landscape})",
                     id=ArtworkType.GRID_LANDSCAPE,
                     disabled=grids_landscape == 0,
                 )
 
                 yield Button(
-                    f"Heroes ({heroes})",
+                    f"{'✓ ' if ArtworkType.HERO in self.selected_types else ''}Heroes ({heroes})",
                     id=ArtworkType.HERO,
                     disabled=heroes == 0,
                 )
 
                 yield Button(
-                    f"Logos ({logos})",
+                    f"{'✓ ' if ArtworkType.LOGO in self.selected_types else ''}Logos ({logos})",
                     id=ArtworkType.LOGO,
                     disabled=logos == 0,
                 )
 
                 yield Button(
-                    f"Icons ({icons})",
+                    f"{'✓ ' if ArtworkType.ICON in self.selected_types else ''}Icons ({icons})",
                     id=ArtworkType.ICON,
                     disabled=icons == 0,
                 )
@@ -4465,13 +4478,15 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         title: str,
         artwork: list[dict],
         client: SteamGridDBClient,
-        local_icons: list[IconCandidate] | None
+        local_icons: list[IconCandidate] | None,
+        selected_artwork: dict | None = None,
     ):
         super().__init__()
 
         self.title = title
         self.artwork = copy.deepcopy(artwork)
         self.client = client
+        self.selected_artwork = selected_artwork
 
         if local_icons:
             for icon in local_icons:
@@ -4490,7 +4505,16 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         art: dict,
     ) -> ListItem:
         details = []
+        saved_id = (
+            self.selected_artwork.get("id")
+            if self.selected_artwork
+            else None
+        )
 
+        is_selected = (
+            saved_id is not None
+            and str(art["id"]) == str(saved_id)
+        )
         if art.get("style"):
             details.append(art["style"].title())
 
@@ -4516,6 +4540,8 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
             text = text.name
 
         text = f"{text}"
+        if is_selected:
+            details.append("✓ Selected")
 
         if details:
             text += "\n    " + " • ".join(details)
