@@ -35,6 +35,7 @@ from typing import Literal
 from typing import TypedDict
 from PIL import Image
 from textual import work
+from textual_fspicker import FileOpen
 from textual.app import (
     App, 
     ComposeResult
@@ -1217,6 +1218,7 @@ def migrate_steamgriddb(
             sgdb.get("cached"),
         ),
     )
+
 
 # ============================================================
 # MODEL
@@ -3573,22 +3575,66 @@ class GameArchiver(App):
                     return
 
                 results = result["data"]
+            if not results:
+                action = await self.push_screen_wait(
+                    NoArtworkMatchDialog(query)
+                )
 
-            if not results or prompt_for_search:
+                match action:
+                    case NoArtworkMatchAction.CANCEL:
+                        return
+
+                    case NoArtworkMatchAction.SEARCH:
+                        new_query = await self.push_screen_wait(
+                            InputDialog(
+                                title="SteamGridDB Search",
+                                prompt="Search for:",
+                                value=query,
+                            )
+                        )
+
+                        if new_query is None:
+                            return
+
+                        new_query = new_query.strip()
+
+                        if not new_query:
+                            self.notify("Search query cannot be empty.")
+                            prompt_for_search = True
+                            continue
+
+                        query = new_query
+                        game.steamgriddb["search"] = query
+                        self.save_game_data()
+                        prompt_for_search = False
+                        continue
+
+                    case NoArtworkMatchAction.LOCAL:
+                        await self.download_local_artwork(game, client)
+                        return
+
+            if prompt_for_search:
                 prompt_for_search = False
-                query = await self.push_screen_wait(
+
+                new_query = await self.push_screen_wait(
                     InputDialog(
                         title="SteamGridDB Search",
-                        prompt="No matches found. Search for:",
+                        prompt="Search for:",
                         value=query,
                     )
                 )
 
-                if query is None:
+                if new_query is None:
                     return
 
-                query = query.strip()
+                new_query = new_query.strip()
 
+                if not new_query:
+                    self.notify("Search query cannot be empty.")
+                    prompt_for_search = True
+                    continue
+
+                query = new_query
                 game.steamgriddb["search"] = query
                 self.save_game_data()
                 continue
@@ -3692,13 +3738,39 @@ class GameArchiver(App):
                         game,
                         client,
                     )
+
+    async def download_local_artwork(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+    ):
+        art = {
+            ArtworkType.GRID_PORTRAIT: [],
+            ArtworkType.GRID_SQUARE: [],
+            ArtworkType.GRID_LANDSCAPE: [],
+            ArtworkType.HERO: [],
+            ArtworkType.LOGO: [],
+            ArtworkType.ICON: [],
+        }
+
+        local_icons = await to_thread(find_icons, launch_path(game))
+
+        game.steamgriddb.setdefault("selected", {})
+        game.steamgriddb.setdefault("art", art)
+
+        await self._choose_artwork(
+            game,
+            client,
+            art,
+            local_icons,
+        )
+
     async def download_steamgriddb_art(
         self,
         game: Game,
         client: SteamGridDBClient,
     ):
         art_data = await client.get_all_art(game)
-        
         local_icons = await to_thread(find_icons, launch_path(game))
 
         if not art_data["success"]:
@@ -3709,71 +3781,126 @@ class GameArchiver(App):
         game.steamgriddb["art"] = art
         self.save_game_data()
 
+        await self._choose_artwork(game, client, art, local_icons)
+
+    async def _choose_artwork(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+        art: dict,
+        local_icons: list[IconCandidate],
+    ):
         while True:
-            art_type = await self.push_screen_wait(
+            result = await self.push_screen_wait(
                 ArtworkTypeDialog(
-                    art, 
+                    art,
                     local_icons,
                     selected_types={
                         art_type
-                        for art_type, info in (game.steamgriddb.get("selected") or {}).items()
-                        if isinstance(info, dict) and info.get("asset") is not None
+                        for art_type, info in (
+                            game.steamgriddb.get("selected") or {}
+                        ).items()
+                        if isinstance(info, dict)
+                        and info.get("asset") is not None
                     },
                 )
             )
 
-            match art_type:
-                case ArtworkType.CANCEL:
-                    return
+            if result is None:
+                return
 
-                case ArtworkType.GRID_PORTRAIT:
-                    artwork = art[ArtworkType.GRID_PORTRAIT]
+            art_type = result.artwork_type
 
-                case ArtworkType.GRID_SQUARE:
-                    artwork = art[ArtworkType.GRID_SQUARE]
+            if result.choose_local:
+                selected_path = await self.push_screen_wait(
+                    FileOpen(
+                        location=Path.home(),
+                        title=(
+                            "Choose Local "
+                            f"{art_type.name.replace('_', ' ').title()} Artwork"
+                        ),
+                    )
+                )
 
-                case ArtworkType.GRID_LANDSCAPE:
-                    artwork = art[ArtworkType.GRID_LANDSCAPE]
+                if selected_path is None:
+                    continue
 
-                case ArtworkType.HERO:
-                    artwork = art[ArtworkType.HERO]
+                # Add this local file to the candidates for the current type.
+                artwork = list(art.get(art_type) or [])
+                artwork.append({
+                    "id": str(selected_path),
+                    "path": selected_path,
+                    "url": selected_path.as_uri(),
+                    "name": selected_path.name,
+                    "source": "local",
+                    "style": "Local",
+                    "kind": selected_path.suffix.lower(),
+                })
 
-                case ArtworkType.LOGO:
-                    artwork = art[ArtworkType.LOGO]
+            else:
+                match art_type:
+                    case ArtworkType.CANCEL:
+                        return
+                    case ArtworkType.GRID_PORTRAIT:
+                        artwork = art[ArtworkType.GRID_PORTRAIT]
+                    case ArtworkType.GRID_SQUARE:
+                        artwork = art[ArtworkType.GRID_SQUARE]
+                    case ArtworkType.GRID_LANDSCAPE:
+                        artwork = art[ArtworkType.GRID_LANDSCAPE]
+                    case ArtworkType.HERO:
+                        artwork = art[ArtworkType.HERO]
+                    case ArtworkType.LOGO:
+                        artwork = art[ArtworkType.LOGO]
+                    case ArtworkType.ICON:
+                        artwork = art[ArtworkType.ICON]
 
-                case ArtworkType.ICON:
-                    artwork = art[ArtworkType.ICON]
             action, selected = await self.push_screen_wait(
                 ArtworkSelectionDialog(
-                    title=f"SteamGridDB {art_type.name.title()}",
+                    title=f"{art_type.name.replace('_', ' ').title()} Artwork",
                     artwork=artwork,
                     client=client,
-                    local_icons = local_icons if art_type == ArtworkType.ICON else None,
+                    local_icons=(
+                        local_icons if art_type == ArtworkType.ICON else None
+                    ),
                     selected_artwork=(
-                        (game.steamgriddb.get("selected") or {})
-                        .get(art_type) or {}
+                        (game.steamgriddb.get("selected") or {}).get(art_type)
+                        or {}
                     ).get("asset"),
                 )
             )
+
             match action:
                 case ArtworkSelectionDialogAction.CANCEL:
-                    continue  # show ArtworkTypeDialog again
-                    break
+                    continue
+
                 case ArtworkSelectionDialogAction.DOWNLOAD:
+                    if selected is None:
+                        continue
+
                     selected_info = game.steamgriddb["selected"].get(art_type)
                     if selected_info is None:
                         selected_info = {}
                         game.steamgriddb["selected"][art_type] = selected_info
+
                     selected_info["asset"] = selected
-                    selected_info["downloaded_path"] = await get_asset_file(client, selected)
+
+                    if selected.get("source") == "local":
+                        selected_info["downloaded_path"] = selected["path"]
+                    else:
+                        selected_info["downloaded_path"] = await get_asset_file(
+                            client,
+                            selected,
+                        )
+
                     self.save_game_data()
+
                     if selected_info["downloaded_path"]:
                         await self.install_artwork(
                             game,
                             art_type,
                             selected_info["downloaded_path"],
                         )
-                    continue  # stay in the artwork picker
+
 
     async def install_artwork(
         self,
@@ -4114,10 +4241,15 @@ class InputDialog(ModalScreen[str | None]):
 # ============================================================
 # Artwork Type Dialog
 # ============================================================
+class NoArtworkMatchAction(StrEnum):
+    LOCAL = "local"
+    SEARCH = "search"
+    CANCEL = "cancel"
 
-class ArtworkTypeDialog(ModalScreen[ArtworkType]):
+
+class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction]):
     DEFAULT_CSS = """
-    ArtworkTypeDialog {
+    NoArtworkMatchDialog {
         align: center middle;
     }
 
@@ -4129,16 +4261,79 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
         padding: 1 2;
     }
 
+    #buttons {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        align-horizontal: right;
+    }
+    """
+
+    def __init__(self, query: str):
+        super().__init__()
+        self.query = query
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("[b]No SteamGridDB matches found[/b]")
+            yield Label(f"No results for: {self.query}")
+
+            with Horizontal(id="buttons"):
+                yield Button("Browse Local Artwork", id="local")
+                yield Button("Search Again", id="search")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        match event.button.id:
+            case "local":
+                self.dismiss(NoArtworkMatchAction.LOCAL)
+            case "search":
+                self.dismiss(NoArtworkMatchAction.SEARCH)
+            case _:
+                self.dismiss(NoArtworkMatchAction.CANCEL)
+
+@dataclass
+class ArtworkTypeDialogResult:
+    artwork_type: ArtworkType
+    choose_local: bool = False
+
+class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
+    DEFAULT_CSS = """
+    ArtworkTypeDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 76;
+        max-width: 95%;
+        height: auto;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
     #art-grid {
         width: 100%;
         height: auto;
-
         grid-size: 2;
         grid-columns: 1fr 1fr;
         grid-gutter: 1;
     }
-    #art-grid Button {
+
+    #art-grid .category-row {
         width: 100%;
+        height: auto;
+        layout: horizontal;
+    }
+
+    #art-grid .category-button {
+        width: 1fr;
+        min-width: 0;
+    }
+
+    #art-grid .local-button {
+        width: 5;
+        min-width: 5;
     }
 
     #cancel {
@@ -4173,89 +4368,69 @@ class ArtworkTypeDialog(ModalScreen[ArtworkType]):
 
         self.local_icons = local_icons
 
-
-
     def compose(self) -> ComposeResult:
-        grids_portrait = len(self.art[ArtworkType.GRID_PORTRAIT])
-        grids_square = len(self.art[ArtworkType.GRID_SQUARE])
-        grids_landscape = len(self.art[ArtworkType.GRID_LANDSCAPE])
-        heroes = len(self.art[ArtworkType.HERO])
-        logos = len(self.art[ArtworkType.LOGO])
-        icons = len(self.art[ArtworkType.ICON]) + len(self.local_icons)
-    
+        categories = [
+            (ArtworkType.GRID_PORTRAIT, "Grid Portrait"),
+            (ArtworkType.GRID_SQUARE, "Grid Square"),
+            (ArtworkType.GRID_LANDSCAPE, "Grid Landscape"),
+            (ArtworkType.HERO, "Heroes"),
+            (ArtworkType.LOGO, "Logos"),
+            (ArtworkType.ICON, "Icons"),
+        ]
+
         with Vertical(id="dialog"):
             yield Label("[b]Download Artwork[/b]")
-            
+
             with Grid(id="art-grid"):
-                yield Button(
-                    f"{'✓ ' if ArtworkType.GRID_PORTRAIT in self.selected_types else ''}Grid Portrait ({grids_portrait})",
-                    id=ArtworkType.GRID_PORTRAIT,
-                    disabled=grids_portrait == 0,
-                )
+                for art_type, label in categories:
+                    count = len(self.art[art_type])
+                    if art_type == ArtworkType.ICON:
+                        count += len(self.local_icons)
 
-                yield Button(
-                    f"{'✓ ' if ArtworkType.GRID_SQUARE in self.selected_types else ''}Grid Square ({grids_square})",
-                    id=ArtworkType.GRID_SQUARE,
-                    disabled=grids_square == 0,
-                )
+                    selected = "✓ " if art_type in self.selected_types else ""
 
-                yield Button(
-                    f"{'✓ ' if ArtworkType.GRID_LANDSCAPE in self.selected_types else ''}Grid Landscape ({grids_landscape})",
-                    id=ArtworkType.GRID_LANDSCAPE,
-                    disabled=grids_landscape == 0,
-                )
+                    with Horizontal(classes="category-row"):
+                        yield Button(
+                            f"{selected}{label} ({count})",
+                            id=str(art_type),
+                            classes="category-button",
+                            disabled=count == 0,
+                        )
+                        yield Button(
+                            "📁",
+                            id=f"local-{art_type.name}",
+                            classes="local-button",
+                            tooltip=f"Choose local {label.lower()} artwork",
+                        )
 
-                yield Button(
-                    f"{'✓ ' if ArtworkType.HERO in self.selected_types else ''}Heroes ({heroes})",
-                    id=ArtworkType.HERO,
-                    disabled=heroes == 0,
-                )
+            yield Button("Cancel", id=str(ArtworkType.CANCEL))
 
-                yield Button(
-                    f"{'✓ ' if ArtworkType.LOGO in self.selected_types else ''}Logos ({logos})",
-                    id=ArtworkType.LOGO,
-                    disabled=logos == 0,
-                )
 
-                yield Button(
-                    f"{'✓ ' if ArtworkType.ICON in self.selected_types else ''}Icons ({icons})",
-                    id=ArtworkType.ICON,
-                    disabled=icons == 0,
-                )
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
 
-            yield Button(
-                "Cancel",
-                id=ArtworkType.CANCEL,
+        if button_id is None or button_id == str(ArtworkType.CANCEL):
+            self.dismiss(None)
+            return
+
+        if button_id.startswith("local-"):
+            art_type = ArtworkType[button_id.removeprefix("local-")]
+            self.dismiss(
+                ArtworkTypeDialogResult(
+                    artwork_type=art_type,
+                    choose_local=True,
+                )
             )
+            return
 
-    def on_button_pressed(
-        self,
-        event: Button.Pressed,
-    ):
-        match event.button.id:
-            case ArtworkType.GRID_PORTRAIT:
-                self.dismiss(ArtworkType.GRID_PORTRAIT)
+        self.dismiss(
+            ArtworkTypeDialogResult(
+                artwork_type=ArtworkType(button_id),
+            )
+        )
 
-            case ArtworkType.GRID_SQUARE:
-                self.dismiss(ArtworkType.GRID_SQUARE)
-
-            case ArtworkType.GRID_LANDSCAPE:
-                self.dismiss(ArtworkType.GRID_LANDSCAPE)
-
-            case ArtworkType.HERO:
-                self.dismiss(ArtworkType.HERO)
-
-            case ArtworkType.LOGO:
-                self.dismiss(ArtworkType.LOGO)
-
-            case ArtworkType.ICON:
-                self.dismiss(ArtworkType.ICON)
-
-            case _:
-                self.dismiss(ArtworkType.CANCEL)
-
-    def action_dismiss(self):
-        self.dismiss(ArtworkType.CANCEL)
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
 
 
 # ============================================================
@@ -4315,7 +4490,7 @@ class ArtworkPreview(Container):
         return THUMB_CACHE / f"{art['id']}{ImageExtension.PNG}"
 
     async def show_local_art(self, art: dict):
-        if art["kind"] == ImageExtension.EXE:
+        if art.get("kind") == ImageExtension.EXE:
             path = await to_thread(extract_exe_icon, art["path"])
         else:
             path = art["path"]
