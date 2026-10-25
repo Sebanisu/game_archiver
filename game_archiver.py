@@ -1714,17 +1714,18 @@ async def get_steamgriddb_api_key(app) -> str | None:
                 )
             )
 
-            if not key:
+            if not key or not key.value or not key.value.strip():
+                self.notify("API key cannot be empty.", severity="warning")
                 continue
 
             config.setdefault(
                 "steamgriddb",
                 {},
-            )["api_key"] = key.strip()
+            )["api_key"] = key.value.strip()
 
             save_config(config)
 
-            return key.strip()
+            return key.value.strip()
 
 
 def extract_exe_icon(exe: Path) -> Path | None:
@@ -3590,13 +3591,19 @@ class GameArchiver(App):
                                 title="SteamGridDB Search",
                                 prompt="Search for:",
                                 value=query,
+                                allow_local_artwork=True,
                             )
                         )
 
-                        if new_query is None:
+                        if new_query is None or new_query.action == InputDialogAction.CANCEL:
                             return
 
-                        new_query = new_query.strip()
+                        if new_query.action == InputDialogAction.LOCAL:
+                            await self.download_local_artwork(game, client)
+                            return
+
+                        assert new_query.action == InputDialogAction.OK
+                        new_query = new_query.value.strip()
 
                         if not new_query:
                             self.notify("Search query cannot be empty.")
@@ -3621,13 +3628,19 @@ class GameArchiver(App):
                         title="SteamGridDB Search",
                         prompt="Search for:",
                         value=query,
+                        allow_local_artwork=True,
                     )
                 )
 
-                if new_query is None:
+                if new_query is None or new_query.action == InputDialogAction.CANCEL:
                     return
 
-                new_query = new_query.strip()
+                if new_query.action == InputDialogAction.LOCAL:
+                    await self.download_local_artwork(game, client)
+                    return
+
+                assert new_query.action == InputDialogAction.OK
+                new_query = new_query.value.strip()
 
                 if not new_query:
                     self.notify("Search query cannot be empty.")
@@ -4153,7 +4166,18 @@ class OptionDialog(ModalScreen[str | None]):
 # ============================================================
 # Input Dialog
 # ============================================================
-class InputDialog(ModalScreen[str | None]):
+class InputDialogAction(StrEnum):
+    OK = "ok"
+    LOCAL = "local"
+    CANCEL = "cancel"
+
+
+@dataclass
+class InputDialogResult:
+    action: InputDialogAction
+    value: str | None = None
+
+class InputDialog(ModalScreen[InputDialogResult | None]):
     DEFAULT_CSS = """
     InputDialog {
         align: center middle;
@@ -4188,6 +4212,7 @@ class InputDialog(ModalScreen[str | None]):
         value: str = "",
         placeholder: str = "",
         password: bool = False,
+        allow_local_artwork: bool = False,
     ):
         super().__init__()
         self.title = title
@@ -4195,6 +4220,7 @@ class InputDialog(ModalScreen[str | None]):
         self.value = value
         self.placeholder = placeholder
         self.password = password
+        self.allow_local_artwork = allow_local_artwork
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -4208,10 +4234,17 @@ class InputDialog(ModalScreen[str | None]):
             )
 
             with Horizontal(id="buttons"):
-                yield Button("Cancel", id="cancel")
+                yield Button("Cancel", id=InputDialogAction.CANCEL)
+
+                if self.allow_local_artwork:
+                    yield Button(
+                        "Browse Local Artwork",
+                        id=InputDialogAction.LOCAL,
+                    )
+
                 yield Button(
                     "OK",
-                    id="ok",
+                    id=InputDialogAction.OK,
                     variant="primary",
                 )
 
@@ -4222,18 +4255,24 @@ class InputDialog(ModalScreen[str | None]):
         self,
         event: Input.Submitted,
     ):
-        self.dismiss(event.value)
+        self.dismiss(InputDialogResult(action=InputDialogAction.OK, value=event.value))
 
     def on_button_pressed(
         self,
         event: Button.Pressed,
     ):
-        if event.button.id == "ok":
-            self.dismiss(
-                self.query_one(Input).value
-            )
-        else:
-            self.dismiss(None)
+        match event.button.id:
+            case InputDialogAction.OK:
+                self.dismiss(
+                    InputDialogResult(
+                        action=InputDialogAction.OK,
+                        value=self.query_one(Input).value
+                    )
+            )            
+            case InputDialogAction.LOCAL:
+                self.dismiss(InputDialogResult(action=InputDialogAction.LOCAL))
+            case _:
+                self.dismiss(None)
 
     def action_dismiss(self):
         self.dismiss(None)
