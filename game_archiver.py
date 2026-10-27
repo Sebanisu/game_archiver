@@ -981,15 +981,12 @@ def save_steamgriddb_artwork(
 
     # Save all available SteamGridDB results when a match exists.
     # Local selections are persisted separately below.
-    if sgdb_game_id is not None:
-        for artwork_type, artwork_list in artwork_by_type.items():
-            if not artwork_list:
-                continue
+    for artwork_type, artwork_list in artwork_by_type.items():
+        if not artwork_list:
+            continue
 
-            for asset in artwork_list:
-                if asset.get("source") == "local":
-                    continue
-                persist_artwork(artwork_type, asset)
+        for asset in artwork_list:
+            persist_artwork(artwork_type, asset)
 
     # Save the current selection independently of the search results.
     for artwork_type, selected_info in selected.items():
@@ -1010,14 +1007,15 @@ def save_steamgriddb_artwork(
         if not isinstance(asset, dict):
             continue
 
-        asset_type = artwork_type
-        if isinstance(asset_type, str):
+        if not isinstance(artwork_type, ArtworkType):
             try:
-                asset_type = ArtworkType[asset_type]
-            except KeyError:
-                continue
+                artwork_type = ArtworkType(artwork_type)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown artwork type: {artwork_type!r}"
+                ) from exc
 
-        artwork_id = persist_artwork(asset_type, asset)
+        artwork_id = persist_artwork(artwork_type, asset)
         downloaded_path = selected_info.get("downloaded_path")
 
         db.execute(
@@ -1496,6 +1494,28 @@ def debug_log(message: str):
     # with open("/tmp/game_archiver-debug.log", "a") as f:
     #     f.write(f"{message}\n")
     pass
+
+def add_selected_artwork_to_art(
+    game: Game,
+    artwork_type: ArtworkType,
+    asset: dict,
+) -> None:
+    sgdb = game.steamgriddb
+    art = sgdb.setdefault("art", {})
+    artwork_list = art.setdefault(artwork_type, [])
+
+    asset_id = asset.get("id")
+    source = asset.get("source")
+
+    # Avoid adding the same asset more than once.
+    if any(
+        existing.get("id") == asset_id
+        and existing.get("source") == source
+        for existing in artwork_list
+    ):
+        return
+
+    artwork_list.append(asset)
 
 def merge_games(existing, scanned):
     # Existing games by unique key
@@ -3883,6 +3903,7 @@ class GameArchiver(App):
             art,
             local_icons,
         )
+        self.save_game_data()
 
     async def download_steamgriddb_art(
         self,
@@ -4005,6 +4026,7 @@ class GameArchiver(App):
                     selected_info["asset"] = selected
 
                     if selected.get("source") == "local":
+                        add_selected_artwork_to_art(game, art_type, selected)
                         selected_info["downloaded_path"] = selected["path"]
                     else:
                         selected_info["downloaded_path"] = await get_asset_file(
