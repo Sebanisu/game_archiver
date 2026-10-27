@@ -76,7 +76,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 5
+DATABASE_SCHEMA_VERSION = 6
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -343,6 +343,25 @@ def create_database(db: sqlite3.Connection):
         """
     )
 
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_artwork (
+            game_id INTEGER NOT NULL,
+            artwork_id INTEGER NOT NULL,
+
+            PRIMARY KEY (game_id, artwork_id),
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES artwork(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
 
 def get_schema_version(db: sqlite3.Connection) -> int:
     row = db.execute(
@@ -394,6 +413,12 @@ def migrate_database(
         migrate_to_v5(db)
         set_schema_version(db, 5)
         current_version = 5
+
+
+    if current_version < 6:
+        migrate_to_v6(db)
+        set_schema_version(db, 6)
+        current_version = 6
 
     # Future migrations go here
 
@@ -627,6 +652,48 @@ def migrate_to_v5(db: sqlite3.Connection) -> None:
     db.execute("DROP TABLE selected_artwork")
     db.execute("ALTER TABLE selected_artwork_v5 RENAME TO selected_artwork")
 
+def migrate_to_v6(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS game_artwork (
+            game_id INTEGER NOT NULL,
+            artwork_id INTEGER NOT NULL,
+
+            PRIMARY KEY (game_id, artwork_id),
+
+            FOREIGN KEY (game_id)
+                REFERENCES games(id)
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (artwork_id)
+                REFERENCES artwork(id)
+                ON DELETE CASCADE
+        )
+        """
+    )
+
+    db.execute(
+        """
+        INSERT OR IGNORE INTO game_artwork (
+            game_id,
+            artwork_id
+        )
+        SELECT DISTINCT
+            game_id,
+            artwork_id
+        FROM selected_artwork
+
+        UNION
+
+        SELECT DISTINCT
+            sg.game_id,
+            sga.artwork_id
+        FROM steamgriddb_artwork AS sga
+        JOIN steamgriddb_games AS sg
+            ON sg.game_id = sga.sgdb_game_id
+        """
+    )
+
 def save_game(
     db: sqlite3.Connection,
     game: Game,
@@ -840,7 +907,6 @@ def save_steamgriddb_artwork(
             if isinstance(artwork_type, ArtworkType)
             else str(artwork_type)
         )
-
     def persist_artwork(
         artwork_type: ArtworkType,
         asset: dict,
@@ -848,6 +914,16 @@ def save_steamgriddb_artwork(
         source = asset.get("source", "steamgriddb")
         external_id = asset.get("id")
         external_id = str(external_id) if external_id is not None else None
+
+        def associate_with_game(artwork_id: int) -> None:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO game_artwork (game_id, artwork_id)
+                VALUES (?, ?)
+                """,
+                (game_id, artwork_id),
+            )
+
         data = json.dumps(
             asset,
             indent=2,
@@ -865,15 +941,14 @@ def save_steamgriddb_artwork(
             )
 
         # Local artwork does not require a SteamGridDB game ID.
-        if source == "local" or source == "steam":
-            # Identify local artwork by source, type, and external ID.
+        if source in ("local", "steam"):
             row = db.execute(
                 """
                 SELECT id
                 FROM artwork
                 WHERE source = ?
-                  AND type = ?
-                  AND external_id = ?
+                AND type = ?
+                AND external_id = ?
                 ORDER BY id
                 LIMIT 1
                 """,
@@ -896,6 +971,7 @@ def save_steamgriddb_artwork(
                         artwork_id,
                     ),
                 )
+                associate_with_game(artwork_id)
                 return artwork_id
 
             cursor = db.execute(
@@ -915,7 +991,10 @@ def save_steamgriddb_artwork(
                     data,
                 ),
             )
-            return cursor.lastrowid
+            artwork_id = cursor.lastrowid
+            associate_with_game(artwork_id)
+            return artwork_id
+
         # SteamGridDB assets are identified through their association table.
         if sgdb_game_id is None:
             raise ValueError(
@@ -925,6 +1004,7 @@ def save_steamgriddb_artwork(
             raise ValueError(
                 f"Cannot persist {source!r} artwork without an external ID"
             )
+
         row = db.execute(
             """
             SELECT artwork_id
@@ -954,6 +1034,7 @@ def save_steamgriddb_artwork(
                     artwork_id,
                 ),
             )
+            associate_with_game(artwork_id)
             return artwork_id
 
         cursor = db.execute(
@@ -984,6 +1065,8 @@ def save_steamgriddb_artwork(
             """,
             (artwork_id, game_id, external_id),
         )
+
+        associate_with_game(artwork_id)
         return artwork_id
 
     # Save all available SteamGridDB results when a match exists.
@@ -1118,10 +1201,10 @@ def load_steamgriddb_artwork(
         SELECT
             a.type,
             a.data
-        FROM steamgriddb_artwork AS sa
+        FROM game_artwork AS ga
         JOIN artwork AS a
-            ON a.id = sa.artwork_id
-        WHERE sa.sgdb_game_id = ?
+            ON a.id = ga.artwork_id
+        WHERE ga.game_id = ?
         """,
         (game_id,),
     ).fetchall()
@@ -1140,6 +1223,7 @@ def load_steamgriddb_artwork(
         art[artwork_type].append(artwork)
 
     return art, bool(rows)
+
 
 # ============================================================
 # JSON to SQLite
@@ -5427,7 +5511,7 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
 def steamgriddb_search_name(game: Game) -> str:
     name = game.name
     if game.steamgriddb and "search" in game.steamgriddb:
-        name = game.steamgriddb["search"]
+        name = game.steamgriddb.get("search") or game.name
 
     # Strip common suffixes
     name = re.sub(r"\s*-\s*v[\d.]+.*$", "", name, flags=re.I)
