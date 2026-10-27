@@ -3792,7 +3792,10 @@ class GameArchiver(App):
                     prompt_for_search = True
                     continue
                 case SelectionDialogAction.BROWSE:
-                    continue  # show SelectionDialog again as shouldn't happen.                
+                    continue  # show SelectionDialog again as shouldn't happen.               
+                case SelectionDialogAction.LOCAL:
+                    await self.download_local_artwork(game, client)
+                    return             
                 case SelectionDialogAction.SELECT:
                     pass
             
@@ -3903,7 +3906,6 @@ class GameArchiver(App):
             art,
             local_icons,
         )
-        self.save_game_data()
 
     async def download_steamgriddb_art(
         self,
@@ -5059,6 +5061,7 @@ class SelectionDialogAction(StrEnum):
     BROWSE = "browse"
     SELECT = "select"
     CANCEL = "cancel"
+    LOCAL = "local"
 
 class SelectionDialog(
     ModalScreen[tuple[SelectionDialogAction, dict | None]]
@@ -5140,6 +5143,10 @@ class SelectionDialog(
                     id=SelectionDialogAction.BROWSE,
                 )
                 yield Button(
+                    "Browse Local Artwork",
+                    id=SelectionDialogAction.LOCAL,
+                )
+                yield Button(
                     "Cancel",
                     id=SelectionDialogAction.CANCEL,
                 )
@@ -5170,7 +5177,8 @@ class SelectionDialog(
 
             case SelectionDialogAction.SEARCH:
                 self.dismiss((SelectionDialogAction.SEARCH, None))
-
+            case SelectionDialogAction.LOCAL:
+                self.dismiss((SelectionDialogAction.LOCAL, None))
             case SelectionDialogAction.BROWSE | SelectionDialogAction.SELECT:
                 index = self.query_one(ListView).index
 
