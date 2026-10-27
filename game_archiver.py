@@ -686,6 +686,7 @@ def save_game(
 
     save_steam(db, game_id, game)
     save_steamgriddb(db, game_id, game)
+    debug_log(f"DEBUG: saving artwork for {game.name}")
     save_steamgriddb_artwork(db, game_id, game)
 
 def save_steam(
@@ -734,7 +735,12 @@ def save_steam(
             game_id,
             game.steam_key,
             (
-                json.dumps(game.steam_entry)
+                json.dumps(
+                    game.steam_entry,
+                    indent=2,
+                    sort_keys=True,
+                    default=json_default,
+                )
                 if game.steam_entry is not None
                 else None
             ),
@@ -786,12 +792,22 @@ def save_steamgriddb(
             sgdb_game.get("name") if sgdb_game else None,
             sgdb.get("search"),
             (
-                json.dumps(sgdb_game)
+                json.dumps(
+                    sgdb_game,
+                    indent=2,
+                    sort_keys=True,
+                    default=json_default,
+                )
                 if sgdb_game is not None
                 else None
             ),
             (
-                json.dumps(sgdb.get("steam_platform_data"))
+                json.dumps(
+                    sgdb.get("steam_platform_data"),
+                    indent=2,
+                    sort_keys=True,
+                    default=json_default,
+                )
                 if sgdb.get("steam_platform_data") is not None
                 else None
             ),
@@ -805,154 +821,225 @@ def save_steamgriddb_artwork(
     game: Game,
 ):
     sgdb = game.steamgriddb
-
     artwork_by_type = sgdb.get("art", {})
-
+    selected = sgdb.get("selected", {})
+    debug_log(f"DEBUG selected artwork for {game.name}: {selected!r}")
     sgdb_game = sgdb.get("game") or {}
     sgdb_game_id = sgdb_game.get("id")
 
-    if sgdb_game_id is None:
-        return
+    def type_name(artwork_type: ArtworkType | str) -> str:
+        return (
+            artwork_type.name
+            if isinstance(artwork_type, ArtworkType)
+            else str(artwork_type)
+        )
 
-    selected = sgdb.get("selected", {})
+    def persist_artwork(
+        artwork_type: ArtworkType,
+        asset: dict,
+    ) -> int:
+        source = asset.get("source", "steamgriddb")
+        external_id = asset.get("id")
+        external_id = str(external_id) if external_id is not None else None
+        data = json.dumps(
+            asset,
+            indent=2,
+            sort_keys=True,
+            default=json_default,
+        )
 
-    for artwork_type, artwork_list in artwork_by_type.items():
-        if not artwork_list:
-            continue
+        author = asset.get("author")
+        if author is not None:
+            author = json.dumps(
+                author,
+                indent=2,
+                sort_keys=True,
+                default=json_default,
+            )
 
-        for artwork in artwork_list:
-            source = artwork.get("source", "steamgriddb")
-
-            external_id = artwork.get("id")
-
-            if external_id is None:
-                continue
-
-            data = json.dumps(artwork)
-
-            author = artwork.get("author")
-
-            if author is not None:
-                author = json.dumps(author)
-
+        # Local artwork does not require a SteamGridDB game ID.
+        if source == "local" or source == "steam":
+            # Identify local artwork by source, type, and external ID.
             row = db.execute(
                 """
-                SELECT artwork_id
-                FROM steamgriddb_artwork
-                WHERE sgdb_game_id = ?
-                  AND sgdb_art_id = ?
+                SELECT id
+                FROM artwork
+                WHERE source = ?
+                  AND type = ?
+                  AND external_id = ?
+                ORDER BY id
+                LIMIT 1
                 """,
-                (
-                    game_id,
-                    str(external_id),
-                ),
+                (source, artwork_type.name, external_id),
             ).fetchone()
 
-            if row is None:
-                cursor = db.execute(
-                    """
-                    INSERT INTO artwork (
-                        type,
-                        source,
-                        external_id,
-                        url,
-                        thumb_url,
-                        author,
-                        data
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        artwork_type.name,
-                        source,
-                        str(external_id),
-                        artwork.get("url"),
-                        artwork.get("thumb"),
-                        author,
-                        data,
-                    ),
-                )
-
-                artwork_id = cursor.lastrowid
-
-                db.execute(
-                    """
-                    INSERT INTO steamgriddb_artwork (
-                        artwork_id,
-                        sgdb_game_id,
-                        sgdb_art_id
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        artwork_id,
-                        game_id,
-                        str(external_id),
-                    ),
-                )
-
-            else:
-                artwork_id = row["artwork_id"]
-
+            if row is not None:
+                artwork_id = row["id"]
                 db.execute(
                     """
                     UPDATE artwork
-                    SET
-                        type = ?,
-                        source = ?,
-                        external_id = ?,
-                        url = ?,
-                        thumb_url = ?,
-                        author = ?,
-                        data = ?
+                    SET url = ?, thumb_url = ?, author = ?, data = ?
                     WHERE id = ?
                     """,
                     (
-                        artwork_type.name,
-                        source,
-                        str(external_id),
-                        artwork.get("url"),
-                        artwork.get("thumb"),
+                        asset.get("url"),
+                        asset.get("thumb"),
                         author,
                         data,
                         artwork_id,
                     ),
                 )
+                return artwork_id
 
-            selected_info = selected.get(artwork_type)
-
-            if (
-                selected_info is not None
-                and selected_info.get("asset", {}).get("id")
-                == external_id
-            ):
-                downloaded_path = selected_info.get(
-                    "downloaded_path"
+            cursor = db.execute(
+                """
+                INSERT INTO artwork (
+                    type, source, external_id, url, thumb_url, author, data
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artwork_type.name,
+                    source,
+                    external_id,
+                    asset.get("url"),
+                    asset.get("thumb"),
+                    author,
+                    data,
+                ),
+            )
+            return cursor.lastrowid
+        # SteamGridDB assets are identified through their association table.
+        if sgdb_game_id is None:
+            raise ValueError(
+                f"Cannot persist {source!r} artwork without a SteamGridDB game ID"
+            )
+        if external_id is None:
+            raise ValueError(
+                f"Cannot persist {source!r} artwork without an external ID"
+            )
+        row = db.execute(
+            """
+            SELECT artwork_id
+            FROM steamgriddb_artwork
+            WHERE sgdb_game_id = ? AND sgdb_art_id = ?
+            """,
+            (game_id, external_id),
+        ).fetchone()
 
-                db.execute(
-                    """
-                    INSERT INTO selected_artwork (
-                        game_id,
-                        artwork_type,
-                        artwork_id,
-                        downloaded_path
-                    )
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(game_id, artwork_type)
-                    DO UPDATE SET
-                        artwork_id = excluded.artwork_id,
-                        downloaded_path = excluded.downloaded_path
-                    """,
-                    (
-                        game_id,
-                        artwork_type.name,
-                        artwork_id,
-                        str(downloaded_path)
-                        if downloaded_path is not None
-                        else None,
-                    ),
-                )
+        if row is not None:
+            artwork_id = row["artwork_id"]
+            db.execute(
+                """
+                UPDATE artwork
+                SET type = ?, source = ?, external_id = ?, url = ?,
+                    thumb_url = ?, author = ?, data = ?
+                WHERE id = ?
+                """,
+                (
+                    artwork_type.name,
+                    source,
+                    external_id,
+                    asset.get("url"),
+                    asset.get("thumb"),
+                    author,
+                    data,
+                    artwork_id,
+                ),
+            )
+            return artwork_id
+
+        cursor = db.execute(
+            """
+            INSERT INTO artwork (
+                type, source, external_id, url, thumb_url, author, data
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artwork_type.name,
+                source,
+                external_id,
+                asset.get("url"),
+                asset.get("thumb"),
+                author,
+                data,
+            ),
+        )
+        artwork_id = cursor.lastrowid
+
+        db.execute(
+            """
+            INSERT INTO steamgriddb_artwork (
+                artwork_id, sgdb_game_id, sgdb_art_id
+            )
+            VALUES (?, ?, ?)
+            """,
+            (artwork_id, game_id, external_id),
+        )
+        return artwork_id
+
+    # Save all available SteamGridDB results when a match exists.
+    # Local selections are persisted separately below.
+    if sgdb_game_id is not None:
+        for artwork_type, artwork_list in artwork_by_type.items():
+            if not artwork_list:
+                continue
+
+            for asset in artwork_list:
+                if asset.get("source") == "local":
+                    continue
+                persist_artwork(artwork_type, asset)
+
+    # Save the current selection independently of the search results.
+    for artwork_type, selected_info in selected.items():
+        artwork_type_name = type_name(artwork_type)
+
+        # A None value means this type currently has no selection.
+        if selected_info is None:
+            db.execute(
+                """
+                DELETE FROM selected_artwork
+                WHERE game_id = ? AND artwork_type = ?
+                """,
+                (game_id, artwork_type_name),
+            )
+            continue
+
+        asset = selected_info.get("asset")
+        if not isinstance(asset, dict):
+            continue
+
+        asset_type = artwork_type
+        if isinstance(asset_type, str):
+            try:
+                asset_type = ArtworkType[asset_type]
+            except KeyError:
+                continue
+
+        artwork_id = persist_artwork(asset_type, asset)
+        downloaded_path = selected_info.get("downloaded_path")
+
+        db.execute(
+            """
+            INSERT INTO selected_artwork (
+                game_id, artwork_type, artwork_id, downloaded_path
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(game_id, artwork_type)
+            DO UPDATE SET
+                artwork_id = excluded.artwork_id,
+                downloaded_path = excluded.downloaded_path
+            """,
+            (
+                game_id,
+                artwork_type_name,
+                artwork_id,
+                str(downloaded_path)
+                if downloaded_path is not None
+                else None,
+            ),
+        )
 
 def load_selected_artwork(
     db: sqlite3.Connection,
@@ -991,6 +1078,11 @@ def load_selected_artwork(
             artwork = json.loads(row["data"])
         except json.JSONDecodeError:
             continue
+
+        # Restore local asset paths after JSON deserialization.
+        if artwork.get("source") == "local":
+            if artwork.get("path") is not None:
+                artwork["path"] = Path(artwork["path"])
 
         downloaded_path = row["downloaded_path"]
         if downloaded_path is not None:
@@ -1165,7 +1257,12 @@ def migrate_steam(
         (
             game_id,
             game_data.get("steam_key"),
-            json.dumps(game_data.get("steam_entry"))
+            json.dumps(
+                game_data.get("steam_entry"),
+                indent=2,
+                sort_keys=True,
+                default=json_default,
+            )
                 if game_data.get("steam_entry") is not None
                 else None,
             int(game_data.get("in_steam", False)),
@@ -1211,14 +1308,13 @@ def migrate_steamgriddb(
             game.get("id") if game else None,
             game.get("name") if game else None,
             sgdb.get("search"),
-            json.dumps(game) if game is not None else None,
-            json.dumps(sgdb.get("steam_platform_data"))
+            json.dumps(game, indent=2, sort_keys=True, default=json_default) if game is not None else None,
+            json.dumps(sgdb.get("steam_platform_data"), indent=2, sort_keys=True, default=json_default)
                 if sgdb.get("steam_platform_data") is not None
                 else None,
             sgdb.get("cached"),
         ),
     )
-
 
 # ============================================================
 # MODEL
@@ -1395,6 +1491,12 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+def debug_log(message: str):
+    # with open("/tmp/game_archiver-debug.log", "a") as f:
+    #     f.write(f"{message}\n")
+    pass
+
 def merge_games(existing, scanned):
     # Existing games by unique key
     existing_map = {g.path: g for g in existing}
@@ -2620,11 +2722,20 @@ class GameArchiver(App):
                     game.steam_broken = bool(row["steam_broken"])
                     game.duplicate_steam = bool(row["duplicate_steam"])
 
-                    if (
+                    game_id = row["id"]
+                    selected = load_selected_artwork(db, game_id)
+
+                    has_sgdb_data = (
                         row["sgdb_id"] is not None
                         or row["sgdb_search"] is not None
                         or row["game_data"] is not None
-                    ):
+                    )
+                    has_selected_artwork = any(
+                        artwork is not None
+                        for artwork in selected.values()
+                    )
+
+                    if has_sgdb_data or has_selected_artwork:
                         game.steamgriddb = {
                             "search": row["sgdb_search"],
                             "game": (
@@ -2639,21 +2750,14 @@ class GameArchiver(App):
                             ),
                             "cached": row["cached"],
                             "art": {},
-                            "selected": {},
+                            "selected": selected,
                         }
-                        game_id = row["id"]
 
                         (
                             game.steamgriddb["art"],
                             game.steamgriddb["artwork_cached"],
-                        ) = load_steamgriddb_artwork(
-                            db,
-                            game_id,
-                        )
-                        game.steamgriddb["selected"] = load_selected_artwork(
-                            db,
-                            game_id,
-                        )
+                        ) = load_steamgriddb_artwork(db, game_id)
+
                     games.append(game)
 
                 shared_games = []
@@ -2679,6 +2783,7 @@ class GameArchiver(App):
             return [], []
 
     def save_game_data(self):
+        debug_log("DEBUG: save_game_data called")
         try:
             with get_db() as db:
                 for game in self.shared_games:
@@ -2689,11 +2794,12 @@ class GameArchiver(App):
 
                 db.commit()
 
-        except Exception as e:
+        except Exception as e:              
             self.notify(
                 f"Error saving game data: "
                 f"{type(e).__name__}: {e}"
             )
+            raise
 
     async def sync_shortcut(self, game: Game) -> bool:
         # Don't touch duplicate shortcuts.
@@ -3816,6 +3922,7 @@ class GameArchiver(App):
                         if isinstance(info, dict)
                         and info.get("asset") is not None
                     },
+                    selected_artwork=game.steamgriddb.get("selected"),
                 )
             )
 
@@ -4386,9 +4493,11 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
         art: dict,
         local_icons: list[IconCandidate],
         selected_types: set[ArtworkType] | None = None,
+        selected_artwork: dict | None = None,
     ):
         super().__init__()
         self.selected_types = selected_types or set()
+        self.selected_artwork = selected_artwork or {}
         self.art = {
             ArtworkType.GRID_PORTRAIT: [],
             ArtworkType.GRID_LANDSCAPE: [],
@@ -4423,8 +4532,33 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
             with Grid(id="art-grid"):
                 for art_type, label in categories:
                     count = len(self.art[art_type])
+
                     if art_type == ArtworkType.ICON:
                         count += len(self.local_icons)
+
+                    selected_info = self.selected_artwork.get(art_type)
+                    selected_asset = (
+                        selected_info.get("asset")
+                        if isinstance(selected_info, dict)
+                        else None
+                    )
+
+                    if selected_asset and selected_asset.get("source") == "local":
+                        selected_id = str(selected_asset.get("id"))
+
+                        existing_ids = {
+                            str(item.get("id"))
+                            for item in self.art[art_type]
+                        }
+
+                        if art_type == ArtworkType.ICON:
+                            existing_ids.update(
+                                icon.path.name
+                                for icon in self.local_icons
+                            )
+
+                        if selected_id not in existing_ids:
+                            count += 1
 
                     selected = "✓ " if art_type in self.selected_types else ""
 
@@ -4712,6 +4846,18 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         self.artwork = copy.deepcopy(artwork)
         self.client = client
         self.selected_artwork = selected_artwork
+
+        if (
+            selected_artwork
+            and selected_artwork.get("source") == "local"
+        ):
+            selected_id = str(selected_artwork.get("id"))
+
+            if not any(
+                str(item.get("id")) == selected_id
+                for item in self.artwork
+            ):
+                self.artwork.append(copy.deepcopy(selected_artwork))
 
         if local_icons:
             for icon in local_icons:
@@ -5111,8 +5257,6 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
         )
 
     def on_mount(self) -> None:
-
-        
         if self.game.steamgriddb:
             self.game_info_json = json.dumps(
                 self.game.steamgriddb,
