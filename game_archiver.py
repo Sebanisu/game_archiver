@@ -118,6 +118,13 @@ class ImageExtension(StrEnum):
     WEBP = ".webp"
     ICO = ".ico"
     EXE = ".exe"
+ARTWORK_EXTENSIONS = (
+    ImageExtension.PNG,
+    ImageExtension.JPG,
+    ImageExtension.JPEG,
+    ImageExtension.WEBP,
+    ImageExtension.ICO,
+)
 ICON_FALLBACK = Path(
     "/usr/share/icons/hicolor/256x256/apps/steam" + ImageExtension.PNG
 )
@@ -1494,6 +1501,7 @@ def debug_log(message: str):
     # with open("/tmp/game_archiver-debug.log", "a") as f:
     #     f.write(f"{message}\n")
     pass
+
 
 def add_selected_artwork_to_art(
     game: Game,
@@ -3985,17 +3993,38 @@ class GameArchiver(App):
                     case ArtworkType.CANCEL:
                         return
                     case ArtworkType.GRID_PORTRAIT:
-                        artwork = art[ArtworkType.GRID_PORTRAIT]
+                        artwork = art[ArtworkType.GRID_PORTRAIT].copy()
                     case ArtworkType.GRID_SQUARE:
-                        artwork = art[ArtworkType.GRID_SQUARE]
+                        artwork = art[ArtworkType.GRID_SQUARE].copy()
                     case ArtworkType.GRID_LANDSCAPE:
-                        artwork = art[ArtworkType.GRID_LANDSCAPE]
+                        artwork = art[ArtworkType.GRID_LANDSCAPE].copy()
                     case ArtworkType.HERO:
-                        artwork = art[ArtworkType.HERO]
+                        artwork = art[ArtworkType.HERO].copy()
                     case ArtworkType.LOGO:
-                        artwork = art[ArtworkType.LOGO]
+                        artwork = art[ArtworkType.LOGO].copy()
                     case ArtworkType.ICON:
-                        artwork = art[ArtworkType.ICON]
+                        artwork = art[ArtworkType.ICON].copy()
+            selected_artwork = (game.steamgriddb.get("selected") or {}).get(art_type) or {}
+            if selected_artwork.get("asset") is None:
+                installed_paths = self.find_installed_artwork(game, art_type)
+                appended = False
+                for path in installed_paths:
+                    installed_asset = self.register_installed_artwork(
+                        game,
+                        art_type,
+                        path,
+                    )
+
+                    if not any(
+                        item.get("id") == installed_asset["id"]
+                        and item.get("source") == installed_asset["source"]
+                        for item in artwork
+                    ):
+                        artwork.append(installed_asset)
+                        appended = True
+
+                if installed_paths and appended:
+                    self.save_game_data()
 
             action, selected = await self.push_screen_wait(
                 ArtworkSelectionDialog(
@@ -4005,10 +4034,7 @@ class GameArchiver(App):
                     local_icons=(
                         local_icons if art_type == ArtworkType.ICON else None
                     ),
-                    selected_artwork=(
-                        (game.steamgriddb.get("selected") or {}).get(art_type)
-                        or {}
-                    ).get("asset"),
+                    selected_artwork=selected_artwork.get("asset"),
                 )
             )
 
@@ -4045,6 +4071,82 @@ class GameArchiver(App):
                             selected_info["downloaded_path"],
                         )
 
+    def find_installed_artwork(
+        self,
+        game: Game,
+        art_type: ArtworkType,
+    ) -> list[Path]:
+        installed: list[Path] = []
+
+        for extension in ARTWORK_EXTENSIONS:
+            path = self.get_steam_artwork_path(
+                game,
+                art_type,
+                extension,
+            )
+
+            if path is not None and path.is_file():
+                installed.append(path)
+
+        return installed
+
+    def register_installed_artwork(
+        self,
+        game: Game,
+        art_type: ArtworkType,
+        path: Path,
+    ) -> dict:
+        asset = {
+            "id": str(path),
+            "path": path,
+            "url": path.as_uri(),
+            "name": path.name,
+            "source": "local",
+            "style": "Installed in Steam",
+            "kind": path.suffix.lower(),
+        }
+
+        # Add to the general artwork collection if it isn't already there.
+        add_selected_artwork_to_art(game, art_type, asset)
+
+        # Create a selected entry only if one doesn't already exist.
+        selected = game.steamgriddb.setdefault(
+            "selected",
+            {},
+        ).setdefault(art_type, {})
+
+        if selected.get("asset") is None:
+            selected["asset"] = asset
+            selected["downloaded_path"] = path # is kinda redundant but it's expected by the code that uses it.
+
+        return asset
+
+    def get_steam_artwork_path(
+        self,
+        game: Game,
+        art_type: ArtworkType,
+        extension: str,
+        appid: str | int | None = None,
+    ) -> Path | None:
+        appid = appid if appid is not None else game_appid(game)
+        extension = extension.lower()
+
+        if not extension.startswith("."):
+            extension = f".{extension}"
+
+        if art_type == ArtworkType.ICON:
+            return STEAM_ICON_DIR / f"{appid}{extension}"
+
+        suffix = suffixes[art_type]
+        if suffix is None:
+            return None
+
+        user = self.current_steam_user()
+        if user is None:
+            return None
+
+        return steam_grid_dir(user) / f"{appid}{suffix}{extension}"
+
 
     async def install_artwork(
         self,
@@ -4052,38 +4154,31 @@ class GameArchiver(App):
         art_type: ArtworkType,
         image: Path,
     ) -> bool:
-        appid = game_appid(game)
-        suffix = suffixes[art_type]
-        if art_type == ArtworkType.ICON:
-            dest_dir = STEAM_ICON_DIR
-            dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.get_steam_artwork_path(
+            game,
+            art_type,
+            image.suffix,
+        )
 
-            dest = dest_dir / f"{appid}{image.suffix.lower()}"
+        if dest is None:
+            return False
 
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if image.resolve() != dest.resolve():
             await to_thread(shutil.copy2, image, dest)
 
+        if art_type == ArtworkType.ICON:
             game.icon = dest
             game.icon_manual = True
             self.save_game_data()
+
             if not steam_running():
                 await self.sync_shortcut(game)
             else:
                 self.notify(
                     "Icon saved. Close Steam and sync shortcuts to apply it."
                 )
-            return True
-        if suffix is None:
-            return False
-        user = self.current_steam_user()
 
-        if user is None:
-            return False
-        grid_dir = steam_grid_dir(user)
-        grid_dir.mkdir(parents=True, exist_ok=True)
-
-        dest = grid_dir / f"{appid}{suffix}{image.suffix.lower()}"
-
-        await to_thread(shutil.copy2, image, dest)
         return True
 
     async def rename_artwork(
@@ -4093,61 +4188,55 @@ class GameArchiver(App):
     ) -> bool:
         new_appid = game_appid(game)
 
-        if old_appid == new_appid:
+        if old_appid == str(new_appid):
             return False
-
-        user = self.current_steam_user()
-        if user is None:
-            return False
-
-        grid_dir = steam_grid_dir(user)
-        grid_dir.mkdir(parents=True, exist_ok=True)
 
         changed = False
+        icon_changed = False
 
-        for suffix in suffixes.values():
-            if suffix is None:
+        for art_type in ArtworkType:
+            if art_type == ArtworkType.CANCEL:
                 continue
 
-            for ext in ImageExtension:
-                if ext == ImageExtension.EXE:
+            if art_type == ArtworkType.ICON and not game.icon_manual:
+                continue
+
+            for ext in ARTWORK_EXTENSIONS:
+                old = self.get_steam_artwork_path(
+                    game,
+                    art_type,
+                    ext,
+                    appid=old_appid,
+                )
+                new = self.get_steam_artwork_path(
+                    game,
+                    art_type,
+                    ext,
+                )
+
+                if old is None or new is None or not old.is_file():
                     continue
-                old = grid_dir / f"{old_appid}{suffix}{ext}"
 
-                if not old.exists():
-                    continue
-
-                new = grid_dir / f"{new_appid}{suffix}{ext}"
-
+                new.parent.mkdir(parents=True, exist_ok=True)
                 await to_thread(old.replace, new)
                 changed = True
-        if game.icon_manual:
-            for ext in ImageExtension:
-                if ext == ImageExtension.EXE:
-                    continue
 
-                old = STEAM_ICON_DIR / f"{old_appid}{ext}"
+                if art_type == ArtworkType.ICON:
+                    game.icon = new
+                    icon_changed = True
 
-                if not old.exists():
-                    continue
-
-                new = STEAM_ICON_DIR / f"{new_appid}{ext}"
-
-                await to_thread(old.replace, new)
-
-                game.icon = new
-                changed = True
-
-                if not steam_running():
-                    await self.sync_shortcut(game)
-                else:
-                    self.notify(
-                        "Icon saved. Close Steam and sync shortcuts to apply it."
-                    )
-                break
+        if icon_changed:
             self.save_game_data()
+
+            if not steam_running():
+                await self.sync_shortcut(game)
+            else:
+                self.notify(
+                    "Icon saved. Close Steam and sync shortcuts to apply it."
+                )
+
         return changed
-    
+
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
