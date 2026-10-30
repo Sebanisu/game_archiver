@@ -116,6 +116,7 @@ class ImageExtension(StrEnum):
     JPG = ".jpg"
     JPEG = ".jpeg"
     WEBP = ".webp"
+    APNG = ".apng"
     ICO = ".ico"
     EXE = ".exe"
 ARTWORK_EXTENSIONS = (
@@ -123,8 +124,18 @@ ARTWORK_EXTENSIONS = (
     ImageExtension.JPG,
     ImageExtension.JPEG,
     ImageExtension.WEBP,
+    ImageExtension.APNG,
     ImageExtension.ICO,
 )
+RENAME_TO_IMAGE_EXTENSIONS = {
+    ImageExtension.APNG: ImageExtension.PNG,
+    ImageExtension.WEBP: ImageExtension.PNG,
+}
+def correct_image_extension(path: Path) -> Path:
+    ext = path.suffix.lower()
+    if ext in RENAME_TO_IMAGE_EXTENSIONS:
+        return path.with_suffix(RENAME_TO_IMAGE_EXTENSIONS[ext])
+    return path
 ICON_FALLBACK = Path(
     "/usr/share/icons/hicolor/256x256/apps/steam" + ImageExtension.PNG
 )
@@ -4194,10 +4205,12 @@ class GameArchiver(App):
         add_selected_artwork_to_art(game, art_type, asset)
 
         # Create a selected entry only if one doesn't already exist.
-        selected = game.steamgriddb.setdefault(
-            "selected",
-            {},
-        ).setdefault(art_type, {})
+        selected_artwork = game.steamgriddb.setdefault("selected", {})
+        selected = selected_artwork.get(art_type)
+
+        if not isinstance(selected, dict):
+            selected = {}
+            selected_artwork[art_type] = selected
 
         if selected.get("asset") is None:
             selected["asset"] = asset
@@ -4238,11 +4251,11 @@ class GameArchiver(App):
         art_type: ArtworkType,
         image: Path,
     ) -> bool:
-        dest = self.get_steam_artwork_path(
+        dest = correct_image_extension(self.get_steam_artwork_path(
             game,
             art_type,
             image.suffix,
-        )
+        ))
 
         if dest is None:
             return False
@@ -4250,6 +4263,14 @@ class GameArchiver(App):
         dest.parent.mkdir(parents=True, exist_ok=True)
         if image.resolve() != dest.resolve():
             await to_thread(shutil.copy2, image, dest)
+        
+        # Remove artwork of the same type that uses another extension.
+        # Keep the newly installed destination.
+        for old_path in self.find_installed_artwork(game, art_type):
+            if old_path.resolve() == dest.resolve():
+                continue
+
+            old_path.unlink(missing_ok=True)
 
         if art_type == ArtworkType.ICON:
             game.icon = dest
@@ -4286,17 +4307,17 @@ class GameArchiver(App):
                 continue
 
             for ext in ARTWORK_EXTENSIONS:
-                old = self.get_steam_artwork_path(
+                old = correct_image_extension(self.get_steam_artwork_path(
                     game,
                     art_type,
                     ext,
                     appid=old_appid,
-                )
-                new = self.get_steam_artwork_path(
+                ))
+                new = correct_image_extension(self.get_steam_artwork_path(
                     game,
                     art_type,
                     ext,
-                )
+                ))
 
                 if old is None or new is None or not old.is_file():
                     continue
