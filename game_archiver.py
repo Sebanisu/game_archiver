@@ -2607,57 +2607,42 @@ class GameRow(ListItem):
 
     def __init__(self, game: Game):
         self.game = game
-        self.label = Static()
 
-        super().__init__(self.label)
+        self.icon = AutoImage()
+        self.icon.styles.width = 2
+        self.icon.styles.height = 1
+        self.icon.styles.max_width = 2
+        self.icon.styles.max_height = 1
+        self.icon.styles.flex_shrink = 0
+
+        self.label = Static()
+        self.label.styles.width = "1fr"
+
+        row = Horizontal(self.icon, self.label)
+        row.styles.height = 1
+        row.styles.max_height = 1
+
+        super().__init__(row)
 
         self.refresh_row()
 
-    def build_line(self) -> str:
+    def refresh_icon(self):
+        """Update the row icon from the game's configured icon path."""
+        icon_path = self.game.icon
 
-        mark = "[*]" if self.game.selected else "[ ]"
+        if icon_path:
+            icon_path = Path(icon_path)
 
-        date = time.strftime(
-            "%Y-%m-%d",
-            time.localtime(self.game.mtime)
-        )
+            if (
+                icon_path.suffix.lower() != ImageExtension.EXE
+                and icon_path.is_file()
+            ):
+                self.icon.image = icon_path
+                return
 
-        size = fmt_size(self.game.size)
+        self.icon.image = None
 
-        if self.game.duplicate_steam:
-            steam = "D"
-        elif self.game.steam_broken:
-            steam = "!"
-        elif self.game.in_steam:
-            steam = "S"
-        else:
-            steam = " "
-
-        if self.game.steamgriddb:
-            sgdb_game = self.game.steamgriddb.get("game")
-
-            if isinstance(sgdb_game, dict) and sgdb_game.get("id"):
-                sgdb = "G"
-            elif self.game.steamgriddb.get("id"):
-                sgdb = "g"
-            else:
-                sgdb = " "
-        else:
-            sgdb = " "
-
-        return (
-            f"{mark} "
-            f"{self.game.name:<45.45} "
-            f"{size:>9} "
-            f"{date} "
-            f"{steam} "
-            f"{sgdb} "
-        )
-
-    def refresh_row(self):
-        self.label.update(
-            self.build_line()
-        )
+    def refresh_tooltip(self):
         parts = [
             f"Launcher: {self.game.launcher}" if self.game.launcher else None,
             "Steam: Duplicate shortcut exists" if self.game.duplicate_steam else None,
@@ -2702,6 +2687,56 @@ class GameRow(ListItem):
 
         self.tooltip = "\n".join(part for part in parts if part)
 
+    def build_line(self) -> str:
+
+        #mark = "[*]" if self.game.selected else "[ ]"
+        mark = "[🗸]" if self.game.selected else "[ ]"
+
+        date = time.strftime(
+            "%Y-%m-%d",
+            time.localtime(self.game.mtime)
+        )
+
+        size = fmt_size(self.game.size)
+
+        if self.game.duplicate_steam:
+            steam = "D"
+        elif self.game.steam_broken:
+            steam = "!"
+        elif self.game.in_steam:
+            steam = "S"
+        else:
+            steam = " "
+
+        if self.game.steamgriddb:
+            sgdb_game = self.game.steamgriddb.get("game")
+
+            if isinstance(sgdb_game, dict) and sgdb_game.get("id"):
+                sgdb = "G"
+            elif self.game.steamgriddb.get("id"):
+                sgdb = "g"
+            else:
+                sgdb = " "
+        else:
+            sgdb = " "
+
+        return (
+            f"{mark} "
+            f"{self.game.name:<45.45} "
+            f"{size:>9} "
+            f"{date} "
+            f"{steam} "
+            f"{sgdb} "
+        )
+
+    def refresh_row(self):
+        self.refresh_icon()
+
+        self.label.update(
+            self.build_line()
+        )
+
+        self.refresh_tooltip()
 
 # ============================================================
 # APP
