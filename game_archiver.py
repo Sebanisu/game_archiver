@@ -4284,8 +4284,9 @@ class GameArchiver(App):
         self,
         game: Game,
         art_type: ArtworkType,
-        image: Path,
+        image: Path | str,
     ) -> bool:
+        image = Path(image)
         dest = correct_image_extension(self.get_steam_artwork_path(
             game,
             art_type,
@@ -4311,6 +4312,8 @@ class GameArchiver(App):
             game.icon = dest
             game.icon_manual = True
             self.save_game_data()
+
+            self.refresh_game_row(game)
 
             if not steam_running():
                 await self.sync_shortcut(game)
@@ -4917,9 +4920,9 @@ class ArtworkPreview(Container):
 
     async def show_local_art(self, art: dict):
         if art.get("kind") == ImageExtension.EXE:
-            path = await to_thread(extract_exe_icon, art["path"])
+            path = await to_thread(extract_exe_icon, Path(art["path"]))
         else:
-            path = art["path"]
+            path = Path(art["path"])
 
         await self.remove_children()
 
