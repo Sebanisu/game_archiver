@@ -20,6 +20,7 @@ import copy
 import stat
 import datetime
 import sqlite3
+import asyncio
 import vdf
 from enum import Enum, auto, StrEnum
 from urllib.parse import quote
@@ -2626,21 +2627,24 @@ class GameRow(ListItem):
 
         self.refresh_row()
 
-    def refresh_icon(self):
+    async def refresh_icon(self):
         """Update the row icon from the game's configured icon path."""
         icon_path = self.game.icon
 
-        if icon_path:
-            icon_path = Path(icon_path)
+        if not icon_path:
+            self.icon.image = None
+            return
 
-            if (
-                icon_path.suffix.lower() != ImageExtension.EXE
-                and icon_path.is_file()
-            ):
-                self.icon.image = icon_path
-                return
+        icon_path = Path(icon_path)
 
-        self.icon.image = None
+        if not icon_path.is_file():
+            self.icon.image = None
+            return
+
+        if icon_path.suffix.lower() == ImageExtension.EXE:
+            icon_path = await to_thread(extract_exe_icon, icon_path)
+
+        self.icon.image = icon_path if icon_path else None
 
     def refresh_tooltip(self):
         parts = [
@@ -2730,7 +2734,7 @@ class GameRow(ListItem):
         )
 
     def refresh_row(self):
-        self.refresh_icon()
+        asyncio.create_task(self.refresh_icon())
 
         self.label.update(
             self.build_line()
