@@ -2648,7 +2648,7 @@ class GameRow(ListItem):
         return (
             f"{mark} "
             f"{self.game.name:<45.45} "
-            f"{size:>8} "
+            f"{size:>9} "
             f"{date} "
             f"{steam} "
             f"{sgdb} "
