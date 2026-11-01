@@ -1894,6 +1894,60 @@ def save_config(config: dict):
         tomli_w.dump(config, f)
 
 
+async def get_vndb_api_token(app) -> str | None:
+    config = load_config()
+    key = config.get("vndb", {}).get("api_token", "").strip()
+
+    if key:
+        return key
+
+    while True:
+        choice = await app.push_screen_wait(
+            OptionDialog(
+                title="VNDB",
+                message=(
+                    "A VNDB API token is required.\n\n"
+                    "Open the API token page?"
+                ),
+                options=[
+                    ("Open", "open"),
+                    ("Paste Token", "paste"),
+                    ("Cancel", "cancel"),
+                ],
+            )
+        )
+
+        if choice == "cancel":
+            return None
+
+        if choice == "open":
+            webbrowser.open("https://vndb.org/u/tokens")
+            continue
+
+        if choice == "paste":
+            result = await app.push_screen_wait(
+                InputDialog(
+                    title="VNDB API Token",
+                    prompt="Paste your API token:",
+                    placeholder="Paste API token...",
+                    password=False,
+                )
+            )
+
+            key = result.value.strip() if result and result.value else ""
+
+            if not key:
+                app.notify(
+                    "API token cannot be empty.",
+                    severity="warning",
+                )
+                continue
+
+            config.setdefault("vndb", {})["api_token"] = key
+            save_config(config)
+
+            return key
+
 async def get_steamgriddb_api_key(app) -> str | None:
     config = load_config()
 
@@ -3184,7 +3238,6 @@ class GameArchiver(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-
         with Horizontal(id="panes"):
             self.shared_view = ListView(id="shared")
             yield self.shared_view
@@ -3195,6 +3248,7 @@ class GameArchiver(App):
         yield Static(id="status")
 
         yield Footer()
+
         
     def refresh_game_row(self, game: Game):
         for row in self.shared_view.children:
