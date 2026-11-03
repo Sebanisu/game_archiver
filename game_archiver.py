@@ -53,6 +53,7 @@ from textual.screen import ModalScreen
 from rich.markup import escape
 from textual.widgets import (
     Button,
+    Checkbox,
     Footer,
     Header,
     Input,
@@ -1429,6 +1430,9 @@ class LaunchInfo:
 
 def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
     def wrap_gamescope(cmd: list[str]) -> list[str]:
+        if not game.gamescope_enabled:
+            return cmd
+
         if for_steam:
             return cmd
 
@@ -1586,6 +1590,7 @@ class Game:
     steam_broken: bool = False
     duplicate_steam: bool = False
     steamgriddb: dict = field(default_factory=dict)
+    gamescope_enabled: bool = True
 
 
 
@@ -2441,9 +2446,9 @@ def launch_path(game: Game) -> Path:
 
     return game.path
 
-def find_launcher(path: Path) -> Path | None:
+def find_launchers(path: Path) -> list[Path]:
     if not path.is_dir():
-        return None
+        return []
 
     launchers: list[Path] = []
 
@@ -2469,12 +2474,20 @@ def find_launcher(path: Path) -> Path | None:
                     launchers.append(child)
 
     if not launchers:
-        return None
+        return []
 
-    return min(
+    return sorted(
         launchers,
         key=lambda p: launcher_score(p, path),
     )
+
+def find_launcher(path: Path) -> Path | None:
+    launchers = find_launchers(path)
+
+    if not launchers:
+        return None
+
+    return launchers[0]
 
 def game_list_changed(
         path: Path | None,
@@ -2837,6 +2850,7 @@ class GameArchiver(App):
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
         Binding("l", "launch", "Launch"),
+        Binding("alt+l", "choose_launcher", "Change Launcher"),
         Binding("o", "open_folder", "Open"),
         Binding("p", "open_remote_folder", "Open Remote"),
         Binding("t", "terminal", "Terminal"),
@@ -3221,6 +3235,9 @@ class GameArchiver(App):
             games += self.archived_games
 
         for game in games:
+            # Keep the current launcher if it still exists.
+            if game.launcher is not None and game.launcher.is_file():
+                continue
             launcher = find_launcher(launch_path(game))
 
             # The game directory may have disappeared if remote storage went offline.
@@ -3509,6 +3526,44 @@ class GameArchiver(App):
         return self.archived_view
 
     # ========================================================
+
+    @work
+    async def action_choose_launcher(self):
+        game = self.get_highlighted_game()
+
+        if game is None:
+            return
+
+        if not self.can_modify_steam():
+            return
+
+        root = launch_path(game)
+        launchers = find_launchers(root)
+
+        if not launchers:
+            self.notify(f"No launchers found for {game.name}.")
+            return
+
+        selected = await self.push_screen_wait(
+            LauncherDialog(
+                root=root,
+                launchers=launchers,
+                current=game.launcher,
+                game=game
+            )
+        )
+
+        if selected is None or selected == game.launcher:
+            return
+
+        game.launcher = selected
+
+        await self.sync_shortcut(game)
+
+        self.save_game_data()
+        self.refresh_game_row(game)
+
+        self.notify(f"Launcher updated: {selected.name}")
 
     def action_switch_pane(self):
 
@@ -4525,6 +4580,80 @@ def get_steam_users() -> list[SteamUser]:
             )
 
     return users
+
+class LauncherDialog(ModalScreen[Path | None]):
+    DEFAULT_CSS = """
+    LauncherDialog {
+        align: center middle;
+    }
+
+    #dialog {
+        width: 80;
+        max-width: 95%;
+        height: 80%;
+        border: round $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #launchers {
+        height: 1fr;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        launchers: list[Path],
+        current: Path | None = None,
+        game: Game | None = None,
+    ):
+        super().__init__()
+        self.root = root
+        self.launchers = launchers
+        self.current = current
+        self.game = game
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("[b]Select Game Launcher[/b]")
+            yield Label(f"Current: {self.current or 'None'}")
+
+            yield ListView(
+                *[
+                    ListItem(
+                        Label(str(path.relative_to(self.root)))
+                    )
+                    for path in self.launchers
+                ],
+                id="launchers",
+            )
+
+            yield Checkbox(
+                label="Enable Gamescope",
+                value=self.game.gamescope_enabled if self.game else False,
+                id="gamescope-checkbox"
+            )
+
+            yield Label("Enter: Select    Escape: Cancel")
+
+    def on_list_view_selected(
+        self,
+        event: ListView.Selected,
+    ):
+        if event.index is not None:
+            self.dismiss(self.launchers[event.index])
+
+    def on_checkbox_changed(
+        self,
+        event: Checkbox.Changed,
+    ):
+        if event.checkbox.id == "gamescope-checkbox" and self.game:
+            self.game.gamescope_enabled = event.value
+
+    def action_dismiss(self):
+        self.dismiss(None)
 
 # ============================================================
 # Option Dialog
