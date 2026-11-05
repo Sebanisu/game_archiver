@@ -3697,8 +3697,25 @@ class GameArchiver(App):
 
             old_path = game.path
             new_path = target / game.name
+
+            # Preserve the current launcher and icon relative to the game directory.
+            launcher_rel = None
+            if game.launcher is not None:
+                try:
+                    launcher_rel = game.launcher.relative_to(old_path)
+                except ValueError:
+                    pass
+
+            icon_rel = None
+            if game.icon is not None:
+                try:
+                    icon_rel = Path(game.icon).relative_to(old_path)
+                except ValueError:
+                    pass
+
             if old_path == self.highlighted_game_path:
                 self.highlighted_game_path = new_path
+
             executables = executable_files(old_path)
 
             await to_thread(shutil.move, old_path, new_path)
@@ -3713,11 +3730,31 @@ class GameArchiver(App):
                         | stat.S_IXUSR
                         | stat.S_IXGRP
                     )
-
             game.path = new_path
             game.mtime = new_path.stat().st_mtime
-            game.launcher = find_launcher(launch_path(game))
-            game.icon = find_icon(launch_path(game))
+
+            # Restore the launcher using its previous relative path.
+            launchers = find_launchers(launch_path(game))
+
+            game.launcher = next(
+                (
+                    path for path in launchers
+                    if launcher_rel is not None
+                    and path == new_path / launcher_rel
+                ),
+                None,
+            )
+
+            # Fall back to automatic launcher detection if the old launcher
+            # could not be matched.
+            if game.launcher is None:
+                game.launcher = find_launcher(launch_path(game))
+
+            # Preserve the icon if it was inside the game directory.
+            if icon_rel is not None:
+                game.icon = new_path / icon_rel
+            elif game.icon is None:
+                game.icon = find_icon(launch_path(game))
 
             await self.sync_shortcut(game)
 
