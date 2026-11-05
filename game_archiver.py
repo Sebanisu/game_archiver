@@ -78,7 +78,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 6
+DATABASE_SCHEMA_VERSION = 7
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
@@ -260,7 +260,8 @@ def create_database(db: sqlite3.Connection):
             last_played REAL NOT NULL DEFAULT 0,
             launcher TEXT,
             icon TEXT,
-            icon_manual INTEGER NOT NULL DEFAULT 0
+            icon_manual INTEGER NOT NULL DEFAULT 0,
+            gamescope_enabled BOOLEAN NOT NULL DEFAULT 1
         )
         """
     )
@@ -432,6 +433,12 @@ def migrate_database(
         migrate_to_v6(db)
         set_schema_version(db, 6)
         current_version = 6
+
+
+    if current_version < 7:
+        migrate_to_v7(db)
+        set_schema_version(db, 7)
+        current_version = 7
 
     # Future migrations go here
 
@@ -707,6 +714,12 @@ def migrate_to_v6(db: sqlite3.Connection) -> None:
         """
     )
 
+def migrate_to_v7(db: sqlite3.Connection):
+    db.execute("""
+        ALTER TABLE games
+        ADD COLUMN gamescope_enabled BOOLEAN NOT NULL DEFAULT 1
+    """)
+
 def save_game(
     db: sqlite3.Connection,
     game: Game,
@@ -729,9 +742,10 @@ def save_game(
             last_played,
             launcher,
             icon,
-            icon_manual
+            icon_manual,
+            gamescope_enabled
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
             size = excluded.size,
@@ -740,7 +754,8 @@ def save_game(
             last_played = excluded.last_played,
             launcher = excluded.launcher,
             icon = excluded.icon,
-            icon_manual = excluded.icon_manual
+            icon_manual = excluded.icon_manual,
+            gamescope_enabled = excluded.gamescope_enabled
         """,
         (
             path,
@@ -756,7 +771,8 @@ def save_game(
             if game.icon is not None
             else None,
             int(game.icon_manual),
-        ),
+            int(game.gamescope_enabled),
+        )
     )
 
     row = db.execute(
@@ -2894,6 +2910,7 @@ class GameArchiver(App):
                         g.launcher,
                         g.icon,
                         g.icon_manual,
+                        g.gamescope_enabled,
 
                         s.steam_key,
                         s.steam_entry,
@@ -2940,6 +2957,7 @@ class GameArchiver(App):
                             else None
                         ),
                         icon_manual=bool(row["icon_manual"]),
+                        gamescope_enabled=bool(row["gamescope_enabled"]),
                     )
 
                     if row["steam_key"] is not None:
@@ -3543,27 +3561,37 @@ class GameArchiver(App):
         if not launchers:
             self.notify(f"No launchers found for {game.name}.")
             return
+        previous_gamescope_enabled = game.gamescope_enabled
 
         selected = await self.push_screen_wait(
             LauncherDialog(
                 root=root,
                 launchers=launchers,
                 current=game.launcher,
-                game=game
+                game=game,
             )
         )
 
-        if selected is None or selected == game.launcher:
+        gamescope_changed = previous_gamescope_enabled != game.gamescope_enabled
+        launcher_changed = selected is not None and selected != game.launcher
+
+        if not gamescope_changed and not launcher_changed:
             return
 
-        game.launcher = selected
-
-        await self.sync_shortcut(game)
+        if launcher_changed:
+            game.launcher = selected
+            await self.sync_shortcut(game)
 
         self.save_game_data()
         self.refresh_game_row(game)
 
-        self.notify(f"Launcher updated: {selected.name}")
+        if launcher_changed:
+            self.notify(f"Launcher updated: {selected.name}")
+
+        if gamescope_changed:
+            self.notify(
+                f"Gamescope {'enabled' if game.gamescope_enabled else 'disabled'}"
+            )
 
     def action_switch_pane(self):
 
@@ -4602,6 +4630,10 @@ class LauncherDialog(ModalScreen[Path | None]):
     }
     """
 
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
+
     def __init__(
         self,
         root: Path,
@@ -4618,12 +4650,14 @@ class LauncherDialog(ModalScreen[Path | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("[b]Select Game Launcher[/b]")
-            yield Label(f"Current: {self.current or 'None'}")
 
             yield ListView(
                 *[
                     ListItem(
-                        Label(str(path.relative_to(self.root)))
+                        Label(
+                            f"{'[🗸] ' if path == self.current else '[ ] '}"
+                            f"{path.relative_to(self.root)}"
+                        )
                     )
                     for path in self.launchers
                 ],
@@ -4654,6 +4688,12 @@ class LauncherDialog(ModalScreen[Path | None]):
 
     def action_dismiss(self):
         self.dismiss(None)
+
+    def on_mount(self):
+        list_view = self.query_one("#launchers", ListView)
+
+        for item, path in zip(list_view.children, self.launchers):
+            item.tooltip = str(path)
 
 # ============================================================
 # Option Dialog
