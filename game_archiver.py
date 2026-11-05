@@ -2875,6 +2875,7 @@ class GameArchiver(App):
         Binding("ctrl+a", "select_all", "Select All"),
         Binding("ctrl+shift+a", "select_none", "Select None"),
         Binding("g", "download_steamgriddb", "SteamGridDB"),
+        Binding("alt+p", "open_proton_prefix", "Open Proton Prefix"),
     ]
 
     def __init__(self, **kwargs):
@@ -3282,7 +3283,7 @@ class GameArchiver(App):
 
         yield Static(id="status")
 
-        yield Footer()
+        yield Footer(show_command_palette=False, compact=True)
 
         
     def refresh_game_row(self, game: Game):
@@ -3592,6 +3593,24 @@ class GameArchiver(App):
             self.notify(
                 f"Gamescope {'enabled' if game.gamescope_enabled else 'disabled'}"
             )
+
+    def action_open_proton_prefix(self):
+        game = self.get_highlighted_game()
+
+        if game is None:
+            return
+
+        compat = (
+            Path.home()
+            / ".local/share/game_archiver/compatdata"
+            / game.name
+        )
+
+        if not compat.is_dir():
+            self.notify("Proton prefix not found.", severity="warning")
+            return
+
+        subprocess.Popen(["xdg-open", str(compat)])
 
     def action_switch_pane(self):
 
