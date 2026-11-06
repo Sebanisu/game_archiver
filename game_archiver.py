@@ -133,7 +133,9 @@ RENAME_TO_IMAGE_EXTENSIONS = {
     ImageExtension.APNG: ImageExtension.PNG,
     ImageExtension.WEBP: ImageExtension.PNG,
 }
-def correct_image_extension(path: Path) -> Path:
+def correct_image_extension(path: Path) -> Path | None:
+    if not path:
+        return path
     ext = path.suffix.lower()
     if ext in RENAME_TO_IMAGE_EXTENSIONS:
         return path.with_suffix(RENAME_TO_IMAGE_EXTENSIONS[ext])
@@ -4414,6 +4416,12 @@ class GameArchiver(App):
 
             if path is not None and path.is_file():
                 installed.append(path)
+            elif path is None:
+                self.notify(
+                    f"{art_type.name} artwork cannot be installed as Steam artwork.",
+                    severity="warning",
+                )
+                return []
 
         return installed
 
@@ -4491,6 +4499,10 @@ class GameArchiver(App):
         ))
 
         if dest is None:
+            self.notify(
+                f"{art_type.name} artwork cannot be installed as Steam artwork.",
+                severity="warning",
+            )
             return False
 
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -4555,6 +4567,10 @@ class GameArchiver(App):
                 ))
 
                 if old is None or new is None or not old.is_file():
+                    self.notify(
+                        f"{art_type.name} artwork cannot be installed as Steam artwork.",
+                        severity="warning",
+                    )
                     continue
 
                 new.parent.mkdir(parents=True, exist_ok=True)
