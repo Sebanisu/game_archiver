@@ -94,6 +94,36 @@ STEAM_CLIENTICON_CDN = (
     "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
 )
 
+PROTON = (
+    Path.home()
+    / ".local"
+    / "share"
+    / "Steam"
+    / "steamapps"
+    / "common"
+    / "Proton - Experimental"
+    / "proton"
+)
+
+
+@dataclass(frozen=True)
+class GameLocation:
+    name: str
+    local_path: Path | None = None
+    remote_path: Path | None = None
+    move_to: str | None = None
+    steam_shortcuts: bool = True
+
+    def scan_path(self, remote_available: bool) -> Path | None:
+        if self.remote_path is not None and remote_available:
+            return self.remote_path
+
+        return self.local_path
+
+    def is_movable(self, remote_available: bool) -> bool:
+        return self.move_to is not None and remote_available
+
+
 # Game Storage Status:
 #
 # Shared:
@@ -107,13 +137,33 @@ STEAM_CLIENTICON_CDN = (
 #
 # Shared vs. Archived describes storage/sync status, NOT playability.
 # Both statuses must remain available for launching games.
+# POOL_DIR is the mount point for the remote game directories.
 
-LOCAL_SHARED_DIR = Path.home() / "Games" / "shared"
-REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
-REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
+
 POOL_DIR = Path("/mnt/media/pool")
-PROTON = (
-    Path.home() / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
+GAME_LOCATIONS = (
+    GameLocation(
+        name="Shared",
+        local_path=Path.home() / "Games" / "shared",
+        remote_path=POOL_DIR / "Games" / "shared",
+        move_to="Archived",
+    ),
+    GameLocation(
+        name="Archived",
+        remote_path=POOL_DIR / "Games" / "archived",
+        move_to="Shared",
+    ),
+    GameLocation(
+        name="Heroic",
+        local_path=Path.home() / "Games" / "Heroic",
+        remote_path=POOL_DIR / "Games" / "Heroic",
+    ),
+    GameLocation(
+        name="Steam",
+        local_path=Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common",
+        remote_path=POOL_DIR / "Games" / "steam",
+        steam_shortcuts=False,
+    ),
 )
 
 
@@ -172,8 +222,6 @@ BAD_LAUNCHER_NAMES = (
     "redist",
 )
 
-SHARED_DIR = REMOTE_SHARED_DIR
-ARCHIVED_DIR = REMOTE_ARCHIVED_DIR
 
 LIMIT_GB = 256
 LIMIT_BYTES = LIMIT_GB * 1024 * 1024 * 1024
@@ -927,6 +975,43 @@ def migrate_to_v8(db: sqlite3.Connection) -> None:
     # These columns are no longer needed after the artwork migration.
     drop_column_if_exists("games", "icon_manual")
     drop_column_if_exists("games", "icon")
+
+
+def reconcile_game_paths(
+    db: sqlite3.Connection,
+    games: list[Game],
+):
+    rows = db.execute("SELECT id, path FROM games").fetchall()
+
+    existing_paths = {
+        game_identity(Game(name="", path=Path(row["path"]))): row
+        for row in rows
+        if row["path"] is not None
+    }
+
+    for game in games:
+        if game.path is None:
+            continue
+
+        identity = game_identity(game)
+
+        if identity is None:
+            continue
+
+        row = existing_paths.get(identity)
+
+        if row is None or row["path"] == str(game.path):
+            continue
+
+        db.execute(
+            "UPDATE games SET path = ? WHERE id = ?",
+            (str(game.path), row["id"]),
+        )
+
+        existing_paths[identity] = {
+            "id": row["id"],
+            "path": str(game.path),
+        }
 
 
 def save_game(
@@ -1930,6 +2015,51 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+
+def can_add_to_steam(game: Game) -> bool:
+    if game.path is None:
+        return False
+
+    location = get_game_location(game.path)
+    return location is None or location.steam_shortcuts
+
+
+def get_move_locations(remote_available: bool) -> list[GameLocation]:
+    return [
+        location for location in GAME_LOCATIONS if location.is_movable(remote_available)
+    ]
+
+
+def get_location(name: str) -> GameLocation:
+    return next(location for location in GAME_LOCATIONS if location.name == name)
+
+
+def game_identity(game: Game) -> tuple[str, Path] | None:
+    if game.path is None:
+        return None
+
+    location = get_game_location(game.path)
+
+    if location is None:
+        return ("path", game.path)
+
+    for base in (location.local_path, location.remote_path):
+        if base is not None and game.path.is_relative_to(base):
+            return (location.name, game.path.relative_to(base))
+
+    return ("path", game.path)
+
+
+def get_game_location(path: Path) -> GameLocation | None:
+    for location in GAME_LOCATIONS:
+        for base in (location.local_path, location.remote_path):
+            if base is not None and path.is_relative_to(base):
+                return location
+
+    return None
+
+
 def match_installed_artwork(
     downloaded_path: Path,
     installed_paths: list[Path],
@@ -1981,25 +2111,33 @@ def update_artwork_paths_for_game(
     if game.steamgriddb is None:
         return
 
+    shared = get_location("Shared")
+    if shared.local_path is None:
+        return
+
+    archived = get_location("Archived")
+
     # Shared -> Archived
-    if old_path.is_relative_to(REMOTE_SHARED_DIR):
+    if shared.remote_path is not None and old_path.is_relative_to(shared.remote_path):
         path_mappings = [
             (
-                REMOTE_SHARED_DIR / old_path.name,
+                shared.remote_path / old_path.name,
                 new_path,
             ),
             (
-                LOCAL_SHARED_DIR / old_path.name,
+                shared.local_path / old_path.name,
                 new_path,
             ),
         ]
 
     # Archived -> Shared
-    elif old_path.is_relative_to(REMOTE_ARCHIVED_DIR):
+    elif archived.remote_path is not None and old_path.is_relative_to(
+        archived.remote_path
+    ):
         path_mappings = [
             (
                 old_path,
-                LOCAL_SHARED_DIR / old_path.name,
+                shared.local_path / old_path.name,
             ),
         ]
 
@@ -2009,12 +2147,10 @@ def update_artwork_paths_for_game(
     art = game.steamgriddb.get("art", {})
     selected = game.steamgriddb.get("selected", {})
 
-    # Update all artwork candidates.
     for assets in art.values():
         for asset in assets:
             update_artwork_paths(asset, path_mappings)
 
-    # Update selected artwork and its nested asset.
     for selected_info in selected.values():
         if selected_info is None:
             continue
@@ -2126,18 +2262,32 @@ def add_selected_artwork_to_art(
     artwork_list.append(asset)
 
 
-def merge_games(existing, scanned):
-    # Existing games by unique key
-    existing_map = {g.path: g for g in existing}
-    scanned_map = {g.path: g for g in scanned}
+def merge_games(existing: list[Game], scanned: list[Game]):
+    existing_map = {
+        game_identity(game): game
+        for game in existing
+        if game_identity(game) is not None
+    }
+    scanned_map = {
+        game_identity(game): game for game in scanned if game_identity(game) is not None
+    }
 
-    # Remove games that no longer exist
-    existing[:] = [g for g in existing if g.path in scanned_map]
+    # Remove games that no longer exist.
+    existing[:] = [game for game in existing if game_identity(game) in scanned_map]
 
-    # Add newly discovered games
-    for path, game in scanned_map.items():
-        if path not in existing_map:
-            existing.append(game)
+    # Add new games and update existing ones.
+    for identity, scanned_game in scanned_map.items():
+        existing_game = existing_map.get(identity)
+
+        if existing_game is None:
+            existing.append(scanned_game)
+        else:
+            # Keep metadata, but use the path discovered by this scan.
+            existing_game.path = scanned_game.path
+            existing_game.name = scanned_game.name
+            existing_game.size = scanned_game.size
+            existing_game.mtime = scanned_game.mtime
+            existing_game.file_count = scanned_game.file_count
 
     sort_games(existing)
 
@@ -2812,9 +2962,19 @@ def natural_key(s: str):
 
 
 def launch_path(game: Game) -> Path:
-    # Only games in shared can have a local mirror.
-    if game.path.parent in (SHARED_DIR, LOCAL_SHARED_DIR):
-        local = LOCAL_SHARED_DIR / game.name
+    if game.path is None:
+        raise RuntimeError(f"Game has no path: {game.name}")
+
+    shared = get_location("Shared")
+
+    if shared.local_path is not None and (
+        (
+            shared.remote_path is not None
+            and game.path.is_relative_to(shared.remote_path)
+        )
+        or game.path.is_relative_to(shared.local_path)
+    ):
+        local = shared.local_path / game.name
 
         if local.is_dir():
             return local
@@ -2880,16 +3040,19 @@ def game_list_changed(
 
 
 def local_sync_status() -> str:
-    if not LOCAL_SHARED_DIR.exists():
+    shared = get_location("Shared")
+    local_path = shared.local_path
+    remote_path = shared.remote_path
+
+    if local_path is None or not local_path.exists():
         return "Local copy missing"
 
-    if not REMOTE_SHARED_DIR.exists():
+    if remote_path is None or not remote_path.exists():
         return "Remote storage offline"
 
     try:
-        remote = {p.name for p in REMOTE_SHARED_DIR.iterdir() if p.is_dir()}
-
-        local = {p.name for p in LOCAL_SHARED_DIR.iterdir() if p.is_dir()}
+        remote = {p.name for p in remote_path.iterdir() if p.is_dir()}
+        local = {p.name for p in local_path.iterdir() if p.is_dir()}
     except FileNotFoundError:
         return "Remote storage offline"
 
@@ -2984,6 +3147,23 @@ def latest_activity(path: Path) -> float:
         return newest
 
     return path.stat().st_mtime
+
+
+def scan_game_locations(
+    locations: tuple[GameLocation, ...],
+    remote_available: bool,
+) -> dict[str, list[Game]]:
+    games = {}
+
+    for location in locations:
+        base = location.scan_path(remote_available)
+
+        if base is None:
+            continue
+
+        games[location.name] = scan_games(base)
+
+    return games
 
 
 def scan_games(base: Path | None) -> list[Game]:
@@ -3121,7 +3301,9 @@ class GameRow(ListItem):
 
         size = fmt_size(self.game.size)
 
-        if self.game.duplicate_steam:
+        if not can_add_to_steam(self.game):
+            steam = "X"
+        elif self.game.duplicate_steam:
             steam = "D"
         elif self.game.steam_broken:
             steam = "!"
@@ -3240,30 +3422,15 @@ class GameArchiver(App):
         self.shared_view.border_title = " Shared / Synced "
         self.archived_view.border_title = " Archived / Remote "
         self.library_view.border_title = " Library / All "
-        self.verify_storage()
-
-        self.load_game_data()
-
-        merge_games(self.shared_games, scan_games(self.shared_dir()))
-
-        if self.storage_online:
-            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
-
-        self.games = (
-            self.shared_games + self.archived_games
-            if self.storage_online
-            else self.shared_games
-        )
 
         self.shared_view = self.query_one("#shared", ListView)
         self.archived_view = self.query_one("#archived", ListView)
         self.library_view = self.query_one("#library", ListView)
 
-        self.refresh_views()
+        self.load_game_data()
+        self.action_refresh()
 
         self.current_view().focus()
-
-        self.start_scan()
 
         self.set_interval(
             SYNC_STATUS_INTERVAL_SEC,
@@ -3273,9 +3440,11 @@ class GameArchiver(App):
             RESCAN_INTERVAL_SEC,
             self.refresh_if_changed,
         )
+
         if len(self.steam_users) > 1:
             self.bind("[", "prev_steam_user", "Steam-")
             self.bind("]", "next_steam_user", "Steam+")
+
         self.refresh_bindings()
         self.save_game_data()
 
@@ -3330,6 +3499,7 @@ class GameArchiver(App):
         self.games: list[Game] = []
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
+        self.library_only_games: list[Game] = []
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
@@ -3492,33 +3662,46 @@ class GameArchiver(App):
 
                     games.append(game)
                 sort_games(games)
+
                 shared_games = []
                 archived_games = []
+                library_only_games = []
 
                 for game in games:
-                    # Determine archive status from the path for now.
-                    # A dedicated database field can be added later if needed.
-                    if game.path is not None and game.path.is_relative_to(
-                        REMOTE_ARCHIVED_DIR
-                    ):
+                    location = get_game_location(game.path) if game.path else None
+
+                    if location is None:
+                        library_only_games.append(game)
+                        continue
+
+                    if location.name == "Shared":
+                        shared_games.append(game)
+                    elif location.name == "Archived":
                         archived_games.append(game)
                     else:
-                        shared_games.append(game)
-                self.games = games
+                        library_only_games.append(game)
+
                 self.shared_games = shared_games
                 self.archived_games = archived_games
+                self.library_only_games = library_only_games
+
+                self.games = games
 
         except Exception as e:  # noqa: BLE001 - Prevent database loading errors from crashing startup.
             self.notify(f"Error loading game data: {type(e).__name__}: {e}")
 
     def save_game_data(self):
         debug_log("DEBUG: save_game_data called")
+
         try:
             with get_db() as db:
-                for game in self.shared_games:
-                    save_game(db, game)
+                games = (
+                    self.shared_games + self.archived_games + self.library_only_games
+                )
 
-                for game in self.archived_games:
+                reconcile_game_paths(db, games)
+
+                for game in games:
                     save_game(db, game)
 
                 db.commit()
@@ -3588,6 +3771,10 @@ class GameArchiver(App):
         }
 
     async def sync_shortcut(self, game: Game) -> bool:
+        # Don't create shortcuts for games already installed through Steam.
+        if not can_add_to_steam(game):
+            return False
+
         # Don't touch duplicate shortcuts.
         if game.duplicate_steam:
             return False
@@ -3726,9 +3913,11 @@ class GameArchiver(App):
         shortcuts = load_shortcuts(user)
         entries = shortcuts["shortcuts"]
 
-        games = list(self.shared_games)
-        if self.storage_online:
-            games += self.archived_games
+        games = (
+            self.shared_games + self.archived_games + self.library_only_games
+            if self.storage_online
+            else self.shared_games + self.library_only_games
+        )
 
         for game in games:
             await self.update_game_steam_status(
@@ -3759,11 +3948,26 @@ class GameArchiver(App):
         if self.is_scan_running():
             return
 
-        if game_list_changed(self.shared_dir(), self.shared_games) or (
-            self.storage_online and game_list_changed(ARCHIVED_DIR, self.archived_games)
-        ):
-            self.action_refresh()
-            return
+        for location in GAME_LOCATIONS:
+            base = location.scan_path(self.storage_online)
+
+            if base is None:
+                continue
+
+            if location.name == "Shared":
+                games = self.shared_games
+            elif location.name == "Archived":
+                games = self.archived_games
+            else:
+                games = [
+                    game
+                    for game in self.library_only_games
+                    if game.path is not None and game.path.is_relative_to(base)
+                ]
+
+            if game_list_changed(base, games):
+                self.action_refresh()
+                return
 
         self.refresh_launchers()
 
@@ -3797,17 +4001,16 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
     def refresh_game_row(self, game: Game):
-        for row in self.shared_view.children:
-            if row.game is game:
-                row.refresh_row()
-                self.update_status()
-                return
-
-        for row in self.archived_view.children:
-            if row.game is game:
-                row.refresh_row()
-                self.update_status()
-                return
+        for view in (
+            self.shared_view,
+            self.archived_view,
+            self.library_view,
+        ):
+            for row in view.children:
+                if row.game is game:
+                    row.refresh_row()
+                    self.update_status()
+                    return
 
     def update_game_info(self, game: Game):
         path = game.path
@@ -3838,12 +4041,26 @@ class GameArchiver(App):
         game.file_count = file_count
 
     async def compute_sizes(self):
-        for games in (self.shared_games, self.archived_games):
+        collections = [
+            self.shared_games,
+            self.library_only_games,
+        ]
+
+        if self.storage_online:
+            collections.append(self.archived_games)
+
+        for games in collections:
             for game in games:
                 await asyncio.to_thread(self.update_game_info, game)
                 self.refresh_game_row(game)
 
             games[:] = [game for game in games if game.size > MIN_GAME_SIZE]
+
+        self.games = (
+            self.shared_games + self.archived_games + self.library_only_games
+            if self.storage_online
+            else self.shared_games + self.library_only_games
+        )
 
         self.sizes_finished()
         self.update_status()
@@ -3882,19 +4099,10 @@ class GameArchiver(App):
             self.storage_online = False
             return
 
-        if not SHARED_DIR.exists():
-            self.notify(f"{SHARED_DIR} is missing!")
-            self.storage_online = False
-
-        if not ARCHIVED_DIR.exists():
-            self.notify(f"{ARCHIVED_DIR} is missing!")
-            self.storage_online = False
-
-    def shared_dir(self) -> Path:
-        if self.storage_online:
-            return SHARED_DIR
-        else:
-            return LOCAL_SHARED_DIR
+        for location in get_move_locations(remote_available=True):
+            if location.remote_path is None or not location.remote_path.exists():
+                self.notify(f"{location.remote_path} is missing!")
+                self.storage_online = False
 
     # ========================================================
 
@@ -4225,14 +4433,22 @@ class GameArchiver(App):
             return
         self.moving = True
 
+        shared_location = get_location("Shared")
+        archived_location = get_location("Archived")
+
         if self.shared_view.has_focus:
             source = self.shared_games
             destination = self.archived_games
-            target = ARCHIVED_DIR
+            target = archived_location.remote_path
         else:
             source = self.archived_games
             destination = self.shared_games
-            target = SHARED_DIR
+            target = shared_location.remote_path
+
+        if target is None:
+            self.notify("Target location is not configured.")
+            self.moving = False
+            return
 
         moved = await self.move_games(source, destination, target)
 
@@ -4336,15 +4552,27 @@ class GameArchiver(App):
 
         self.verify_storage()
 
-        merge_games(self.shared_games, scan_games(self.shared_dir()))
+        scanned = scan_game_locations(GAME_LOCATIONS, self.storage_online)
+
+        merge_games(self.shared_games, scanned.get("Shared", []))
 
         if self.storage_online:
-            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+            merge_games(self.archived_games, scanned.get("Archived", []))
+
+        library_only_scanned = [
+            game
+            for name, games in scanned.items()
+            if name not in ("Shared", "Archived")
+            for game in games
+        ]
+
+        merge_games(self.library_only_games, library_only_scanned)
 
         self.games = (
-            self.shared_games + self.archived_games
+            self.shared_games + self.archived_games + self.library_only_games
             if self.storage_online
-            else self.shared_games
+            else self.shared_games + self.library_only_games
+            # this might not be good enough for library_only_games that are remote only but we don't have any of those right now.
         )
 
         self.refresh_views()
@@ -4357,9 +4585,11 @@ class GameArchiver(App):
 
         game.last_played = time.time()
 
+        sort_games(self.games)
+
         if game in self.shared_games:
             sort_games(self.shared_games)
-        else:
+        elif game in self.archived_games:
             sort_games(self.archived_games)
 
         self.save_game_data()
@@ -5064,6 +5294,12 @@ class GameArchiver(App):
         image: Path | str,
     ) -> bool:
         image = Path(image)
+        if not can_add_to_steam(game):
+            self.notify(
+                f"Adding artwork to Steam games is not supported for {game.name}.",
+                severity="error",
+            )
+            return False
         if not image.is_file():
             self.notify(
                 f"Artwork file not found: {image}",
