@@ -68,7 +68,8 @@ DATABASE_SCHEMA_VERSION = 8
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0  # 1024 * 1024  # 1 MB
-LOGGING_ENABLED = False
+LOGGING_ENABLED = False  # DEBUG
+LOGGING_FILE = "/tmp/game_archiver-debug.log"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2098,7 +2099,7 @@ def debug_log(message: str):
     global FIRSTLOG
 
     if LOGGING_ENABLED:
-        with open("/tmp/game_archiver-debug.log", "w" if FIRSTLOG else "a") as f:
+        with open(LOGGING_FILE, "w" if FIRSTLOG else "a") as f:
             f.write(f"{message}\n")
         FIRSTLOG = False
 
@@ -3195,6 +3196,21 @@ class GameArchiver(App):
         padding-left: 1;
         text-style: bold;
     }
+
+    #details-artwork {
+        width: 100%;
+        height: 0;
+        padding: 0;
+        align: center top;
+    }
+
+
+    #library-art {
+        padding: 0;
+        margin: 0;
+        width: auto;
+        height: auto;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -3212,7 +3228,7 @@ class GameArchiver(App):
             yield self.library_view
 
             with Vertical(id="library-details"):
-                yield Static("", id="details-artwork")
+                yield Vertical(id="details-artwork")
                 yield Static("", id="details-info")
 
         yield Static(id="status")
@@ -3317,6 +3333,59 @@ class GameArchiver(App):
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
+
+    async def clear_library_artwork(self):
+        container = self.query_one("#details-artwork", Vertical)
+        await container.remove_children()
+
+    async def update_library_artwork(self, game: Game):
+        artwork = None
+
+        for artwork_type in (
+            ArtworkType.HERO,
+            ArtworkType.GRID_LANDSCAPE,
+            ArtworkType.GRID_PORTRAIT,
+            ArtworkType.GRID_SQUARE,
+            ArtworkType.ICON,
+        ):
+            artwork = await self.get_selected_artwork_path(game, artwork_type)
+
+            if artwork and artwork.is_file():
+                break
+
+        # if self.app_mode != AppMode.LIBRARY or self.highlighted_game_path != game.path:
+        #     return
+
+        container = self.query_one("#details-artwork", Vertical)
+        await container.remove_children()
+
+        if artwork:
+            if artwork_type is ArtworkType.HERO:
+                with Image.open(artwork) as img:
+                    image_width, image_height = img.size
+                    height = round(
+                        (container.size.width * image_height / image_width) / 2
+                    )
+                    debug_log(
+                        f"Artwork size: {image_width}x{image_height}, container width: {container.size.width}, calculated height: {height}"
+                    )
+                    container.styles.height = height
+            else:
+                container.styles.height = 10
+
+            debug_log(f"Artwork path: {artwork}")
+            debug_log(f"Exists: {artwork.is_file()}")
+            debug_log(f"Size: {artwork.stat().st_size if artwork.is_file() else 'N/A'}")
+
+            image = AutoImage(str(artwork), id="library-art")
+            await container.mount(image)
+
+            debug_log(f"Mounted: {image.is_mounted}")
+            debug_log(f"Container size: {container.size}")
+            debug_log(f"Image size: {image.size}")
+        else:
+            container.styles.height = 0
+            debug_log("No artwork found for the game.")
 
     def load_game_data(self) -> None:
         try:
@@ -3859,6 +3928,11 @@ class GameArchiver(App):
         if game is None:
             details.border_title = "Select a game"
             info.update("")
+            self.run_worker(
+                self.clear_library_artwork(),
+                group="library-artwork",
+                exclusive=True,
+            )
             return
 
         sgdb = game.steamgriddb or {}
@@ -3893,6 +3967,11 @@ class GameArchiver(App):
             f"Launcher: {launcher}\n"
             f"Steam: {steam_status}\n"
             f"Gamescope: {'Enabled' if game.gamescope_enabled else 'Disabled'}"
+        )
+        self.run_worker(
+            self.update_library_artwork(game),
+            group="library-artwork",
+            exclusive=True,
         )
 
     def refresh_views(self):
