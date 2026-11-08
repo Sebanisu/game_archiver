@@ -93,6 +93,19 @@ STEAM_CLIENTICON_CDN = (
     "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
 )
 
+# Game Storage Status:
+#
+# Shared:
+#   - Game is synced locally to both the PC and Steam Deck.
+#   - Launches locally using the installed game files.
+#
+# Archived:
+#   - Game is stored on the server and is not synced locally.
+#   - Still playable; assets must be streamed/accessed over the network
+#     when launching remotely.
+#
+# Shared vs. Archived describes storage/sync status, NOT playability.
+# Both statuses must remain available for launching games.
 
 LOCAL_SHARED_DIR = Path.home() / "Games" / "shared"
 REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
@@ -101,6 +114,11 @@ POOL_DIR = Path("/mnt/media/pool")
 PROTON = (
     Path.home() / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
 )
+
+
+class AppMode(StrEnum):
+    MOVE = "move"
+    LIBRARY = "library"
 
 
 class ImageExtension(StrEnum):
@@ -3144,8 +3162,14 @@ class GameArchiver(App):
         layout: vertical;
     }
 
-    #panes {
+    #move-mode {
         height: 1fr;
+        display: none;
+    }
+
+    #library-mode {
+        height: 1fr;
+        display: none;
     }
 
     ListView {
@@ -3166,6 +3190,75 @@ class GameArchiver(App):
     }
     """
 
+    def compose(self) -> ComposeResult:
+        yield Header()
+
+        with Horizontal(id="move-mode"):
+            self.shared_view = ListView(id="shared")
+            yield self.shared_view
+
+            self.archived_view = ListView(id="archived")
+            yield self.archived_view
+
+        with Horizontal(id="library-mode"):
+            self.library_view = ListView(id="library")
+            yield self.library_view
+
+        yield Static(id="status")
+
+        yield Footer(show_command_palette=False, compact=True)
+
+    def on_mount(self):
+        self.update_mode_display()
+        self.shared_view.border_title = " Shared / Synced "
+        self.archived_view.border_title = " Archived / Remote "
+        self.library_view.border_title = " Library / All "
+        self.verify_storage()
+
+        self.load_game_data()
+
+        merge_games(self.shared_games, scan_games(self.shared_dir()))
+
+        if self.storage_online:
+            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+
+        self.games = (
+            self.shared_games + self.archived_games
+            if self.storage_online
+            else self.shared_games
+        )
+
+        self.shared_view = self.query_one("#shared", ListView)
+        self.archived_view = self.query_one("#archived", ListView)
+        self.library_view = self.query_one("#library", ListView)
+
+        self.refresh_views()
+
+        self.current_view().focus()
+
+        self.start_scan()
+
+        self.set_interval(
+            SYNC_STATUS_INTERVAL_SEC,
+            self.refresh_sync_status,
+        )
+        self.set_interval(
+            RESCAN_INTERVAL_SEC,
+            self.refresh_if_changed,
+        )
+        if len(self.steam_users) > 1:
+            self.bind("[", "prev_steam_user", "Steam-")
+            self.bind("]", "next_steam_user", "Steam+")
+        self.refresh_bindings()
+        self.save_game_data()
+
+    def update_mode_display(self):
+        move_mode = self.query_one("#move-mode")
+        library_mode = self.query_one("#library-mode")
+
+        move_mode.display = self.app_mode == AppMode.MOVE
+        library_mode.display = self.app_mode == AppMode.LIBRARY
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("tab", "switch_pane", "Switch"),
         Binding("space", "toggle", "Toggle"),
@@ -3184,11 +3277,18 @@ class GameArchiver(App):
         Binding("ctrl+shift+a", "select_none", "Select None"),
         Binding("g", "download_steamgriddb", "SteamGridDB"),
         Binding("alt+p", "open_proton_prefix", "Open Proton Prefix"),
+        Binding("f2", "switch_mode", "Switch Mode"),
     ]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
+        config = load_config()
+        try:
+            self.app_mode = AppMode(
+                config.get("ui", {}).get("last_mode", AppMode.MOVE.value)
+            )
+        except ValueError:
+            self.app_mode = AppMode.MOVE
         self.computing_sizes = False
         self.detecting_steam = False
         self.moving = False
@@ -3197,13 +3297,14 @@ class GameArchiver(App):
         self.sync_status = "Detecting"
         self.storage_online = False
 
+        self.games: list[Game] = []
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
 
-    def load_game_data(self) -> tuple[list[Game], list[Game]]:
+    def load_game_data(self) -> None:
         try:
             with get_db() as db:
                 rows = db.execute(
@@ -3307,7 +3408,7 @@ class GameArchiver(App):
                         ) = load_steamgriddb_artwork(db, game_id)
 
                     games.append(game)
-
+                sort_games(games)
                 shared_games = []
                 archived_games = []
 
@@ -3320,12 +3421,12 @@ class GameArchiver(App):
                         archived_games.append(game)
                     else:
                         shared_games.append(game)
-
-                return shared_games, archived_games
+                self.games = games
+                self.shared_games = shared_games
+                self.archived_games = archived_games
 
         except Exception as e:  # noqa: BLE001 - Prevent database loading errors from crashing startup.
             self.notify(f"Error loading game data: {type(e).__name__}: {e}")
-            return [], []
 
     def save_game_data(self):
         debug_log("DEBUG: save_game_data called")
@@ -3612,19 +3713,6 @@ class GameArchiver(App):
 
                 self.refresh_game_row(game)
 
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with Horizontal(id="panes"):
-            self.shared_view = ListView(id="shared")
-            yield self.shared_view
-
-            self.archived_view = ListView(id="archived")
-            yield self.archived_view
-
-        yield Static(id="status")
-
-        yield Footer(show_command_palette=False, compact=True)
-
     def refresh_game_row(self, game: Game):
         for row in self.shared_view.children:
             if row.game is game:
@@ -3725,41 +3813,6 @@ class GameArchiver(App):
         else:
             return LOCAL_SHARED_DIR
 
-    def on_mount(self):
-        self.shared_view.border_title = " Shared / Synced "
-        self.archived_view.border_title = " Archived / Remote "
-        self.verify_storage()
-
-        self.shared_games, self.archived_games = self.load_game_data()
-
-        merge_games(self.shared_games, scan_games(self.shared_dir()))
-
-        if self.storage_online:
-            merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
-
-        self.shared_view = self.query_one("#shared", ListView)
-        self.archived_view = self.query_one("#archived", ListView)
-
-        self.refresh_views()
-
-        self.shared_view.focus()
-
-        self.start_scan()
-
-        self.set_interval(
-            SYNC_STATUS_INTERVAL_SEC,
-            self.refresh_sync_status,
-        )
-        self.set_interval(
-            RESCAN_INTERVAL_SEC,
-            self.refresh_if_changed,
-        )
-        if len(self.steam_users) > 1:
-            self.bind("[", "prev_steam_user", "Steam-")
-            self.bind("]", "next_steam_user", "Steam+")
-        self.refresh_bindings()
-        self.save_game_data()
-
     # ========================================================
 
     async def on_list_view_highlighted(self, event: ListView.Highlighted):
@@ -3782,6 +3835,7 @@ class GameArchiver(App):
         return row.game
 
     def refresh_views(self):
+        self.update_mode_display()
         selected_path = self.highlighted_game_path
 
         archived_display = self.archived_games if self.storage_online else []
@@ -3792,12 +3846,15 @@ class GameArchiver(App):
         if self.storage_online:
             sort_games(self.archived_games)
 
+        sort_games(self.games)
+
         self.shared_view.clear()
         self.archived_view.clear()
+        self.library_view.clear()
 
         self.shared_view.extend([GameRow(g) for g in self.shared_games])
-
         self.archived_view.extend([GameRow(g) for g in archived_display])
+        self.library_view.extend([GameRow(g) for g in self.games])
 
         self.update_status()
 
@@ -3805,7 +3862,7 @@ class GameArchiver(App):
             return
 
         def restore_highlight():
-            for view in (self.shared_view, self.archived_view):
+            for view in (self.shared_view, self.archived_view, self.library_view):
                 for i, row in enumerate(view.children):
                     if row.game.path == selected_path:
                         view.focus()
@@ -3860,14 +3917,30 @@ class GameArchiver(App):
         text = "   ".join(part for part in parts if part)
         self.query_one("#status", Static).update(text)
 
-    def current_view(self) -> ListView:
-
-        if self.shared_view.has_focus:
+    def current_view(self) -> ListView | None:
+        if self.app_mode == AppMode.LIBRARY:
+            return self.library_view
+        if self.app_mode == AppMode.MOVE:
+            for view in (self.shared_view, self.archived_view):
+                if view.has_focus:
+                    return view
             return self.shared_view
-
-        return self.archived_view
+        # future modes need handled here or they will return None causing errors in get_highlighted_game and action_toggle
+        return None
 
     # ========================================================
+
+    def action_switch_mode(self):
+        modes = list(AppMode)
+        current_index = modes.index(self.app_mode)
+        self.app_mode = modes[(current_index + 1) % len(modes)]
+
+        config = load_config()
+        config.setdefault("ui", {})["last_mode"] = self.app_mode.value
+        save_config(config)
+
+        self.refresh_bindings()
+        self.refresh_views()
 
     @work
     async def action_choose_launcher(self):
@@ -3979,6 +4052,9 @@ class GameArchiver(App):
         self.refresh_views()
 
     async def action_move_selected(self):
+        if self.app_mode != AppMode.MOVE:
+            self.notify("Only available in MOVE mode")
+            return
         if not self.can_modify_steam():
             return
         if not self.storage_online:
@@ -4101,6 +4177,12 @@ class GameArchiver(App):
 
         if self.storage_online:
             merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
+
+        self.games = (
+            self.shared_games + self.archived_games
+            if self.storage_online
+            else self.shared_games
+        )
 
         self.refresh_views()
         self.start_scan()
