@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import binascii
 import copy
-import datetime
 import hashlib
 import json
 import os
@@ -21,6 +20,7 @@ import tomllib
 import webbrowser
 from asyncio import to_thread
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from enum import Enum, StrEnum, auto
 from hashlib import sha1
 from pathlib import Path
@@ -3172,6 +3172,13 @@ class GameArchiver(App):
         display: none;
     }
 
+    #library-details {
+        width: 2fr;
+        height: 1fr;
+        border: solid white;
+        padding: 1;
+    }
+
     ListView {
         width: 1fr;
         border: solid white;
@@ -3203,6 +3210,10 @@ class GameArchiver(App):
         with Horizontal(id="library-mode"):
             self.library_view = ListView(id="library")
             yield self.library_view
+
+            with Vertical(id="library-details"):
+                yield Static("", id="details-artwork")
+                yield Static("", id="details-info")
 
         yield Static(id="status")
 
@@ -3258,6 +3269,9 @@ class GameArchiver(App):
 
         move_mode.display = self.app_mode == AppMode.MOVE
         library_mode.display = self.app_mode == AppMode.LIBRARY
+        view = self.current_view()
+        if view:
+            self.set_focus(view)
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("tab", "switch_pane", "Switch"),
@@ -3821,6 +3835,11 @@ class GameArchiver(App):
         if isinstance(row, GameRow):
             self.highlighted_game_path = row.game.path
 
+            if self.app_mode == AppMode.LIBRARY:
+                self.update_library_details(row.game)
+        elif self.app_mode == AppMode.LIBRARY:
+            self.update_library_details(None)
+
     def get_highlighted_game(self) -> Game | None:
         view = self.current_view()
 
@@ -3833,6 +3852,48 @@ class GameArchiver(App):
 
         row = view.children[view.index]
         return row.game
+
+    def update_library_details(self, game: Game | None):
+        info = self.query_one("#details-info", Static)
+        details = self.query_one("#library-details")
+        if game is None:
+            details.border_title = "Select a game"
+            info.update("")
+            return
+
+        sgdb = game.steamgriddb or {}
+        sgdb_game = sgdb.get("game")
+
+        name = sgdb.get("name") or (
+            sgdb_game.get("name") if isinstance(sgdb_game, dict) else None
+        )
+
+        details.border_title = f"{game.name} ({name})" if name else game.name
+
+        last_played = (
+            datetime.fromtimestamp(game.last_played).strftime("%Y-%m-%d %H:%M")
+            if game.last_played
+            else "Never"
+        )
+
+        launcher = game.launcher.name if game.launcher else "Automatic"
+
+        steam_status = (
+            "Broken"
+            if game.steam_broken
+            else "Installed"
+            if game.in_steam
+            else "Not installed"
+        )
+
+        info.update(
+            f"Size: {game.size:,} bytes\n"
+            f"Files: {game.file_count:,}\n"
+            f"Last Played: {last_played}\n"
+            f"Launcher: {launcher}\n"
+            f"Steam: {steam_status}\n"
+            f"Gamescope: {'Enabled' if game.gamescope_enabled else 'Disabled'}"
+        )
 
     def refresh_views(self):
         self.update_mode_display()
@@ -3858,16 +3919,39 @@ class GameArchiver(App):
 
         self.update_status()
 
-        if selected_path is None:
-            return
-
         def restore_highlight():
-            for view in (self.shared_view, self.archived_view, self.library_view):
-                for i, row in enumerate(view.children):
-                    if row.game.path == selected_path:
-                        view.focus()
-                        view.index = i
-                        return
+
+            if selected_path is not None:
+                views = ()
+
+                if self.app_mode == AppMode.LIBRARY:
+                    views = (self.library_view,)
+                elif self.app_mode == AppMode.MOVE:
+                    views = (self.shared_view, self.archived_view)
+                # Future modes here
+
+                for view in views:
+                    for i, row in enumerate(view.children):
+                        if row.game.path == selected_path:
+                            view.index = i
+
+                            if self.app_mode == AppMode.LIBRARY:
+                                self.update_library_details(row.game)
+
+                            self.set_focus(view)
+                            return
+            view = self.current_view()
+            if view is not None:
+                view.index = 0
+
+                row = view.children[0] if view.children else None
+                if row is not None:
+                    self.highlighted_game_path = row.game.path
+
+                    if self.app_mode == AppMode.LIBRARY:
+                        self.update_library_details(row.game)
+
+                self.set_focus(view)
 
         self.call_after_refresh(restore_highlight)
 
@@ -6132,7 +6216,7 @@ class SelectionDialog(ModalScreen[tuple[SelectionDialogAction, dict | None]]):
             details.append(", ".join(types))
 
         if release := result.get("release_date"):
-            year = datetime.datetime.fromtimestamp(release).year
+            year = datetime.fromtimestamp(release).year
             details.append(str(year))
 
         text += "\n    " + " • ".join(details)
