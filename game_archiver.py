@@ -2,55 +2,39 @@
 
 from __future__ import annotations
 
+import asyncio
 import binascii
-import ctypes
+import copy
+import datetime
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
 import tomllib
 import webbrowser
-import httpx
-import copy
-import stat
-import datetime
-import sqlite3
-import asyncio
-import vdf
-from enum import Enum, auto, StrEnum
-from urllib.parse import quote
-from dataclasses import (
-    asdict, 
-    dataclass, 
-    field
-    )
-from pathlib import Path
-from hashlib import sha1
 from asyncio import to_thread
-from typing import Literal
-from typing import TypedDict
+from dataclasses import asdict, dataclass, field
+from enum import Enum, StrEnum, auto
+from hashlib import sha1
+from pathlib import Path
+from typing import ClassVar, Literal, TypedDict
+from urllib.parse import quote
+
+import httpx
+import vdf
 from PIL import Image
 from textual import work
-from textual_fspicker import FileOpen
-from textual.app import (
-    App, 
-    ComposeResult
-)
+from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import (
-    Horizontal, 
-    Vertical, 
-    Grid, 
-    Container
-)
-from textual_image.widget import AutoImage
+from textual.containers import Container, Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
-from rich.markup import escape
 from textual.widgets import (
     Button,
     Checkbox,
@@ -58,11 +42,13 @@ from textual.widgets import (
     Header,
     Input,
     Label,
-    TextArea,
     ListItem,
     ListView,
     Static,
+    TextArea,
 )
+from textual_fspicker import FileOpen
+from textual_image.widget import AutoImage
 
 try:
     import tomli_w
@@ -78,10 +64,11 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 7
+DATABASE_SCHEMA_VERSION = 8
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
-MIN_GAME_SIZE = 0 #1024 * 1024  # 1 MB
+MIN_GAME_SIZE = 0  # 1024 * 1024  # 1 MB
+LOGGING_ENABLED = False
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,7 +76,7 @@ CACHE_DIR = Path.home() / ".cache" / "game_archiver"
 ICON_CACHE = CACHE_DIR / "icons"
 IMAGE_CACHE = CACHE_DIR / "steamgriddb" / "url"
 THUMB_CACHE = CACHE_DIR / "steamgriddb" / "thumbs"
-#STEAM_ART_CACHE = CACHE_DIR / "steam"
+# STEAM_ART_CACHE = CACHE_DIR / "steam"
 
 DATA_DIR = Path.home() / ".local" / "share" / "game_archiver"
 STEAM_ICON_DIR = DATA_DIR / "icons"
@@ -98,11 +85,13 @@ ICON_CACHE.mkdir(parents=True, exist_ok=True)
 IMAGE_CACHE.mkdir(parents=True, exist_ok=True)
 THUMB_CACHE.mkdir(parents=True, exist_ok=True)
 STEAM_ICON_DIR.mkdir(parents=True, exist_ok=True)
-#STEAM_ART_CACHE.mkdir(parents=True, exist_ok=True)
+# STEAM_ART_CACHE.mkdir(parents=True, exist_ok=True)
 
 STEAM_STORE_CDN = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"
 STEAM_ICON_CDN = "https://shared.fastly.steamstatic.com/community_assets/images/apps/"
-STEAM_CLIENTICON_CDN = "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
+STEAM_CLIENTICON_CDN = (
+    "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
+)
 
 
 LOCAL_SHARED_DIR = Path.home() / "Games" / "shared"
@@ -110,9 +99,10 @@ REMOTE_SHARED_DIR = Path("/mnt/media/pool/Games/shared")
 REMOTE_ARCHIVED_DIR = Path("/mnt/media/pool/Games/archived")
 POOL_DIR = Path("/mnt/media/pool")
 PROTON = (
-    Path.home()
-    / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
+    Path.home() / ".local/share/Steam/steamapps/common/Proton - Experimental/proton"
 )
+
+
 class ImageExtension(StrEnum):
     PNG = ".png"
     JPG = ".jpg"
@@ -121,6 +111,8 @@ class ImageExtension(StrEnum):
     APNG = ".apng"
     ICO = ".ico"
     EXE = ".exe"
+
+
 ARTWORK_EXTENSIONS = (
     ImageExtension.PNG,
     ImageExtension.JPG,
@@ -133,6 +125,8 @@ RENAME_TO_IMAGE_EXTENSIONS = {
     ImageExtension.APNG: ImageExtension.PNG,
     ImageExtension.WEBP: ImageExtension.PNG,
 }
+
+
 def correct_image_extension(path: Path) -> Path | None:
     if not path:
         return path
@@ -140,9 +134,9 @@ def correct_image_extension(path: Path) -> Path | None:
     if ext in RENAME_TO_IMAGE_EXTENSIONS:
         return path.with_suffix(RENAME_TO_IMAGE_EXTENSIONS[ext])
     return path
-ICON_FALLBACK = Path(
-    "/usr/share/icons/hicolor/256x256/apps/steam" + ImageExtension.PNG
-)
+
+
+ICON_FALLBACK = Path("/usr/share/icons/hicolor/256x256/apps/steam" + ImageExtension.PNG)
 BAD_LAUNCHER_NAMES = (
     "unins",
     "uninstall",
@@ -173,15 +167,7 @@ IGNORE_DIRS = {
     "__pycache__",
 }
 
-LAUNCHER_EXTS = (
-    ".sh",
-    ".AppImage",
-    ".x86_64",
-    ".exe",
-    ".swf",
-    ".apk"
-)
-
+LAUNCHER_EXTS = (".sh", ".AppImage", ".x86_64", ".exe", ".swf", ".apk")
 
 
 class ArtworkType(StrEnum):
@@ -192,6 +178,7 @@ class ArtworkType(StrEnum):
     LOGO = "logo"
     ICON = "icon"
     CANCEL = "cancel"
+
 
 class SteamArtworkAuthor(TypedDict):
     name: str
@@ -209,6 +196,7 @@ class SteamArtwork(TypedDict):
     style: str
     source: str
 
+
 suffixes = {
     ArtworkType.GRID_PORTRAIT: "p",
     ArtworkType.GRID_LANDSCAPE: "",
@@ -220,6 +208,7 @@ suffixes = {
 
 Filter = Literal["false", "true", "any"]
 
+
 @dataclass(slots=True)
 class SearchOptions:
     nsfw: Filter = "any"
@@ -227,16 +216,12 @@ class SearchOptions:
     epilepsy: Filter = "any"
 
     def params(self) -> dict[str, str]:
-        return {
-            k: v
-            for k, v in asdict(self).items()
-            if v is not None
-        }
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
 
 # ============================================================
 # SQLite
 # ============================================================
-
 
 
 def get_db() -> sqlite3.Connection:
@@ -261,8 +246,6 @@ def create_database(db: sqlite3.Connection):
             file_count INTEGER NOT NULL DEFAULT 0,
             last_played REAL NOT NULL DEFAULT 0,
             launcher TEXT,
-            icon TEXT,
-            icon_manual INTEGER NOT NULL DEFAULT 0,
             gamescope_enabled BOOLEAN NOT NULL DEFAULT 1
         )
         """
@@ -345,6 +328,7 @@ def create_database(db: sqlite3.Connection):
             artwork_type TEXT NOT NULL,
             artwork_id INTEGER NOT NULL,
             downloaded_path TEXT,
+            installed_path TEXT,
 
             PRIMARY KEY (game_id, artwork_type),
 
@@ -380,9 +364,7 @@ def create_database(db: sqlite3.Connection):
 
 
 def get_schema_version(db: sqlite3.Connection) -> int:
-    row = db.execute(
-        "PRAGMA user_version"
-    ).fetchone()
+    row = db.execute("PRAGMA user_version").fetchone()
 
     return row[0]
 
@@ -424,24 +406,25 @@ def migrate_database(
         set_schema_version(db, 4)
         current_version = 4
 
-
     if current_version < 5:
         migrate_to_v5(db)
         set_schema_version(db, 5)
         current_version = 5
-
 
     if current_version < 6:
         migrate_to_v6(db)
         set_schema_version(db, 6)
         current_version = 6
 
-
     if current_version < 7:
         migrate_to_v7(db)
         set_schema_version(db, 7)
         current_version = 7
 
+    if current_version < 8:
+        migrate_to_v8(db)
+        set_schema_version(db, 8)
+        current_version = 8
     # Future migrations go here
 
 
@@ -455,6 +438,7 @@ def init_database():
         )
 
         db.commit()
+
 
 def migrate_to_v2(db: sqlite3.Connection):
     db.executescript(
@@ -496,6 +480,7 @@ def migrate_to_v2(db: sqlite3.Connection):
         """
     )
 
+
 def migrate_to_v3(db: sqlite3.Connection):
     db.execute(
         """
@@ -503,6 +488,7 @@ def migrate_to_v3(db: sqlite3.Connection):
         ADD COLUMN icon_manual INTEGER NOT NULL DEFAULT 0
         """
     )
+
 
 def migrate_to_v4(db: sqlite3.Connection):
     db.execute(
@@ -638,6 +624,7 @@ def migrate_to_v4(db: sqlite3.Connection):
         """
     )
 
+
 def migrate_to_v5(db: sqlite3.Connection) -> None:
     db.execute("""
         CREATE TABLE selected_artwork_v5 (
@@ -673,6 +660,7 @@ def migrate_to_v5(db: sqlite3.Connection) -> None:
 
     db.execute("DROP TABLE selected_artwork")
     db.execute("ALTER TABLE selected_artwork_v5 RENAME TO selected_artwork")
+
 
 def migrate_to_v6(db: sqlite3.Connection) -> None:
     db.execute(
@@ -716,20 +704,218 @@ def migrate_to_v6(db: sqlite3.Connection) -> None:
         """
     )
 
+
 def migrate_to_v7(db: sqlite3.Connection):
     db.execute("""
         ALTER TABLE games
         ADD COLUMN gamescope_enabled BOOLEAN NOT NULL DEFAULT 1
     """)
 
+
+def migrate_to_v8(db: sqlite3.Connection) -> None:
+    def drop_column_if_exists(
+        table: str,
+        column: str,
+    ) -> None:
+        columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+
+        if column in columns:
+            db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(selected_artwork)")}
+
+    if "installed_path" not in columns:
+        db.execute("""
+            ALTER TABLE selected_artwork
+            ADD COLUMN installed_path TEXT
+        """)
+
+    rows = db.execute("""
+        SELECT
+            g.id,
+            g.name,
+            g.launcher,
+            g.icon,
+            g.icon_manual,
+            s.steam_entry,
+            sa.artwork_id AS selected_artwork_id,
+            sa.downloaded_path
+        FROM games g
+        LEFT JOIN steam_games s
+            ON s.game_id = g.id
+        LEFT JOIN selected_artwork sa
+            ON sa.game_id = g.id
+           AND sa.artwork_type = 'ICON'
+    """).fetchall()
+
+    for row in rows:
+        game_id = row["id"]
+
+        icon_path = Path(row["icon"]) if row["icon"] else None
+
+        # Determine the Steam AppID.
+        steam_entry = json.loads(row["steam_entry"]) if row["steam_entry"] else None
+
+        if steam_entry is not None:
+            appid = steam_entry["appid"]
+            if not isinstance(appid, str):
+                appid = str(appid & 0xFFFFFFFF)
+
+        elif row["launcher"]:
+            appid = generate_appid(
+                Path(row["launcher"]),
+                row["name"],
+            )
+
+        else:
+            appid = None
+
+        # Find existing Steam-installed icon files.
+        installed_paths = []
+
+        if appid is not None:
+            for extension in ARTWORK_EXTENSIONS:
+                path = STEAM_ICON_DIR / f"{appid}{extension}"
+
+                if path.is_file():
+                    installed_paths.append(path)
+
+        # Prefer the existing selection's downloaded path.
+        # Fall back to the legacy icon if necessary.
+        downloaded_path = (
+            Path(row["downloaded_path"]) if row["downloaded_path"] else icon_path
+        )
+
+        installed_path = None
+
+        if (
+            icon_path is not None
+            and icon_path.is_file()
+            and icon_path.suffix.lower() != ImageExtension.EXE
+        ):
+            # A non-EXE legacy icon path means the icon was already installed.
+            installed_path = icon_path
+
+        elif downloaded_path is not None:
+            # EXE-derived icons need to be matched against Steam's installed icon.
+            installed_path = match_installed_artwork(
+                downloaded_path,
+                installed_paths,
+            )
+
+        # Preserve existing selections.
+        if row["selected_artwork_id"] is not None:
+            if installed_path is not None:
+                db.execute(
+                    """
+                    UPDATE selected_artwork
+                    SET installed_path = ?
+                    WHERE game_id = ?
+                      AND artwork_type = 'ICON'
+                """,
+                    (str(installed_path), game_id),
+                )
+
+            continue
+
+        # Nothing to migrate if there is no legacy icon.
+        if icon_path is None:
+            continue
+
+        asset = {
+            "id": str(icon_path),
+            "path": icon_path,
+            "url": icon_path.resolve().as_uri(),
+            "name": icon_path.name,
+            "source": "local",
+            "kind": icon_path.suffix.lower(),
+        }
+
+        data = json.dumps(
+            asset,
+            indent=2,
+            sort_keys=True,
+            default=json_default,
+        )
+
+        # Reuse an existing local ICON asset if one already exists.
+        existing = db.execute(
+            """
+            SELECT id
+            FROM artwork
+            WHERE type = 'ICON'
+              AND source = 'local'
+              AND external_id = ?
+            LIMIT 1
+        """,
+            (str(icon_path),),
+        ).fetchone()
+
+        if existing is not None:
+            artwork_id = existing["id"]
+
+            db.execute(
+                """
+                UPDATE artwork
+                SET url = ?, data = ?
+                WHERE id = ?
+            """,
+                (asset["url"], data, artwork_id),
+            )
+
+        else:
+            cursor = db.execute(
+                """
+                INSERT INTO artwork (
+                    type, source, external_id, url, data
+                )
+                VALUES ('ICON', 'local', ?, ?, ?)
+            """,
+                (str(icon_path), asset["url"], data),
+            )
+
+            artwork_id = cursor.lastrowid
+
+        db.execute(
+            """
+            INSERT OR IGNORE INTO game_artwork (
+                game_id, artwork_id
+            )
+            VALUES (?, ?)
+        """,
+            (game_id, artwork_id),
+        )
+
+        db.execute(
+            """
+            INSERT INTO selected_artwork (
+                game_id,
+                artwork_type,
+                artwork_id,
+                downloaded_path,
+                installed_path
+            )
+            VALUES (?, 'ICON', ?, ?, ?)
+        """,
+            (
+                game_id,
+                artwork_id,
+                str(icon_path),
+                str(installed_path) if installed_path else None,
+            ),
+        )
+
+    # These columns are no longer needed after the artwork migration.
+    drop_column_if_exists("games", "icon_manual")
+    drop_column_if_exists("games", "icon")
+
+
 def save_game(
     db: sqlite3.Connection,
     game: Game,
 ):
     if game.path is None:
-        raise RuntimeError(
-            f"Cannot save game without a path: {game.name}"
-        )
+        raise RuntimeError(f"Cannot save game without a path: {game.name}")
 
     path = str(game.path)
 
@@ -743,11 +929,9 @@ def save_game(
             file_count,
             last_played,
             launcher,
-            icon,
-            icon_manual,
             gamescope_enabled
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
             size = excluded.size,
@@ -755,8 +939,6 @@ def save_game(
             file_count = excluded.file_count,
             last_played = excluded.last_played,
             launcher = excluded.launcher,
-            icon = excluded.icon,
-            icon_manual = excluded.icon_manual,
             gamescope_enabled = excluded.gamescope_enabled
         """,
         (
@@ -766,15 +948,9 @@ def save_game(
             game.mtime,
             game.file_count,
             game.last_played,
-            str(game.launcher)
-            if game.launcher is not None
-            else None,
-            str(game.icon)
-            if game.icon is not None
-            else None,
-            int(game.icon_manual),
+            str(game.launcher) if game.launcher is not None else None,
             int(game.gamescope_enabled),
-        )
+        ),
     )
 
     row = db.execute(
@@ -783,9 +959,7 @@ def save_game(
     ).fetchone()
 
     if row is None:
-        raise RuntimeError(
-            f"Failed to retrieve database ID for game: {path}"
-        )
+        raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
 
     game_id = row["id"]
 
@@ -793,6 +967,7 @@ def save_game(
     save_steamgriddb(db, game_id, game)
     debug_log(f"DEBUG: saving artwork for {game.name}")
     save_steamgriddb_artwork(db, game_id, game)
+
 
 def save_steam(
     db: sqlite3.Connection,
@@ -854,6 +1029,7 @@ def save_steam(
             int(game.duplicate_steam),
         ),
     )
+
 
 def save_steamgriddb(
     db: sqlite3.Connection,
@@ -920,6 +1096,7 @@ def save_steamgriddb(
         ),
     )
 
+
 def save_steamgriddb_artwork(
     db: sqlite3.Connection,
     game_id: int,
@@ -938,6 +1115,7 @@ def save_steamgriddb_artwork(
             if isinstance(artwork_type, ArtworkType)
             else str(artwork_type)
         )
+
     def persist_artwork(
         artwork_type: ArtworkType,
         asset: dict,
@@ -1132,33 +1310,37 @@ def save_steamgriddb_artwork(
             try:
                 artwork_type = ArtworkType(artwork_type)
             except ValueError as exc:
-                raise ValueError(
-                    f"Unknown artwork type: {artwork_type!r}"
-                ) from exc
+                raise ValueError(f"Unknown artwork type: {artwork_type!r}") from exc
 
         artwork_id = persist_artwork(artwork_type, asset)
         downloaded_path = selected_info.get("downloaded_path")
+        installed_path = selected_info.get("installed_path")
 
         db.execute(
             """
             INSERT INTO selected_artwork (
-                game_id, artwork_type, artwork_id, downloaded_path
+                game_id,
+                artwork_type,
+                artwork_id,
+                downloaded_path,
+                installed_path
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(game_id, artwork_type)
             DO UPDATE SET
                 artwork_id = excluded.artwork_id,
-                downloaded_path = excluded.downloaded_path
+                downloaded_path = excluded.downloaded_path,
+                installed_path = excluded.installed_path
             """,
             (
                 game_id,
                 artwork_type_name,
                 artwork_id,
-                str(downloaded_path)
-                if downloaded_path is not None
-                else None,
+                str(downloaded_path) if downloaded_path is not None else None,
+                str(installed_path) if installed_path is not None else None,
             ),
         )
+
 
 def load_selected_artwork(
     db: sqlite3.Connection,
@@ -1178,7 +1360,8 @@ def load_selected_artwork(
         SELECT
             sa.artwork_type,
             a.data,
-            sa.downloaded_path
+            sa.downloaded_path,
+            sa.installed_path
         FROM selected_artwork AS sa
         JOIN artwork AS a
             ON a.id = sa.artwork_id
@@ -1199,20 +1382,25 @@ def load_selected_artwork(
             continue
 
         # Restore local asset paths after JSON deserialization.
-        if artwork.get("source") == "local":
-            if artwork.get("path") is not None:
-                artwork["path"] = Path(artwork["path"])
+        if artwork.get("source") == "local" and artwork.get("path") is not None:
+            artwork["path"] = Path(artwork["path"])
 
         downloaded_path = row["downloaded_path"]
         if downloaded_path is not None:
             downloaded_path = Path(downloaded_path)
 
+        installed_path = row["installed_path"]
+        if installed_path is not None:
+            installed_path = Path(installed_path)
+
         selected[artwork_type] = {
             "asset": artwork,
             "downloaded_path": downloaded_path,
+            "installed_path": installed_path,
         }
 
     return selected
+
 
 def load_steamgriddb_artwork(
     db: sqlite3.Connection,
@@ -1260,6 +1448,112 @@ def load_steamgriddb_artwork(
 # JSON to SQLite
 # ============================================================
 
+
+def migrate_legacy_icon(
+    db: sqlite3.Connection,
+    game_id: int,
+    game_data: dict,
+) -> None:
+    icon = game_data.get("icon")
+
+    if not icon:
+        return
+
+    # Preserve an ICON selection already imported from SteamGridDB.
+    existing = db.execute(
+        """
+        SELECT 1
+        FROM selected_artwork
+        WHERE game_id = ?
+          AND artwork_type = 'ICON'
+        """,
+        (game_id,),
+    ).fetchone()
+
+    if existing is not None:
+        return
+
+    icon_path = Path(icon)
+
+    asset = {
+        "id": str(icon_path),
+        "path": icon_path,
+        "url": icon_path.resolve().as_uri(),
+        "name": icon_path.name,
+        "source": "local",
+        "kind": icon_path.suffix.lower(),
+    }
+
+    data = json.dumps(
+        asset,
+        indent=2,
+        sort_keys=True,
+        default=json_default,
+    )
+
+    existing = db.execute(
+        """
+        SELECT id
+        FROM artwork
+        WHERE type = 'ICON'
+          AND source = 'local'
+          AND external_id = ?
+        LIMIT 1
+        """,
+        (str(icon_path),),
+    ).fetchone()
+
+    if existing is not None:
+        artwork_id = existing["id"]
+    else:
+        cursor = db.execute(
+            """
+            INSERT INTO artwork (
+                type, source, external_id, url, data
+            )
+            VALUES ('ICON', 'local', ?, ?, ?)
+            """,
+            (str(icon_path), asset["url"], data),
+        )
+        artwork_id = cursor.lastrowid
+
+    db.execute(
+        """
+        INSERT OR IGNORE INTO game_artwork (
+            game_id, artwork_id
+        )
+        VALUES (?, ?)
+        """,
+        (game_id, artwork_id),
+    )
+
+    # Preserve the old installed path when it is an existing image.
+    installed_path = (
+        icon_path
+        if (icon_path.is_file() and icon_path.suffix.lower() != ImageExtension.EXE)
+        else None
+    )
+
+    db.execute(
+        """
+        INSERT INTO selected_artwork (
+            game_id,
+            artwork_type,
+            artwork_id,
+            downloaded_path,
+            installed_path
+        )
+        VALUES (?, 'ICON', ?, ?, ?)
+        """,
+        (
+            game_id,
+            artwork_id,
+            str(icon_path),
+            str(installed_path) if installed_path else None,
+        ),
+    )
+
+
 def migrate_game_data():
     if not GAME_DATA.exists():
         return
@@ -1275,6 +1569,7 @@ def migrate_game_data():
             migrate_game(db, game_data)
 
         db.commit()
+
 
 def migrate_game(
     db: sqlite3.Connection,
@@ -1292,20 +1587,16 @@ def migrate_game(
             mtime,
             file_count,
             last_played,
-            launcher,
-            icon,
-            icon_manual
+            launcher
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             name = excluded.name,
             size = excluded.size,
             mtime = excluded.mtime,
             file_count = excluded.file_count,
             last_played = excluded.last_played,
-            launcher = excluded.launcher,
-            icon = excluded.icon,
-            icon_manual = excluded.icon_manual
+            launcher = excluded.launcher
         """,
         (
             path,
@@ -1315,12 +1606,8 @@ def migrate_game(
             game_data.get("file_count", 0),
             game_data.get("last_played", 0),
             str(game_data["launcher"])
-                if game_data.get("launcher") is not None
-                else None,
-            str(game_data["icon"])
-                if game_data.get("icon") is not None
-                else None,
-            int(game_data.get("icon_manual", False))
+            if game_data.get("launcher") is not None
+            else None,
         ),
     )
 
@@ -1330,14 +1617,14 @@ def migrate_game(
     ).fetchone()
 
     if row is None:
-        raise RuntimeError(
-            f"Failed to retrieve database ID for game: {path}"
-        )
+        raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
 
     game_id = row["id"]
 
     migrate_steam(db, game_id, game_data)
     migrate_steamgriddb(db, game_id, game_data)
+    migrate_legacy_icon(db, game_id, game_data)
+
 
 def migrate_steam(
     db: sqlite3.Connection,
@@ -1383,13 +1670,14 @@ def migrate_steam(
                 sort_keys=True,
                 default=json_default,
             )
-                if game_data.get("steam_entry") is not None
-                else None,
+            if game_data.get("steam_entry") is not None
+            else None,
             int(game_data.get("in_steam", False)),
             int(game_data.get("steam_broken", False)),
             int(game_data.get("duplicate_steam", False)),
         ),
     )
+
 
 def migrate_steamgriddb(
     db: sqlite3.Connection,
@@ -1428,17 +1716,26 @@ def migrate_steamgriddb(
             game.get("id") if game else None,
             game.get("name") if game else None,
             sgdb.get("search"),
-            json.dumps(game, indent=2, sort_keys=True, default=json_default) if game is not None else None,
-            json.dumps(sgdb.get("steam_platform_data"), indent=2, sort_keys=True, default=json_default)
-                if sgdb.get("steam_platform_data") is not None
-                else None,
+            json.dumps(game, indent=2, sort_keys=True, default=json_default)
+            if game is not None
+            else None,
+            json.dumps(
+                sgdb.get("steam_platform_data"),
+                indent=2,
+                sort_keys=True,
+                default=json_default,
+            )
+            if sgdb.get("steam_platform_data") is not None
+            else None,
             sgdb.get("cached"),
         ),
     )
 
+
 # ============================================================
 # MODEL
 # ============================================================
+
 
 @dataclass
 class LaunchInfo:
@@ -1446,7 +1743,8 @@ class LaunchInfo:
     cwd: Path
     env: dict[str, str]
 
-def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
+
+def get_launch_info(game: Game, *, for_steam: bool = False) -> LaunchInfo:
     def wrap_gamescope(cmd: list[str]) -> list[str]:
         if not game.gamescope_enabled:
             return cmd
@@ -1460,16 +1758,21 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
         return [
             "gamescope",
             "-f",
-            "-w", "1920",
-            "-h", "1080",
-            "-W", "1920",
-            "-H", "1080",
+            "-w",
+            "1920",
+            "-h",
+            "1080",
+            "-W",
+            "1920",
+            "-H",
+            "1080",
             "--force-grab-cursor",
-            "--backend", "sdl",
+            "--backend",
+            "sdl",
             "--",
             *cmd,
         ]
-    
+
     if game.launcher is None:
         game.launcher = find_launcher(launch_path(game))
 
@@ -1480,34 +1783,28 @@ def get_launch_info(game: Game,*, for_steam: bool = False) -> LaunchInfo:
     env = os.environ.copy()
     env["SDL_VIDEODRIVER"] = "x11"
 
-
     if launcher.suffix.casefold() == ".sh":
         if for_steam:
             cmd = [str(launcher)]
         else:
-            cmd = wrap_gamescope(["bash", str(launcher)])           
-
+            cmd = wrap_gamescope(["bash", str(launcher)])
 
     elif launcher.suffix == ".swf":
         cmd = wrap_gamescope(["ruffle", str(launcher)])
-        
+
     elif launcher.suffix == ".apk" and for_steam == False:
         cmd = [
             "waydroid",
             "app",
             "install",
             str(launcher),
-            ]
+        ]
 
     elif launcher.suffix == ".exe":
         if for_steam:
             cmd = [str(launcher)]
         else:
-            compat = (
-                Path.home()
-                / ".local/share/game_archiver/compatdata"
-                / game.name
-            )
+            compat = Path.home() / ".local/share/game_archiver/compatdata" / game.name
 
             compat.mkdir(parents=True, exist_ok=True)
 
@@ -1574,7 +1871,7 @@ exec {shlex.quote(str(PROTON))} run {shlex.quote(str(launcher))}
                 "-lc",
                 shlex.join(wrap_gamescope(["bash", "-c", bash_cmd])),
             ]
-    
+
     else:
         cmd = [str(launcher)]
 
@@ -1584,11 +1881,13 @@ exec {shlex.quote(str(PROTON))} run {shlex.quote(str(launcher))}
         env=env,
     )
 
+
 class SteamGridDBAction(Enum):
     BROWSE = auto()
     DOWNLOAD = auto()
     CHANGE = auto()
     CANCEL = auto()
+
 
 @dataclass
 class Game:
@@ -1600,8 +1899,6 @@ class Game:
     last_played: float = 0.0
     selected: bool = False
     launcher: Path | None = None
-    icon: Path | None = None
-    icon_manual: bool = False
     steam_key: str | None = None
     steam_entry: dict | None = None
     in_steam: bool = False
@@ -1611,15 +1908,200 @@ class Game:
     gamescope_enabled: bool = True
 
 
-
 # ============================================================
 # HELPERS
 # ============================================================
+def match_installed_artwork(
+    downloaded_path: Path,
+    installed_paths: list[Path],
+) -> Path | None:
+    expected_path = correct_image_extension(downloaded_path)
+
+    if expected_path is None or not expected_path.is_file():
+        return None
+
+    expected_suffix = expected_path.suffix.lower()
+    expected_size = expected_path.stat().st_size
+
+    matches = [
+        path
+        for path in installed_paths
+        if path.suffix.lower() == expected_suffix
+        and path.stat().st_size == expected_size
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if not matches:
+        return None
+
+    # Only hash when the original downloaded format matches
+    # the installed format. Converted formats cannot be compared
+    # directly against their original source.
+    if downloaded_path.suffix.lower() != expected_suffix:
+        return None
+
+    expected_hash = hashlib.sha256(downloaded_path.read_bytes()).digest()
+
+    return next(
+        (
+            path
+            for path in matches
+            if hashlib.sha256(path.read_bytes()).digest() == expected_hash
+        ),
+        None,
+    )
+
+
+def update_artwork_paths_for_game(
+    game: Game,
+    old_path: Path,
+    new_path: Path,
+) -> None:
+    if game.steamgriddb is None:
+        return
+
+    # Shared -> Archived
+    if old_path.is_relative_to(REMOTE_SHARED_DIR):
+        path_mappings = [
+            (
+                REMOTE_SHARED_DIR / old_path.name,
+                new_path,
+            ),
+            (
+                LOCAL_SHARED_DIR / old_path.name,
+                new_path,
+            ),
+        ]
+
+    # Archived -> Shared
+    elif old_path.is_relative_to(REMOTE_ARCHIVED_DIR):
+        path_mappings = [
+            (
+                old_path,
+                LOCAL_SHARED_DIR / old_path.name,
+            ),
+        ]
+
+    else:
+        return
+
+    art = game.steamgriddb.get("art", {})
+    selected = game.steamgriddb.get("selected", {})
+
+    # Update all artwork candidates.
+    for assets in art.values():
+        for asset in assets:
+            update_artwork_paths(asset, path_mappings)
+
+    # Update selected artwork and its nested asset.
+    for selected_info in selected.values():
+        if selected_info is None:
+            continue
+
+        update_artwork_paths(selected_info, path_mappings)
+
+        asset = selected_info.get("asset")
+        if asset:
+            update_artwork_paths(asset, path_mappings)
+
+
+def update_artwork_paths(
+    artwork: dict | None,
+    path_mappings: list[tuple[Path, Path]],
+) -> None:
+    if artwork is None:
+        return
+
+    for key in ("path", "downloaded_path", "installed_path"):
+        value = artwork.get(key)
+
+        if value is None:
+            continue
+
+        value = Path(value)
+
+        for old_root, new_root in path_mappings:
+            try:
+                relative_path = value.relative_to(old_root)
+            except ValueError:
+                continue
+
+            artwork[key] = new_root / relative_path
+            break
+
+    value = artwork.get("url")
+
+    if value and value.startswith("file://"):
+        try:
+            path = Path.from_uri(value)
+        except ValueError:
+            return
+
+        for old_root, new_root in path_mappings:
+            try:
+                relative_path = path.relative_to(old_root)
+            except ValueError:
+                continue
+
+            artwork["url"] = (new_root / relative_path).as_uri()
+            break
+
+
+def get_selected_artwork(
+    game: Game,
+    artwork_type: ArtworkType,
+) -> dict | None:
+    if not game.steamgriddb:
+        return None
+    return (game.steamgriddb.get("selected") or {}).get(artwork_type)
+
+
+def get_selected_artwork_path(
+    game: Game,
+    artwork_type: ArtworkType,
+    installed_only: bool = False,
+) -> Path | None:
+    selected = get_selected_artwork(game, artwork_type)
+
+    if not selected:
+        return None
+
+    path = (
+        selected.get("installed_path")
+        if installed_only
+        else selected.get("installed_path") or selected.get("downloaded_path")
+    )
+
+    return Path(path) if path is not None else None
+
+
+def icon_candidate_to_artwork(
+    candidate: IconCandidate,
+) -> dict:
+    return {
+        "id": str(candidate.path),
+        "path": candidate.path,
+        "url": candidate.path.as_uri(),
+        "name": candidate.path.name,
+        "source": "local",
+        "style": "Detected",
+        "kind": candidate.kind,
+        "score": candidate.score,
+    }
+
+
+FIRSTLOG = True
+
 
 def debug_log(message: str):
-    # with open("/tmp/game_archiver-debug.log", "a") as f:
-    #     f.write(f"{message}\n")
-    pass
+    global FIRSTLOG
+
+    if LOGGING_ENABLED:
+        with open("/tmp/game_archiver-debug.log", "w" if FIRSTLOG else "a") as f:
+            f.write(f"{message}\n")
+        FIRSTLOG = False
 
 
 def add_selected_artwork_to_art(
@@ -1636,13 +2118,13 @@ def add_selected_artwork_to_art(
 
     # Avoid adding the same asset more than once.
     if any(
-        existing.get("id") == asset_id
-        and existing.get("source") == source
+        existing.get("id") == asset_id and existing.get("source") == source
         for existing in artwork_list
     ):
         return
 
     artwork_list.append(asset)
+
 
 def merge_games(existing, scanned):
     # Existing games by unique key
@@ -1659,6 +2141,7 @@ def merge_games(existing, scanned):
 
     sort_games(existing)
 
+
 def executable_files(root: Path) -> list[Path]:
     executables = []
 
@@ -1670,6 +2153,7 @@ def executable_files(root: Path) -> list[Path]:
         if exec_bits:
             executables.append(path.relative_to(root))
     return executables
+
 
 async def get_asset_file(client: SteamGridDBClient, art: dict) -> Path | None:
     if art.get("source") == "local":
@@ -1709,12 +2193,13 @@ def classify_grid(grid: dict) -> ArtworkType:
     ratio = width / height
 
     if ratio < 0.9:
-        return ArtworkType. GRID_PORTRAIT
+        return ArtworkType.GRID_PORTRAIT
 
     if ratio <= 1.1:
         return ArtworkType.GRID_SQUARE
 
     return ArtworkType.GRID_LANDSCAPE
+
 
 def preferred_language(images: dict[str, str]) -> tuple[str, str] | None:
     """
@@ -1753,6 +2238,7 @@ FALLBACKS = {
     },
 }
 
+
 def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | None]:
     """
     Returns:
@@ -1764,21 +2250,18 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
     """
 
     art = {
-        ArtworkType.GRID_PORTRAIT: None, 
-        ArtworkType.GRID_SQUARE: None, 
-        ArtworkType.GRID_LANDSCAPE: None, 
-        ArtworkType.HERO: None, 
-        ArtworkType.LOGO: None, 
+        ArtworkType.GRID_PORTRAIT: None,
+        ArtworkType.GRID_SQUARE: None,
+        ArtworkType.GRID_LANDSCAPE: None,
+        ArtworkType.HERO: None,
+        ArtworkType.LOGO: None,
         ArtworkType.ICON: None,
     }
 
     if not metadata:
         return art
 
-    app = (
-        metadata.get("external_platform_data", {})
-        .get("steam", [{}])[0]
-    )
+    app = metadata.get("external_platform_data", {}).get("steam", [{}])[0]
 
     appid = app.get("id")
     meta = app.get("metadata", {})
@@ -1797,15 +2280,11 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
         if steam_type == "icon":
             if clienticon:
                 urls.append(
-                    f"{STEAM_CLIENTICON_CDN}{appid}/"
-                    f"{clienticon}{ImageExtension.ICO}"
+                    f"{STEAM_CLIENTICON_CDN}{appid}/{clienticon}{ImageExtension.ICO}"
                 )
 
             if icon:
-                urls.append(
-                    f"{STEAM_ICON_CDN}{appid}/"
-                    f"{icon}{ImageExtension.JPG}"
-                )
+                urls.append(f"{STEAM_ICON_CDN}{appid}/{icon}{ImageExtension.JPG}")
 
             if not urls:
                 return None
@@ -1816,9 +2295,7 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
         else:
             if isinstance(data, dict):
                 thumb = preferred_language(data.get("image", data))
-                full = preferred_language(
-                    data.get("image2x", data.get("image", data))
-                )
+                full = preferred_language(data.get("image2x", data.get("image", data)))
 
                 if thumb is None:
                     return None
@@ -1860,12 +2337,14 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
             "style": "official",
             "source": "steam",
         }
+
     art[ArtworkType.GRID_PORTRAIT] = build("library_capsule")
     art[ArtworkType.GRID_LANDSCAPE] = build("header_image")
     art[ArtworkType.HERO] = build("library_hero")
     art[ArtworkType.LOGO] = build("library_logo")
     art[ArtworkType.ICON] = build("icon")
     return art
+
 
 def add_dict(parts: list[str], data: dict, prefix: str = ""):
     for key, value in data.items():
@@ -1890,6 +2369,7 @@ def add_dict(parts: list[str], data: dict, prefix: str = ""):
         else:
             parts.append(f"{name}: {value}")
 
+
 def launcher_signature(path: str | Path) -> tuple[str, str]:
     path = Path(normalize_exe(str(path)))
 
@@ -1900,6 +2380,7 @@ def launcher_signature(path: str | Path) -> tuple[str, str]:
         )
 
     return ("", path.name.casefold())
+
 
 def load_config() -> dict:
     if not CONFIG_FILE.exists():
@@ -1928,10 +2409,7 @@ async def get_vndb_api_token(app) -> str | None:
         choice = await app.push_screen_wait(
             OptionDialog(
                 title="VNDB",
-                message=(
-                    "A VNDB API token is required.\n\n"
-                    "Open the API token page?"
-                ),
+                message=("A VNDB API token is required.\n\nOpen the API token page?"),
                 options=[
                     ("Open", "open"),
                     ("Paste Token", "paste"),
@@ -1970,65 +2448,6 @@ async def get_vndb_api_token(app) -> str | None:
             save_config(config)
 
             return key
-
-async def get_steamgriddb_api_key(app) -> str | None:
-    config = load_config()
-
-    key = (
-        config.get("steamgriddb", {})
-        .get("api_key")
-    )
-
-    if key:
-        return key
-
-    while True:
-        choice = await app.push_screen_wait(
-            OptionDialog(
-                title="SteamGridDB",
-                message=(
-                    "SteamGridDB API key is required.\n\n"
-                    "Open the API page?"
-                ),
-                options=[
-                    ("Open", "open"),
-                    ("Paste Key", "paste"),
-                    ("Cancel", "cancel"),
-                ],
-            )
-        )
-
-        if choice == "cancel":
-            return None
-
-        if choice == "open":
-            webbrowser.open(
-                "https://www.steamgriddb.com/profile/preferences/api"
-            )
-            continue
-
-        if choice == "paste":
-            key = await app.push_screen_wait(
-                InputDialog(
-                    title="SteamGridDB API Key",
-                    prompt="Paste your API key:",
-                    placeholder="Paste API key...",
-                    password=False,
-                )
-            )
-
-            if not key or not key.value or not key.value.strip():
-                self.notify("API key cannot be empty.", severity="warning")
-                continue
-
-            config.setdefault(
-                "steamgriddb",
-                {},
-            )["api_key"] = key.value.strip()
-
-            save_config(config)
-
-            return key.value.strip()
 
 
 def extract_exe_icon(exe: Path) -> Path | None:
@@ -2113,6 +2532,7 @@ def steam_running() -> bool:
     except subprocess.CalledProcessError:
         return False
 
+
 @dataclass(order=True)
 class IconCandidate:
     score: tuple
@@ -2136,10 +2556,8 @@ def find_icons(root: Path) -> list[IconCandidate]:
             name = file.casefold()
 
             if path.suffix.casefold() == ImageExtension.EXE:
-                if (
-                    best_exe is None
-                    or launcher_score(path, root)
-                    < launcher_score(best_exe, root)
+                if best_exe is None or launcher_score(path, root) < launcher_score(
+                    best_exe, root
                 ):
                     best_exe = path
                 continue
@@ -2171,7 +2589,7 @@ def find_icons(root: Path) -> list[IconCandidate]:
             if name == "icon" + ImageExtension.PNG:
                 icons.append(
                     IconCandidate(
-                        score=(2,0),
+                        score=(2, 0),
                         path=path,
                         kind=ImageExtension.PNG,
                     )
@@ -2181,7 +2599,7 @@ def find_icons(root: Path) -> list[IconCandidate]:
             if name == "android-icon_foreground" + ImageExtension.PNG:
                 icons.append(
                     IconCandidate(
-                        score=(3,0),
+                        score=(3, 0),
                         path=path,
                         kind=ImageExtension.PNG,
                     )
@@ -2191,7 +2609,7 @@ def find_icons(root: Path) -> list[IconCandidate]:
             if path.suffix.casefold() == ImageExtension.ICO:
                 icons.append(
                     IconCandidate(
-                        score=(4,0),
+                        score=(4, 0),
                         path=path,
                         kind=ImageExtension.ICO,
                     )
@@ -2225,6 +2643,7 @@ def find_icon(root: Path) -> Path:
 
     return best.path
 
+
 def launcher_score(path: Path, root: Path):
     name = path.stem.casefold()
 
@@ -2245,67 +2664,26 @@ def launcher_score(path: Path, root: Path):
         natural_key(path.stem),
     )
 
+
 def game_appid(game: Game) -> str:
     if game.steam_entry is not None:
         appid = game.steam_entry["appid"]
         return appid if isinstance(appid, str) else str(appid & 0xFFFFFFFF)
-        #new generated app ids are str
-        #when read in the parser it's as an int
+        # new generated app ids are str
+        # when read in the parser it's as an int
 
     launcher = game.launcher
     assert launcher is not None
     return generate_appid(launcher, game.name)
 
-def make_shortcut(game: Game) -> dict:
-    launcher = game.launcher
-    assert launcher is not None
-
-    try:
-        info = get_launch_info(game, for_steam=True)
-    except Exception as e:
-        self.notify(str(e))
-        return
-
-    return {
-        "appid": generate_appid(launcher, game.name),
-        "AppName": game.name,
-        "Exe": f'"{info.cmd[0]}"',
-        "StartDir": f'"{info.cwd}"',
-        "icon": str(game.icon) if game.icon is not None else "",
-        "ShortcutPath": "",
-        "LaunchOptions": " ".join(
-            shlex.quote(arg)
-            for arg in info.cmd[1:]
-        ),
-        "IsHidden": 0,
-        "AllowDesktopConfig": 1,
-        "AllowOverlay": 1,
-        "OpenVR": 0,
-        "Devkit": 0,
-        "DevkitGameID": "",
-        "LastPlayTime": 0,
-        "tags": {
-            "0": "Non-Steam",
-        },
-    }
 
 def shortcuts_path(user: SteamUser) -> Path:
-    return (
-        STEAM_DIR
-        / "userdata"
-        / user.userdata_id
-        / "config"
-        / "shortcuts.vdf"
-    )
+    return STEAM_DIR / "userdata" / user.userdata_id / "config" / "shortcuts.vdf"
+
 
 def steam_grid_dir(user: SteamUser) -> Path:
-    return (
-        STEAM_DIR
-        / "userdata"
-        / user.userdata_id
-        / "config"
-        / "grid"
-    )
+    return STEAM_DIR / "userdata" / user.userdata_id / "config" / "grid"
+
 
 def load_shortcuts(user: SteamUser) -> dict:
     path = shortcuts_path(user)
@@ -2316,8 +2694,9 @@ def load_shortcuts(user: SteamUser) -> dict:
     try:
         with path.open("rb") as f:
             return vdf.binary_load(f)
-    except Exception:
+    except (OSError, ValueError):
         return {"shortcuts": {}}
+
 
 def save_shortcuts(user: SteamUser, data: dict):
     path = shortcuts_path(user)
@@ -2333,6 +2712,7 @@ def save_shortcuts(user: SteamUser, data: dict):
 
     tmp_path.replace(path)
 
+
 def normalize_exe(exe: str) -> str:
     exe = exe.strip()
 
@@ -2340,11 +2720,7 @@ def normalize_exe(exe: str) -> str:
         return ""
 
     # Strip surrounding quotes only.
-    if (
-        len(exe) >= 2
-        and exe[0] == exe[-1]
-        and exe[0] in "\"'"
-    ):
+    if len(exe) >= 2 and exe[0] == exe[-1] and exe[0] in "\"'":
         exe = exe[1:-1]
 
     if exe.startswith("env "):
@@ -2358,18 +2734,11 @@ def normalize_exe(exe: str) -> str:
 
     return exe
 
-def shortcut_target(entry: dict) -> str:
-    exe = normalize_exe(
-        entry.get("Exe")
-        or entry.get("exe")
-        or ""
-    )
 
-    launch_options = (
-        entry.get("LaunchOptions")
-        or entry.get("launchoptions")
-        or ""
-    )
+def shortcut_target(entry: dict) -> str:
+    exe = normalize_exe(entry.get("Exe") or entry.get("exe") or "")
+
+    launch_options = entry.get("LaunchOptions") or entry.get("launchoptions") or ""
 
     # Old shortcuts:
     # Exe = "bash"
@@ -2392,11 +2761,7 @@ def find_existing_shortcut(
     game: Game,
 ) -> str | None:
     target_name = game.name.casefold()
-    target_exe = (
-        normalize_exe(str(game.launcher))
-        if game.launcher
-        else ""
-    )
+    target_exe = normalize_exe(str(game.launcher)) if game.launcher else ""
 
     # First look for matching launcher
     for key, entry in entries.items():
@@ -2416,26 +2781,19 @@ def find_existing_shortcut(
 
     # Finally fall back to matching game name
     for key, entry in entries.items():
-        name = (
-            entry.get("AppName")
-            or entry.get("appname")
-            or ""
-        ).casefold()
+        name = (entry.get("AppName") or entry.get("appname") or "").casefold()
 
         if name == target_name:
             return key
 
     return None
 
+
 def generate_appid(exe: Path, stable_id: str) -> str:
-    crc = (
-        binascii.crc32(
-            (str(exe) + stable_id).encode("utf-8")
-        )
-        | 0x80000000
-    )
+    crc = binascii.crc32((str(exe) + stable_id).encode("utf-8")) | 0x80000000
 
     return str(crc & 0xFFFFFFFF)
+
 
 def fmt_time(ts: float) -> str:
     if not ts:
@@ -2446,13 +2804,13 @@ def fmt_time(ts: float) -> str:
         time.localtime(ts),
     )
 
+
 def natural_key(s: str):
     return [
-        int(part)
-        if part.isdigit()
-        else part.casefold()
+        int(part) if part.isdigit() else part.casefold()
         for part in re.split(r"(\d+)", s)
     ]
+
 
 def launch_path(game: Game) -> Path:
     # Only games in shared can have a local mirror.
@@ -2464,6 +2822,7 @@ def launch_path(game: Game) -> Path:
 
     return game.path
 
+
 def find_launchers(path: Path) -> list[Path]:
     if not path.is_dir():
         return []
@@ -2472,22 +2831,17 @@ def find_launchers(path: Path) -> list[Path]:
 
     for p in path.iterdir():
         if p.is_file():
-            if p.suffix in LAUNCHER_EXTS or (p.stat().st_mode & (
-                stat.S_IXUSR
-                | stat.S_IXGRP
-                | stat.S_IXOTH
-            )):
+            if p.suffix in LAUNCHER_EXTS or (
+                p.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            ):
                 launchers.append(p)
 
         elif p.is_dir():
             for child in p.iterdir():
                 if child.is_file() and (
                     child.suffix in LAUNCHER_EXTS
-                    or child.stat().st_mode & (
-                        stat.S_IXUSR
-                        | stat.S_IXGRP
-                        | stat.S_IXOTH
-                    )
+                    or child.stat().st_mode
+                    & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 ):
                     launchers.append(child)
 
@@ -2499,6 +2853,7 @@ def find_launchers(path: Path) -> list[Path]:
         key=lambda p: launcher_score(p, path),
     )
 
+
 def find_launcher(path: Path) -> Path | None:
     launchers = find_launchers(path)
 
@@ -2507,14 +2862,12 @@ def find_launcher(path: Path) -> Path | None:
 
     return launchers[0]
 
+
 def game_list_changed(
-        path: Path | None,
-        games: list[Game],
-    ) -> bool:
-    cached = {
-        (g.name, g.mtime)
-        for g in games
-    }
+    path: Path | None,
+    games: list[Game],
+) -> bool:
+    cached = {(g.name, g.mtime) for g in games}
 
     if path is None:
         return False
@@ -2529,9 +2882,9 @@ def game_list_changed(
         for p in path.iterdir()
         if p.is_dir()
     }
-    
 
     return current != cached
+
 
 def local_sync_status() -> str:
     if not LOCAL_SHARED_DIR.exists():
@@ -2541,17 +2894,9 @@ def local_sync_status() -> str:
         return "Remote storage offline"
 
     try:
-        remote = {
-            p.name
-            for p in REMOTE_SHARED_DIR.iterdir()
-            if p.is_dir()
-        }
+        remote = {p.name for p in REMOTE_SHARED_DIR.iterdir() if p.is_dir()}
 
-        local = {
-            p.name
-            for p in LOCAL_SHARED_DIR.iterdir()
-            if p.is_dir()
-        }
+        local = {p.name for p in LOCAL_SHARED_DIR.iterdir() if p.is_dir()}
     except FileNotFoundError:
         return "Remote storage offline"
 
@@ -2569,13 +2914,14 @@ def local_sync_status() -> str:
 
     return ", ".join(parts)
 
+
 def fmt_size(num: int) -> str:
-    gb = num / (1024 ** 3)
+    gb = num / (1024**3)
 
     if gb >= 1:
         return f"{gb:.1f} GB"
 
-    mb = num / (1024 ** 2)
+    mb = num / (1024**2)
 
     if mb >= 1:
         return f"{mb:.1f} MB"
@@ -2583,6 +2929,7 @@ def fmt_size(num: int) -> str:
         return ""
 
     return f"{num / 1024:.1f} KB"
+
 
 def dir_size(path: Path) -> int:
     try:
@@ -2597,7 +2944,7 @@ def dir_size(path: Path) -> int:
             ["du", "-sb", *exclude_args, str(target)],
             capture_output=True,
             text=True,
-            # do NOT use check=True
+            check=False,
         )
 
         if result.returncode != 0:
@@ -2612,16 +2959,14 @@ def dir_size(path: Path) -> int:
 
     except Exception as e:
         # Keep the message short and free of [ ] characters
-        raise RuntimeError(
-            f"dir_size failed for {path}: {type(e).__name__}"
-        ) from e
+        raise RuntimeError(f"dir_size failed for {path}: {type(e).__name__}") from e
+
 
 def latest_activity(path: Path) -> float:
     newest = 0.0
 
     try:
         for p in path.rglob("*"):
-
             if not p.is_file():
                 continue
 
@@ -2630,7 +2975,7 @@ def latest_activity(path: Path) -> float:
 
             try:
                 mtime = p.stat().st_mtime
-            except Exception:
+            except OSError:
                 continue
 
             # prioritize launcher-like files
@@ -2639,13 +2984,14 @@ def latest_activity(path: Path) -> float:
 
             newest = max(newest, mtime)
 
-    except Exception:
+    except OSError:
         pass
 
     if newest > 0:
         return newest
 
     return path.stat().st_mtime
+
 
 def scan_games(base: Path | None) -> list[Game]:
     games = []
@@ -2656,7 +3002,6 @@ def scan_games(base: Path | None) -> list[Game]:
     if not base.exists():
         return games
 
-
     for item in sorted(base.iterdir()):
         if not item.is_dir():
             continue
@@ -2665,16 +3010,13 @@ def scan_games(base: Path | None) -> list[Game]:
         if item.name.startswith(".") or item.name in IGNORE_DIRS:
             continue
 
-
-        game = Game(
-            name=item.name,
-            path=item
-        )
+        game = Game(name=item.name, path=item)
 
         games.append(game)
 
     sort_games(games)
     return games
+
 
 def sort_games(games: list[Game]):
     games.sort(
@@ -2689,8 +3031,8 @@ def sort_games(games: list[Game]):
 # UI
 # ============================================================
 
-class GameRow(ListItem):
 
+class GameRow(ListItem):
     def __init__(self, game: Game):
         self.game = game
 
@@ -2714,7 +3056,11 @@ class GameRow(ListItem):
 
     async def refresh_icon(self):
         """Update the row icon from the game's configured icon path."""
-        icon_path = self.game.icon
+        icon_path = get_selected_artwork_path(
+            self.game,
+            ArtworkType.ICON,
+            installed_only=True,
+        )
 
         if not icon_path:
             self.icon.image = None
@@ -2737,21 +3083,18 @@ class GameRow(ListItem):
             "Steam: Duplicate shortcut exists" if self.game.duplicate_steam else None,
             "Steam: Shortcut path is out of date" if self.game.steam_broken else None,
             "Steam: Shortcut is synchronized"
-                if self.game.in_steam
-                and not self.game.steam_broken
-                and not self.game.duplicate_steam
-                else None,
+            if self.game.in_steam
+            and not self.game.steam_broken
+            and not self.game.duplicate_steam
+            else None,
             f"Last Played: {fmt_time(self.game.last_played)}",
             f"Modified:    {fmt_time(self.game.mtime)}",
         ]
         if self.game.steam_entry:
-            parts.append(
-                f"Steam Exe: {self.game.steam_entry['Exe']}")
+            parts.append(f"Steam Exe: {self.game.steam_entry['Exe']}")
             launch_options = self.game.steam_entry.get("LaunchOptions", "")
             if launch_options:
-                parts.append(
-                    f"Steam LaunchOptions: {launch_options}"
-                )
+                parts.append(f"Steam LaunchOptions: {launch_options}")
             if self.game.steamgriddb:
                 sgdb_game = self.game.steamgriddb.get("game")
 
@@ -2778,13 +3121,10 @@ class GameRow(ListItem):
 
     def build_line(self) -> str:
 
-        #mark = "[*]" if self.game.selected else "[ ]"
+        # mark = "[*]" if self.game.selected else "[ ]"
         mark = "[🗸]" if self.game.selected else "[ ]"
 
-        date = time.strftime(
-            "%Y-%m-%d",
-            time.localtime(self.game.mtime)
-        )
+        date = time.strftime("%Y-%m-%d", time.localtime(self.game.mtime))
 
         size = fmt_size(self.game.size)
 
@@ -2809,30 +3149,22 @@ class GameRow(ListItem):
         else:
             sgdb = " "
 
-        return (
-            f"{mark} "
-            f"{self.game.name:<45.45} "
-            f"{size:>9} "
-            f"{date} "
-            f"{steam} "
-            f"{sgdb} "
-        )
+        return f"{mark} {self.game.name:<45.45} {size:>9} {date} {steam} {sgdb} "
 
     def refresh_row(self):
         asyncio.create_task(self.refresh_icon())
 
-        self.label.update(
-            self.build_line()
-        )
+        self.label.update(self.build_line())
 
         self.refresh_tooltip()
+
 
 # ============================================================
 # APP
 # ============================================================
 
-class GameArchiver(App):
 
+class GameArchiver(App):
     CSS = """
     Screen {
         layout: vertical;
@@ -2860,7 +3192,7 @@ class GameArchiver(App):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("tab", "switch_pane", "Switch"),
         Binding("space", "toggle", "Toggle"),
         Binding("a", "auto_select", "Auto"),
@@ -2911,8 +3243,6 @@ class GameArchiver(App):
                         g.file_count,
                         g.last_played,
                         g.launcher,
-                        g.icon,
-                        g.icon_manual,
                         g.gamescope_enabled,
 
                         s.steam_key,
@@ -2954,12 +3284,6 @@ class GameArchiver(App):
                             if row["launcher"] is not None
                             else None
                         ),
-                        icon=(
-                            Path(row["icon"])
-                            if row["icon"] is not None
-                            else None
-                        ),
-                        icon_manual=bool(row["icon_manual"]),
                         gamescope_enabled=bool(row["gamescope_enabled"]),
                     )
 
@@ -2982,8 +3306,7 @@ class GameArchiver(App):
                         or row["game_data"] is not None
                     )
                     has_selected_artwork = any(
-                        artwork is not None
-                        for artwork in selected.values()
+                        artwork is not None for artwork in selected.values()
                     )
 
                     if has_sgdb_data or has_selected_artwork:
@@ -3026,11 +3349,8 @@ class GameArchiver(App):
 
                 return shared_games, archived_games
 
-        except Exception as e:
-            self.notify(
-                f"Error loading game data: "
-                f"{type(e).__name__}: {e}"
-            )
+        except Exception as e:  # noqa: BLE001 - Prevent database loading errors from crashing startup.
+            self.notify(f"Error loading game data: {type(e).__name__}: {e}")
             return [], []
 
     def save_game_data(self):
@@ -3045,12 +3365,45 @@ class GameArchiver(App):
 
                 db.commit()
 
-        except Exception as e:              
-            self.notify(
-                f"Error saving game data: "
-                f"{type(e).__name__}: {e}"
-            )
+        except Exception as e:
+            self.notify(f"Error saving game data: {type(e).__name__}: {e}")
             raise
+
+    def make_shortcut(self, game: Game) -> dict:
+        launcher = game.launcher
+        assert launcher is not None
+
+        try:
+            info = get_launch_info(game, for_steam=True)
+        except RuntimeError as e:
+            self.notify(str(e))
+            return None
+
+        icon_path = get_selected_artwork_path(
+            game,
+            ArtworkType.ICON,
+            installed_only=True,
+        )
+
+        return {
+            "appid": generate_appid(launcher, game.name),
+            "AppName": game.name,
+            "Exe": f'"{info.cmd[0]}"',
+            "StartDir": f'"{info.cwd}"',
+            "icon": str(icon_path) if icon_path is not None else "",
+            "ShortcutPath": "",
+            "LaunchOptions": " ".join(shlex.quote(arg) for arg in info.cmd[1:]),
+            "IsHidden": 0,
+            "AllowDesktopConfig": 1,
+            "AllowOverlay": 1,
+            "OpenVR": 0,
+            "Devkit": 0,
+            "DevkitGameID": "",
+            "LastPlayTime": 0,
+            "tags": {
+                "0": "Non-Steam",
+            },
+        }
 
     async def sync_shortcut(self, game: Game) -> bool:
         # Don't touch duplicate shortcuts.
@@ -3073,7 +3426,7 @@ class GameArchiver(App):
         old_appid = game_appid(game) if key is not None else None
 
         # Build the shortcut as it should exist now.
-        desired = make_shortcut(game)
+        desired = self.make_shortcut(game)
 
         self.save_game_data()
 
@@ -3113,34 +3466,27 @@ class GameArchiver(App):
         game.in_steam = True
 
         return changed
+
     def is_scan_running(self) -> bool:
         if self.detecting_steam:
-            self.notify(
-                "Please wait for the Steam scan to finish."
-            )
+            self.notify("Please wait for the Steam scan to finish.")
             return True
         if self.computing_sizes:
-            self.notify(
-                "Please wait for the size scan to finish."
-            )
+            self.notify("Please wait for the size scan to finish.")
             return True
         if self.moving:
-            self.notify(
-                "Please wait for moving to complete."
-            )
+            self.notify("Please wait for moving to complete.")
             return True
         return False
 
     def can_modify_steam(self) -> bool:
-        
+
         if steam_running():
-            self.notify(
-                "Steam is running. Close Steam before modifying shortcuts."
-            )
+            self.notify("Steam is running. Close Steam before modifying shortcuts.")
             return False
         return not self.is_scan_running()
 
-    def update_game_steam_status(
+    async def update_game_steam_status(
         self,
         game: Game,
         entries: dict[str, dict],
@@ -3148,8 +3494,9 @@ class GameArchiver(App):
         if game.launcher is None:
             game.launcher = find_launcher(launch_path(game))
 
-        if game.icon is None and game.icon_manual is False:
-            game.icon = find_icon(launch_path(game))
+        if get_selected_artwork(game, ArtworkType.ICON) is None:
+            local_icons = await to_thread(find_icons, launch_path(game))
+            await self.add_detected_icons(game, local_icons)
 
         game.in_steam = False
         game.steam_broken = False
@@ -3188,7 +3535,7 @@ class GameArchiver(App):
             else:
                 game.steam_broken = True
 
-    def compute_steam_status(self):
+    async def compute_steam_status(self):
         user = self.current_steam_user()
 
         if user is None:
@@ -3202,18 +3549,14 @@ class GameArchiver(App):
             games += self.archived_games
 
         for game in games:
-            self.update_game_steam_status(
+            await self.update_game_steam_status(
                 game,
                 entries,
             )
+            self.refresh_game_row(game)
 
-            self.call_from_thread(
-                self.refresh_game_row,
-                game,
-            )
-
-        self.call_from_thread(self.steam_scan_finished)
-        self.call_from_thread(self.update_status)
+        self.steam_scan_finished()
+        self.update_status()
 
     def current_steam_user(self) -> SteamUser | None:
         if not self.steam_users:
@@ -3225,7 +3568,6 @@ class GameArchiver(App):
         self.sync_status = local_sync_status()
         self.update_status()
 
-
     def refresh_if_changed(self):
         if self.dialog_open:
             return
@@ -3235,12 +3577,8 @@ class GameArchiver(App):
         if self.is_scan_running():
             return
 
-        if (
-            game_list_changed(self.shared_dir(), self.shared_games)
-            or (
-                self.storage_online
-                and game_list_changed(ARCHIVED_DIR, self.archived_games)
-            )
+        if game_list_changed(self.shared_dir(), self.shared_games) or (
+            self.storage_online and game_list_changed(ARCHIVED_DIR, self.archived_games)
         ):
             self.action_refresh()
             return
@@ -3265,9 +3603,11 @@ class GameArchiver(App):
             if launcher is None:
                 continue
 
-            if (launcher != game.launcher):
+            if launcher != game.launcher:
                 game.launcher = launcher
-                game.icon = find_icon(launch_path(game))
+                if get_selected_artwork(game, ArtworkType.ICON) is None:
+                    local_icons = await to_thread(find_icons, launch_path(game))
+                    await self.add_detected_icons(game, local_icons)
 
                 if game.in_steam:
                     await self.sync_shortcut(game)
@@ -3287,7 +3627,6 @@ class GameArchiver(App):
 
         yield Footer(show_command_palette=False, compact=True)
 
-        
     def refresh_game_row(self, game: Game):
         for row in self.shared_view.children:
             if row.game is game:
@@ -3300,7 +3639,7 @@ class GameArchiver(App):
                 row.refresh_row()
                 self.update_status()
                 return
-                
+
     def update_game_info(self, game: Game):
         path = game.path
 
@@ -3313,15 +3652,12 @@ class GameArchiver(App):
 
         file_count = sum(1 for _ in os.scandir(path))
 
-        if (
-            game.mtime == mtime
-            and game.file_count == file_count
-        ):
+        if game.mtime == mtime and game.file_count == file_count:
             return
 
         try:
             game.size = dir_size(path)
-        except Exception as e:
+        except OSError as e:
             self.notify(
                 f"Error computing size for {path}: {type(e).__name__}",
                 severity="error",
@@ -3332,22 +3668,18 @@ class GameArchiver(App):
         game.mtime = mtime
         game.file_count = file_count
 
-    def compute_sizes(self):
+    async def compute_sizes(self):
         for games in (self.shared_games, self.archived_games):
             for game in games:
-                self.update_game_info(game)
-                self.call_from_thread(self.refresh_game_row, game)
+                await asyncio.to_thread(self.update_game_info, game)
+                self.refresh_game_row(game)
 
-            games[:] = [
-                game
-                for game in games
-                if game.size > MIN_GAME_SIZE
-            ]
+            games[:] = [game for game in games if game.size > MIN_GAME_SIZE]
 
-        self.call_from_thread(self.sizes_finished)
-        self.call_from_thread(self.update_status)
-        self.call_from_thread(self.refresh_views)
-        self.call_from_thread(self.save_game_data)
+        self.sizes_finished()
+        self.update_status()
+        self.refresh_views()
+        self.save_game_data()
 
     def sizes_finished(self):
         self.computing_sizes = False
@@ -3363,14 +3695,12 @@ class GameArchiver(App):
 
         self.computing_sizes = True
         self.run_worker(
-            self.compute_sizes,
-            thread=True,
+            self.compute_sizes(),
             name="compute-sizes",
         )
         self.detecting_steam = True
         self.run_worker(
-            self.compute_steam_status,
-            thread=True,
+            self.compute_steam_status(),
             name="compute-steam",
         )
         return True
@@ -3402,10 +3732,10 @@ class GameArchiver(App):
         self.archived_view.border_title = " Archived / Remote "
         self.verify_storage()
 
-        self.shared_games, self.archived_games = self.load_game_data()        
+        self.shared_games, self.archived_games = self.load_game_data()
 
         merge_games(self.shared_games, scan_games(self.shared_dir()))
-        
+
         if self.storage_online:
             merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
 
@@ -3417,7 +3747,7 @@ class GameArchiver(App):
         self.shared_view.focus()
 
         self.start_scan()
-        
+
         self.set_interval(
             SYNC_STATUS_INTERVAL_SEC,
             self.refresh_sync_status,
@@ -3455,7 +3785,7 @@ class GameArchiver(App):
 
     def refresh_views(self):
         selected_path = self.highlighted_game_path
-        
+
         archived_display = self.archived_games if self.storage_online else []
         self.archived_view.display = bool(archived_display)
 
@@ -3467,13 +3797,9 @@ class GameArchiver(App):
         self.shared_view.clear()
         self.archived_view.clear()
 
-        self.shared_view.extend(
-            [GameRow(g) for g in self.shared_games]
-        )
+        self.shared_view.extend([GameRow(g) for g in self.shared_games])
 
-        self.archived_view.extend(
-            [GameRow(g) for g in archived_display]
-        )
+        self.archived_view.extend([GameRow(g) for g in archived_display])
 
         self.update_status()
 
@@ -3494,15 +3820,11 @@ class GameArchiver(App):
 
         shared_size = sum(g.size for g in self.shared_games)
 
-        selected_archive = sum(
-            g.size for g in self.shared_games
-            if g.selected
-        ) or None
+        selected_archive = sum(g.size for g in self.shared_games if g.selected) or None
 
-        selected_restore = sum(
-            g.size for g in self.archived_games
-            if g.selected
-        ) or None
+        selected_restore = (
+            sum(g.size for g in self.archived_games if g.selected) or None
+        )
 
         steam = self.current_steam_user()
 
@@ -3510,7 +3832,6 @@ class GameArchiver(App):
             steam_text = "None"
         else:
             steam_text = steam.display_name
-
 
         scan_text = "Computing sizes..." if self.computing_sizes else ""
         steam_scan_text = "Detecting Steam..." if self.detecting_steam else ""
@@ -3528,13 +3849,15 @@ class GameArchiver(App):
         if self.storage_online:
             parts.append(f"Sync: {self.sync_status}")
         else:
-            parts.append(f"Remote Storage: Offline")
-        
-        parts.extend([
-            f"Steam: {steam_text}",
-            scan_text,
-            steam_scan_text,
-        ])
+            parts.append("Remote Storage: Offline")
+
+        parts.extend(
+            [
+                f"Steam: {steam_text}",
+                scan_text,
+                steam_scan_text,
+            ]
+        )
 
         text = "   ".join(part for part in parts if part)
         self.query_one("#status", Static).update(text)
@@ -3602,11 +3925,7 @@ class GameArchiver(App):
         if game is None:
             return
 
-        compat = (
-            Path.home()
-            / ".local/share/game_archiver/compatdata"
-            / game.name
-        )
+        compat = Path.home() / ".local/share/game_archiver/compatdata" / game.name
 
         if not compat.is_dir():
             self.notify("Proton prefix not found.", severity="warning")
@@ -3652,11 +3971,7 @@ class GameArchiver(App):
 
         freed = 0
 
-        for game in sorted(
-            self.shared_games,
-            key=lambda g: g.mtime
-        ):
-
+        for game in sorted(self.shared_games, key=lambda g: g.mtime):
             if freed >= excess:
                 break
 
@@ -3672,7 +3987,6 @@ class GameArchiver(App):
             self.notify("Storage Offline, can't move")
             return
         self.moving = True
-        
 
         if self.shared_view.has_focus:
             source = self.shared_games
@@ -3685,12 +3999,10 @@ class GameArchiver(App):
 
         moved = await self.move_games(source, destination, target)
 
-        
         if not moved:
             self.moving = False
             self.notify("No games selected")
-            return        
-
+            return
 
         self.refresh_views()
         self.moving = False
@@ -3727,13 +4039,6 @@ class GameArchiver(App):
                 except ValueError:
                     pass
 
-            icon_rel = None
-            if game.icon is not None:
-                try:
-                    icon_rel = Path(game.icon).relative_to(old_path)
-                except ValueError:
-                    pass
-
             if old_path == self.highlighted_game_path:
                 self.highlighted_game_path = new_path
 
@@ -3746,11 +4051,7 @@ class GameArchiver(App):
 
                 if path.exists():
                     mode = path.stat().st_mode
-                    path.chmod(
-                        mode
-                        | stat.S_IXUSR
-                        | stat.S_IXGRP
-                    )
+                    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP)
             game.path = new_path
             game.mtime = new_path.stat().st_mtime
 
@@ -3759,9 +4060,9 @@ class GameArchiver(App):
 
             game.launcher = next(
                 (
-                    path for path in launchers
-                    if launcher_rel is not None
-                    and path == new_path / launcher_rel
+                    path
+                    for path in launchers
+                    if launcher_rel is not None and path == new_path / launcher_rel
                 ),
                 None,
             )
@@ -3772,10 +4073,11 @@ class GameArchiver(App):
                 game.launcher = find_launcher(launch_path(game))
 
             # Preserve the icon if it was inside the game directory.
-            if icon_rel is not None:
-                game.icon = new_path / icon_rel
-            elif game.icon is None:
-                game.icon = find_icon(launch_path(game))
+            update_artwork_paths_for_game(game, old_path, new_path)
+
+            if get_selected_artwork(game, ArtworkType.ICON) is None:
+                local_icons = await to_thread(find_icons, launch_path(game))
+                await self.add_detected_icons(game, local_icons)
 
             await self.sync_shortcut(game)
 
@@ -3784,7 +4086,6 @@ class GameArchiver(App):
             source_games.remove(game)
             destination_games.append(game)
 
-
         sort_games(source_games)
         sort_games(destination_games)
 
@@ -3792,15 +4093,14 @@ class GameArchiver(App):
 
         return True
 
-
     def action_refresh(self):
         if self.is_scan_running():
             return
-        
+
         self.verify_storage()
 
         merge_games(self.shared_games, scan_games(self.shared_dir()))
-        
+
         if self.storage_online:
             merge_games(self.archived_games, scan_games(ARCHIVED_DIR))
 
@@ -3811,7 +4111,7 @@ class GameArchiver(App):
         game = self.get_highlighted_game()
         if game is None:
             return
-        
+
         game.last_played = time.time()
 
         if game in self.shared_games:
@@ -3825,7 +4125,7 @@ class GameArchiver(App):
 
         try:
             info = get_launch_info(game)
-        except Exception as e:
+        except RuntimeError as e:
             self.notify(str(e))
             return
 
@@ -3854,9 +4154,8 @@ class GameArchiver(App):
                 ["xdg-open", str(path)],
                 start_new_session=True,
             )
-        except Exception as e:
+        except OSError as e:
             self.notify(f"Open failed: {e}")
-
 
     def action_open_remote_folder(self):
         if not self.storage_online:
@@ -3868,8 +4167,6 @@ class GameArchiver(App):
             return
 
         row = view.children[view.index]
-        game = row.game
-
         path = row.game.path
 
         try:
@@ -3877,7 +4174,7 @@ class GameArchiver(App):
                 ["xdg-open", str(path)],
                 start_new_session=True,
             )
-        except Exception as e:
+        except OSError as e:
             self.notify(f"Open failed: {e}")
 
     def action_terminal(self):
@@ -3891,9 +4188,7 @@ class GameArchiver(App):
 
         path = launch_path(game)
 
-        self.notify(
-            f"Opening terminal in {game.name}"
-        )
+        self.notify(f"Opening terminal in {game.name}")
 
         subprocess.Popen(
             [
@@ -3929,24 +4224,24 @@ class GameArchiver(App):
             ],
             start_new_session=True,
         )
+
     def action_next_steam_user(self):
         if len(self.steam_users) <= 1:
             return
 
-        self.selected_steam_user = (
-            self.selected_steam_user + 1
-        ) % len(self.steam_users)
+        self.selected_steam_user = (self.selected_steam_user + 1) % len(
+            self.steam_users
+        )
 
         self.update_status()
-
 
     def action_prev_steam_user(self):
         if len(self.steam_users) <= 1:
             return
 
-        self.selected_steam_user = (
-            self.selected_steam_user - 1
-        ) % len(self.steam_users)
+        self.selected_steam_user = (self.selected_steam_user - 1) % len(
+            self.steam_users
+        )
 
         self.update_status()
 
@@ -3980,12 +4275,10 @@ class GameArchiver(App):
         entries = shortcuts["shortcuts"]
 
         for game in games:
-            self.update_game_steam_status(game, entries)
+            await self.update_game_steam_status(game, entries)
             self.refresh_game_row(game)
 
-        self.notify(
-            f"Updated {updated} Steam shortcut{'s' if updated != 1 else ''}."
-        )
+        self.notify(f"Updated {updated} Steam shortcut{'s' if updated != 1 else ''}.")
 
     def action_select_all(self):
         if self.shared_view.has_focus:
@@ -4003,7 +4296,7 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
         self.update_status()
-    
+
     def action_select_none(self):
         if self.shared_view.has_focus:
             games = list(self.shared_games)
@@ -4040,9 +4333,7 @@ class GameArchiver(App):
 
                 results = result["data"]
             if not results:
-                action = await self.push_screen_wait(
-                    NoArtworkMatchDialog(query)
-                )
+                action = await self.push_screen_wait(NoArtworkMatchDialog(query))
 
                 match action:
                     case NoArtworkMatchAction.CANCEL:
@@ -4058,7 +4349,10 @@ class GameArchiver(App):
                             )
                         )
 
-                        if new_query is None or new_query.action == InputDialogAction.CANCEL:
+                        if (
+                            new_query is None
+                            or new_query.action == InputDialogAction.CANCEL
+                        ):
                             return
 
                         if new_query.action == InputDialogAction.LOCAL:
@@ -4129,26 +4423,22 @@ class GameArchiver(App):
                     prompt_for_search = True
                     continue
                 case SelectionDialogAction.BROWSE:
-                    continue  # show SelectionDialog again as shouldn't happen.               
+                    continue  # show SelectionDialog again as shouldn't happen.
                 case SelectionDialogAction.LOCAL:
                     await self.download_local_artwork(game, client)
-                    return             
+                    return
                 case SelectionDialogAction.SELECT:
                     pass
-            
+
             assert selected is not None
             game.steamgriddb = {
                 "search": query,
-
                 # Full SteamGridDB game details.
                 "game": None,
-
                 # Steam platform data.
                 "steam_platform_data": None,
-
                 # Unix timestamp of the last artwork metadata refresh.
                 "cached": None,
-
                 # None = never fetched.
                 "art": {
                     ArtworkType.GRID_PORTRAIT: None,
@@ -4158,7 +4448,6 @@ class GameArchiver(App):
                     ArtworkType.LOGO: None,
                     ArtworkType.ICON: None,
                 },
-
                 # User's chosen artwork IDs.
                 "selected": {
                     ArtworkType.GRID_PORTRAIT: None,
@@ -4173,12 +4462,12 @@ class GameArchiver(App):
 
             if game_details is not None:
                 game.steamgriddb["game"] = game_details
-            
+
             steam_platform_data = await client.get_steam_platform_data(game)
 
             if steam_platform_data is not None:
                 game.steamgriddb["steam_platform_data"] = steam_platform_data
-            
+
             # await download_steam_art(game)
 
             self.save_game_data()
@@ -4187,17 +4476,14 @@ class GameArchiver(App):
             self.refresh_game_row(game)
             await self.manage_steamgriddb(game, client)
             return
-            
-    
+
     async def manage_steamgriddb(
         self,
         game: Game,
         client: SteamGridDBClient,
     ):
         while True:
-            action = await self.push_screen_wait(
-                SteamGridDBDialog(game)
-            )
+            action = await self.push_screen_wait(SteamGridDBDialog(game))
 
             match action:
                 case SteamGridDBAction.CANCEL:
@@ -4232,17 +4518,14 @@ class GameArchiver(App):
             ArtworkType.ICON: [],
         }
 
-        local_icons = await to_thread(find_icons, launch_path(game))
-
         game.steamgriddb.setdefault("selected", {})
         game.steamgriddb.setdefault("art", art)
+        art = game.steamgriddb["art"]
 
-        await self._choose_artwork(
-            game,
-            client,
-            art,
-            local_icons,
-        )
+        local_icons = await to_thread(find_icons, launch_path(game))
+        await self.add_detected_icons(game, local_icons)
+
+        await self._choose_artwork(game, client, art)
 
     async def download_steamgriddb_art(
         self,
@@ -4250,7 +4533,6 @@ class GameArchiver(App):
         client: SteamGridDBClient,
     ):
         art_data = await client.get_all_art(game)
-        local_icons = await to_thread(find_icons, launch_path(game))
 
         if not art_data["success"]:
             self.notify(art_data["error"])
@@ -4258,29 +4540,24 @@ class GameArchiver(App):
 
         art = art_data["data"]
         game.steamgriddb["art"] = art
+        local_icons = await to_thread(find_icons, launch_path(game))
+        await self.add_detected_icons(game, local_icons)
+
         self.save_game_data()
 
-        await self._choose_artwork(game, client, art, local_icons)
+        await self._choose_artwork(game, client, art)
 
-    async def _choose_artwork(
-        self,
-        game: Game,
-        client: SteamGridDBClient,
-        art: dict,
-        local_icons: list[IconCandidate],
-    ):
+    async def _choose_artwork(self, game: Game, client: SteamGridDBClient, art: dict):
         while True:
             result = await self.push_screen_wait(
                 ArtworkTypeDialog(
                     art,
-                    local_icons,
                     selected_types={
                         art_type
                         for art_type, info in (
                             game.steamgriddb.get("selected") or {}
                         ).items()
-                        if isinstance(info, dict)
-                        and info.get("asset") is not None
+                        if isinstance(info, dict) and info.get("asset") is not None
                     },
                     selected_artwork=game.steamgriddb.get("selected"),
                 )
@@ -4307,15 +4584,17 @@ class GameArchiver(App):
 
                 # Add this local file to the candidates for the current type.
                 artwork = list(art.get(art_type) or [])
-                artwork.append({
-                    "id": str(selected_path),
-                    "path": selected_path,
-                    "url": selected_path.as_uri(),
-                    "name": selected_path.name,
-                    "source": "local",
-                    "style": "Local",
-                    "kind": selected_path.suffix.lower(),
-                })
+                artwork.append(
+                    {
+                        "id": str(selected_path),
+                        "path": selected_path,
+                        "url": selected_path.as_uri(),
+                        "name": selected_path.name,
+                        "source": "local",
+                        "style": "Local",
+                        "kind": selected_path.suffix.lower(),
+                    }
+                )
 
             else:
                 match art_type:
@@ -4333,7 +4612,9 @@ class GameArchiver(App):
                         artwork = art[ArtworkType.LOGO].copy()
                     case ArtworkType.ICON:
                         artwork = art[ArtworkType.ICON].copy()
-            selected_artwork = (game.steamgriddb.get("selected") or {}).get(art_type) or {}
+            selected_artwork = (game.steamgriddb.get("selected") or {}).get(
+                art_type
+            ) or {}
             if selected_artwork.get("asset") is None:
                 installed_paths = self.find_installed_artwork(game, art_type)
                 appended = False
@@ -4360,9 +4641,6 @@ class GameArchiver(App):
                     title=f"{art_type.name.replace('_', ' ').title()} Artwork",
                     artwork=artwork,
                     client=client,
-                    local_icons=(
-                        local_icons if art_type == ArtworkType.ICON else None
-                    ),
                     selected_artwork=selected_artwork.get("asset"),
                 )
             )
@@ -4454,7 +4732,9 @@ class GameArchiver(App):
 
         if selected.get("asset") is None:
             selected["asset"] = asset
-            selected["downloaded_path"] = path # is kinda redundant but it's expected by the code that uses it.
+            selected["downloaded_path"] = (
+                path  # is kinda redundant but it's expected by the code that uses it.
+            )
 
         return asset
 
@@ -4484,6 +4764,44 @@ class GameArchiver(App):
 
         return steam_grid_dir(user) / f"{appid}{suffix}{extension}"
 
+    async def add_detected_icons(
+        self,
+        game: Game,
+        candidates: list[IconCandidate],
+    ) -> None:
+        if not candidates:
+            return
+
+        if game.steamgriddb is None:
+            game.steamgriddb = {}
+
+        for candidate in candidates:
+            asset = icon_candidate_to_artwork(candidate)
+
+            add_selected_artwork_to_art(
+                game,
+                ArtworkType.ICON,
+                asset,
+            )
+        self.save_game_data()
+
+        # Only initialize and install a selection if one doesn't exist.
+        if get_selected_artwork(game, ArtworkType.ICON) is None:
+            asset = icon_candidate_to_artwork(candidates[0])
+
+            selected = {
+                "asset": asset,
+                "downloaded_path": asset["path"],
+                "installed_path": None,
+            }
+
+            game.steamgriddb.setdefault("selected", {})[ArtworkType.ICON] = selected
+
+            await self.install_artwork(
+                game,
+                ArtworkType.ICON,
+                selected["downloaded_path"],
+            )
 
     async def install_artwork(
         self,
@@ -4492,11 +4810,31 @@ class GameArchiver(App):
         image: Path | str,
     ) -> bool:
         image = Path(image)
-        dest = correct_image_extension(self.get_steam_artwork_path(
-            game,
-            art_type,
-            image.suffix,
-        ))
+
+        if art_type == ArtworkType.ICON:
+            if image.suffix.lower() == ImageExtension.EXE:
+                extracted = await to_thread(extract_exe_icon, image)
+
+                if extracted is None:
+                    self.notify(
+                        f"Failed to extract icon from {image.name}.",
+                        severity="error",
+                    )
+                    return False
+
+                image_to_install = extracted
+            else:
+                image_to_install = image
+        else:
+            image_to_install = image
+
+        dest = correct_image_extension(
+            self.get_steam_artwork_path(
+                game,
+                art_type,
+                image_to_install.suffix,
+            )
+        )
 
         if dest is None:
             self.notify(
@@ -4506,9 +4844,9 @@ class GameArchiver(App):
             return False
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if image.resolve() != dest.resolve():
-            await to_thread(shutil.copy2, image, dest)
-        
+        if image_to_install.resolve() != dest.resolve():
+            await to_thread(shutil.copy2, image_to_install, dest)
+
         # Remove artwork of the same type that uses another extension.
         # Keep the newly installed destination.
         for old_path in self.find_installed_artwork(game, art_type):
@@ -4516,20 +4854,16 @@ class GameArchiver(App):
                 continue
 
             old_path.unlink(missing_ok=True)
+        selected = game.steamgriddb["selected"][art_type]
+        selected["installed_path"] = dest
 
+        self.save_game_data()
+        self.refresh_game_row(game)
         if art_type == ArtworkType.ICON:
-            game.icon = dest
-            game.icon_manual = True
-            self.save_game_data()
-
-            self.refresh_game_row(game)
-
             if not steam_running():
                 await self.sync_shortcut(game)
             else:
-                self.notify(
-                    "Icon saved. Close Steam and sync shortcuts to apply it."
-                )
+                self.notify("Icon saved. Close Steam and sync shortcuts to apply it.")
 
         return True
 
@@ -4547,57 +4881,138 @@ class GameArchiver(App):
         icon_changed = False
 
         for art_type in ArtworkType:
-            if art_type == ArtworkType.CANCEL:
-                continue
-
-            if art_type == ArtworkType.ICON and not game.icon_manual:
+            if art_type in (ArtworkType.CANCEL, ArtworkType.ICON):
                 continue
 
             for ext in ARTWORK_EXTENSIONS:
-                old = correct_image_extension(self.get_steam_artwork_path(
-                    game,
-                    art_type,
-                    ext,
-                    appid=old_appid,
-                ))
-                new = correct_image_extension(self.get_steam_artwork_path(
-                    game,
-                    art_type,
-                    ext,
-                ))
+                old = correct_image_extension(
+                    self.get_steam_artwork_path(
+                        game,
+                        art_type,
+                        ext,
+                        appid=old_appid,
+                    )
+                )
+                new = correct_image_extension(
+                    self.get_steam_artwork_path(
+                        game,
+                        art_type,
+                        ext,
+                    )
+                )
 
                 if old is None or new is None or not old.is_file():
-                    self.notify(
-                        f"{art_type.name} artwork cannot be installed as Steam artwork.",
-                        severity="warning",
-                    )
                     continue
 
                 new.parent.mkdir(parents=True, exist_ok=True)
                 await to_thread(old.replace, new)
+                selected = get_selected_artwork(game, art_type)
+
+                if selected is not None:
+                    installed_path = selected.get("installed_path")
+
+                    if (
+                        installed_path is not None
+                        and Path(installed_path).resolve() == old.resolve()
+                    ):
+                        selected["installed_path"] = new
                 changed = True
 
-                if art_type == ArtworkType.ICON:
-                    game.icon = new
-                    icon_changed = True
+        # Rename the selected ICON artwork, if it has been installed.
+        selected = get_selected_artwork(game, ArtworkType.ICON)
 
-        if icon_changed:
+        if selected is not None:
+            installed_path = selected.get("installed_path")
+
+            if installed_path is not None:
+                installed_path = Path(installed_path)
+
+                if installed_path.is_file():
+                    new = correct_image_extension(
+                        self.get_steam_artwork_path(
+                            game,
+                            ArtworkType.ICON,
+                            installed_path.suffix,
+                        )
+                    )
+
+                    if new is not None:
+                        new.parent.mkdir(parents=True, exist_ok=True)
+
+                        if installed_path.resolve() != new.resolve():
+                            await to_thread(installed_path.replace, new)
+
+                            selected["installed_path"] = new
+                            changed = True
+                            icon_changed = True
+
+        if changed:
             self.save_game_data()
 
+        if icon_changed:
             if not steam_running():
                 await self.sync_shortcut(game)
             else:
-                self.notify(
-                    "Icon saved. Close Steam and sync shortcuts to apply it."
-                )
+                self.notify("Icon saved. Close Steam and sync shortcuts to apply it.")
 
         return changed
+
+    async def get_steamgriddb_api_key(self) -> str | None:
+        config = load_config()
+
+        key = config.get("steamgriddb", {}).get("api_key")
+
+        if key:
+            return key
+
+        while True:
+            choice = await self.push_screen_wait(
+                OptionDialog(
+                    title="SteamGridDB",
+                    message=("SteamGridDB API key is required.\n\nOpen the API page?"),
+                    options=[
+                        ("Open", "open"),
+                        ("Paste Key", "paste"),
+                        ("Cancel", "cancel"),
+                    ],
+                )
+            )
+
+            if choice == "cancel":
+                return None
+
+            if choice == "open":
+                webbrowser.open("https://www.steamgriddb.com/profile/preferences/api")
+                continue
+
+            if choice == "paste":
+                key = await self.push_screen_wait(
+                    InputDialog(
+                        title="SteamGridDB API Key",
+                        prompt="Paste your API key:",
+                        placeholder="Paste API key...",
+                        password=False,
+                    )
+                )
+
+                if not key or not key.value or not key.value.strip():
+                    self.notify("API key cannot be empty.", severity="warning")
+                    continue
+
+                config.setdefault(
+                    "steamgriddb",
+                    {},
+                )["api_key"] = key.value.strip()
+
+                save_config(config)
+
+                return key.value.strip()
 
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
         try:
-            key = await get_steamgriddb_api_key(self)
+            key = await self.get_steamgriddb_api_key()
 
             if key is None:
                 return
@@ -4609,12 +5024,11 @@ class GameArchiver(App):
                 self.notify("No game highlighted.")
                 return
 
-            
             if game.steamgriddb.get("game"):
                 await self.manage_steamgriddb(game, client)
             else:
                 await self.link_steamgriddb(game, client)
-            
+
         finally:
             self.dialog_open = False
 
@@ -4622,8 +5036,6 @@ class GameArchiver(App):
 # ============================================================
 # STEAM
 # ============================================================
-
-
 
 
 @dataclass
@@ -4650,16 +5062,19 @@ def get_steam_users() -> list[SteamUser]:
         try:
             with loginusers.open(encoding="utf-8") as f:
                 data = vdf.load(f)
+        except (OSError, UnicodeError, vdf.VDFError):
+            data = {}
 
-            for steamid64, info in data.get("users", {}).items():
+        for steamid64, info in data.get("users", {}).items():
+            try:
                 userdata_id = str(int(steamid64) - 76561197960265728)
+            except (ValueError, TypeError):
+                continue
 
-                persona_lookup[userdata_id] = (
-                    info.get("PersonaName")
-                    or info.get("AccountName")
+            if isinstance(info, dict):
+                persona_lookup[userdata_id] = info.get("PersonaName") or info.get(
+                    "AccountName"
                 )
-        except Exception:
-            pass
 
     if userdata.exists():
         for p in sorted(userdata.iterdir()):
@@ -4680,6 +5095,7 @@ def get_steam_users() -> list[SteamUser]:
             )
 
     return users
+
 
 class LauncherDialog(ModalScreen[Path | None]):
     DEFAULT_CSS = """
@@ -4702,7 +5118,7 @@ class LauncherDialog(ModalScreen[Path | None]):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "dismiss", "Cancel", show=False, priority=True),
     ]
 
@@ -4739,7 +5155,7 @@ class LauncherDialog(ModalScreen[Path | None]):
             yield Checkbox(
                 label="Enable Gamescope",
                 value=self.game.gamescope_enabled if self.game else False,
-                id="gamescope-checkbox"
+                id="gamescope-checkbox",
             )
 
             yield Label("Enter: Select    Escape: Cancel")
@@ -4766,6 +5182,7 @@ class LauncherDialog(ModalScreen[Path | None]):
 
         for item, path in zip(list_view.children, self.launchers):
             item.tooltip = str(path)
+
 
 # ============================================================
 # Option Dialog
@@ -4825,6 +5242,7 @@ class OptionDialog(ModalScreen[str | None]):
     def action_dismiss(self):
         self.dismiss(None)
 
+
 # ============================================================
 # Input Dialog
 # ============================================================
@@ -4838,6 +5256,7 @@ class InputDialogAction(StrEnum):
 class InputDialogResult:
     action: InputDialogAction
     value: str | None = None
+
 
 class InputDialog(ModalScreen[InputDialogResult | None]):
     DEFAULT_CSS = """
@@ -4927,10 +5346,9 @@ class InputDialog(ModalScreen[InputDialogResult | None]):
             case InputDialogAction.OK:
                 self.dismiss(
                     InputDialogResult(
-                        action=InputDialogAction.OK,
-                        value=self.query_one(Input).value
+                        action=InputDialogAction.OK, value=self.query_one(Input).value
                     )
-            )            
+                )
             case InputDialogAction.LOCAL:
                 self.dismiss(InputDialogResult(action=InputDialogAction.LOCAL))
             case _:
@@ -4938,6 +5356,7 @@ class InputDialog(ModalScreen[InputDialogResult | None]):
 
     def action_dismiss(self):
         self.dismiss(None)
+
 
 # ============================================================
 # Artwork Type Dialog
@@ -4972,12 +5391,12 @@ class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction]):
 
     def __init__(self, query: str):
         super().__init__()
-        self.query = query
+        self.search_query = query
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("[b]No SteamGridDB matches found[/b]")
-            yield Label(f"No results for: {self.query}")
+            yield Label(f"No results for: {self.search_query}")
 
             with Horizontal(id="buttons"):
                 yield Button("Browse Local Artwork", id="local")
@@ -4993,10 +5412,12 @@ class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction]):
             case _:
                 self.dismiss(NoArtworkMatchAction.CANCEL)
 
+
 @dataclass
 class ArtworkTypeDialogResult:
     artwork_type: ArtworkType
     choose_local: bool = False
+
 
 class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
     DEFAULT_CSS = """
@@ -5040,13 +5461,12 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
     #cancel {
         width: 100%;
         margin-top: 1;
-    }   
+    }
     """
 
     def __init__(
         self,
         art: dict,
-        local_icons: list[IconCandidate],
         selected_types: set[ArtworkType] | None = None,
         selected_artwork: dict | None = None,
     ):
@@ -5062,14 +5482,12 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
             ArtworkType.ICON: [],
         }
 
-        self.art[ArtworkType.GRID_PORTRAIT]   = art.get(ArtworkType.GRID_PORTRAIT, [])
-        self.art[ArtworkType.GRID_SQUARE]     = art.get(ArtworkType.GRID_SQUARE, [])
-        self.art[ArtworkType.GRID_LANDSCAPE]  = art.get(ArtworkType.GRID_LANDSCAPE, [])
-        self.art[ArtworkType.HERO]   = art.get(ArtworkType.HERO, [])
-        self.art[ArtworkType.LOGO]   = art.get(ArtworkType.LOGO, [])
-        self.art[ArtworkType.ICON]   = art.get(ArtworkType.ICON, [])
-
-        self.local_icons = local_icons
+        self.art[ArtworkType.GRID_PORTRAIT] = art.get(ArtworkType.GRID_PORTRAIT, [])
+        self.art[ArtworkType.GRID_SQUARE] = art.get(ArtworkType.GRID_SQUARE, [])
+        self.art[ArtworkType.GRID_LANDSCAPE] = art.get(ArtworkType.GRID_LANDSCAPE, [])
+        self.art[ArtworkType.HERO] = art.get(ArtworkType.HERO, [])
+        self.art[ArtworkType.LOGO] = art.get(ArtworkType.LOGO, [])
+        self.art[ArtworkType.ICON] = art.get(ArtworkType.ICON, [])
 
     def compose(self) -> ComposeResult:
         categories = [
@@ -5088,9 +5506,6 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
                 for art_type, label in categories:
                     count = len(self.art[art_type])
 
-                    if art_type == ArtworkType.ICON:
-                        count += len(self.local_icons)
-
                     selected_info = self.selected_artwork.get(art_type)
                     selected_asset = (
                         selected_info.get("asset")
@@ -5102,15 +5517,8 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
                         selected_id = str(selected_asset.get("id"))
 
                         existing_ids = {
-                            str(item.get("id"))
-                            for item in self.art[art_type]
+                            str(item.get("id")) for item in self.art[art_type]
                         }
-
-                        if art_type == ArtworkType.ICON:
-                            existing_ids.update(
-                                icon.path.name
-                                for icon in self.local_icons
-                            )
 
                         if selected_id not in existing_ids:
                             count += 1
@@ -5132,7 +5540,6 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
                         )
 
             yield Button("Cancel", id=str(ArtworkType.CANCEL))
-
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
@@ -5225,7 +5632,7 @@ class ArtworkPreview(Container):
 
         await self.remove_children()
 
-        if path is None or not path.is_file():
+        if path is None or not Path(path).is_file():
             self.image = None
             await self.mount(
                 Static(
@@ -5252,11 +5659,8 @@ class ArtworkPreview(Container):
         #     f"thumb={art.get('thumb')}"
         # )
         # Don't reload the same artwork.
-        if (
-            self.art is not None
-            and self.art["id"] == art["id"]
-        ):
-            return
+        # if self.art is not None and self.art["id"] == art["id"]:
+        #     return
 
         self.art = art
 
@@ -5309,7 +5713,6 @@ class ArtworkPreview(Container):
             # Replace loading widget with image.
             await self.remove_children()
 
-
             # self.notify("Mounting AutoImage")
             # self.notify(
             #     f"path type: {type(path).__name__}\n"
@@ -5321,14 +5724,15 @@ class ArtworkPreview(Container):
                     id="image",
                 )
             )
-            
+
             # self.notify("AutoImage mounted")
-        except Exception as e:
+        except Exception:  # noqa: BLE001, S110 - AutoImage is optional.
             # self.notify(
             #     f"AutoImage error: "
             #     f"{type(e).__name__}: {e}"
             # )
             pass
+
 
 # ============================================================
 # Artwork Selection Dialog
@@ -5338,7 +5742,10 @@ class ArtworkSelectionDialogAction(StrEnum):
     CANCEL = "cancel"
     DOWNLOAD = "download"
 
-class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dict | None]]):
+
+class ArtworkSelectionDialog(
+    ModalScreen[tuple[ArtworkSelectionDialogAction, dict | None]]
+):
     DEFAULT_CSS = """
     ArtworkSelectionDialog {
         align: center middle;
@@ -5392,7 +5799,6 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         title: str,
         artwork: list[dict],
         client: SteamGridDBClient,
-        local_icons: list[IconCandidate] | None,
         selected_artwork: dict | None = None,
     ):
         super().__init__()
@@ -5402,57 +5808,28 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         self.client = client
         self.selected_artwork = selected_artwork
 
-        if (
-            selected_artwork
-            and selected_artwork.get("source") == "local"
-        ):
+        if selected_artwork and selected_artwork.get("source") == "local":
             selected_id = str(selected_artwork.get("id"))
 
-            if not any(
-                str(item.get("id")) == selected_id
-                for item in self.artwork
-            ):
+            if not any(str(item.get("id")) == selected_id for item in self.artwork):
                 self.artwork.append(copy.deepcopy(selected_artwork))
-
-        if local_icons:
-            for icon in local_icons:
-                self.artwork.append({
-                    "id": icon.path.name,
-                    "path": icon.path,
-                    "url": icon.path.as_uri(),      # optional
-                    "score": icon.score,
-                    "style": "Local",
-                    "source": "local",
-                    "kind": icon.kind,
-                })
 
     def build_item(
         self,
         art: dict,
     ) -> ListItem:
         details = []
-        saved_id = (
-            self.selected_artwork.get("id")
-            if self.selected_artwork
-            else None
-        )
+        saved_id = self.selected_artwork.get("id") if self.selected_artwork else None
 
-        is_selected = (
-            saved_id is not None
-            and str(art["id"]) == str(saved_id)
-        )
+        is_selected = saved_id is not None and str(art["id"]) == str(saved_id)
         if art.get("style"):
             details.append(art["style"].title())
 
         if art.get("width") and art.get("height"):
-            details.append(
-                f"{art['width']}×{art['height']}"
-            )
+            details.append(f"{art['width']}×{art['height']}")
 
         if art.get("score") is not None:
-            details.append(
-                f"★ {art['score']}"
-            )
+            details.append(f"★ {art['score']}")
 
         if art.get("nsfw"):
             details.append("NSFW")
@@ -5472,24 +5849,16 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         if details:
             text += "\n    " + " • ".join(details)
 
-        return ListItem(
-            Label(text)
-        )
+        return ListItem(Label(text))
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label(
-                f"[b]{self.title}[/b]"
-            )
+            yield Label(f"[b]{self.title}[/b]")
 
             with Horizontal(id="body"):
-
                 with Vertical(id="left"):
                     yield ListView(
-                        *(
-                            self.build_item(a)
-                            for a in self.artwork
-                        ),
+                        *(self.build_item(a) for a in self.artwork),
                         id="results",
                     )
 
@@ -5517,16 +5886,15 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
     async def on_mount(self):
         self.query_one(ListView).focus()
         await self.update_preview()
+
     async def update_preview(self):
         index = self.query_one(ListView).index
 
         if index is None:
             return
 
-        await self.query_one(ArtworkPreview).show_art(
-            self.artwork[index]
-        )
-   
+        await self.query_one(ArtworkPreview).show_art(self.artwork[index])
+
     async def on_list_view_highlighted(
         self,
         event: ListView.Highlighted,
@@ -5548,15 +5916,11 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
         self,
         event: Button.Pressed,
     ):
-        index = self.query_one(
-            ListView
-        ).index
+        index = self.query_one(ListView).index
 
         if event.button.id == ArtworkSelectionDialogAction.BROWSE:
             if index is not None:
-                webbrowser.open(
-                    self.artwork[index]["url"]
-                )
+                webbrowser.open(self.artwork[index]["url"])
             return
 
         if event.button.id == ArtworkSelectionDialogAction.CANCEL:
@@ -5584,6 +5948,7 @@ class ArtworkSelectionDialog(ModalScreen[tuple[ArtworkSelectionDialogAction, dic
             )
         )
 
+
 # ============================================================
 # Selection Dialog
 # ============================================================
@@ -5594,9 +5959,8 @@ class SelectionDialogAction(StrEnum):
     CANCEL = "cancel"
     LOCAL = "local"
 
-class SelectionDialog(
-    ModalScreen[tuple[SelectionDialogAction, dict | None]]
-):
+
+class SelectionDialog(ModalScreen[tuple[SelectionDialogAction, dict | None]]):
     DEFAULT_CSS = """
     SelectionDialog {
         align: center middle;
@@ -5778,17 +6142,15 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
         yield Vertical(
             Label("[b]SteamGridDB[/b]"),
             Label(
-                f"Name: {sgdb.get('game',{}).get('name', 'Unknown')}\n"
-                f"ID: {sgdb.get('game',{}).get('id', 'Unknown')}\n"
+                f"Name: {sgdb.get('game', {}).get('name', 'Unknown')}\n"
+                f"ID: {sgdb.get('game', {}).get('id', 'Unknown')}\n"
                 f"Search: {sgdb.get('search', '')}"
             ),
-
             TextArea(
                 "",
                 id="details",
                 read_only=True,
             ),
-
             Horizontal(
                 Button(
                     "Browse",
@@ -5803,11 +6165,7 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
                     "Change Match",
                     id="change",
                 ),
-                Button(
-                    "Copy JSON", 
-                    id="copy",
-                    disabled = self.game.steamgriddb == None
-                ),
+                Button("Copy JSON", id="copy", disabled=self.game.steamgriddb is None),
                 Button(
                     "Cancel",
                     id="cancel",
@@ -5833,38 +6191,28 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
     ):
         match event.button.id:
             case "browse":
-                self.dismiss(
-                    SteamGridDBAction.BROWSE
-                )
+                self.dismiss(SteamGridDBAction.BROWSE)
 
             case "download":
-                self.dismiss(
-                    SteamGridDBAction.DOWNLOAD
-                )
+                self.dismiss(SteamGridDBAction.DOWNLOAD)
 
             case "change":
-                self.dismiss(
-                    SteamGridDBAction.CHANGE
-                )
+                self.dismiss(SteamGridDBAction.CHANGE)
 
             case "copy":
-                self.app.copy_to_clipboard(
-                    self.game_info_json
-                )
+                self.app.copy_to_clipboard(self.game_info_json)
 
             case "cancel":
-                self.dismiss(
-                    SteamGridDBAction.CANCEL
-                )
+                self.dismiss(SteamGridDBAction.CANCEL)
 
     def action_dismiss(self):
-        self.dismiss(
-            SteamGridDBAction.CANCEL
-        )
+        self.dismiss(SteamGridDBAction.CANCEL)
+
 
 # ============================================================
 # SteamGridDB Client
 # ============================================================
+
 
 def steamgriddb_search_name(game: Game) -> str:
     name = game.name
@@ -5872,17 +6220,19 @@ def steamgriddb_search_name(game: Game) -> str:
         name = game.steamgriddb.get("search") or game.name
 
     # Strip common suffixes
-    name = re.sub(r"\s*-\s*v[\d.]+.*$", "", name, flags=re.I)
-    name = re.sub(r"\s+-\s+PC$", "", name, flags=re.I)
-    name = re.sub(r"\bR18\b", "", name, flags=re.I)
+    name = re.sub(r"\s*-\s*v[\d.]+.*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s+-\s+PC$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\bR18\b", "", name, flags=re.IGNORECASE)
 
     return name.strip()
+
 
 class SteamGridDBArtType(StrEnum):
     GRIDS = "grids"
     HEROES = "heroes"
     LOGOS = "logos"
     ICONS = "icons"
+
 
 class SteamGridDBClient:
     BASE_URL = "https://www.steamgriddb.com/api/v2"
@@ -5933,7 +6283,6 @@ class SteamGridDBClient:
             "data": payload["data"],
         }
 
-
     async def search_game(
         self,
         query: str,
@@ -5975,7 +6324,7 @@ class SteamGridDBClient:
             return None
 
         return result["data"]
-    
+
     async def get_art(
         self,
         kind: SteamGridDBArtType,
@@ -5996,7 +6345,7 @@ class SteamGridDBClient:
             }
         options = SearchOptions()
         return await self.get(f"{kind}/game/{game_id}", params=options.params())
-    
+
     async def get_grids(self, game: Game) -> dict:
         return await self.get_art(SteamGridDBArtType.GRIDS, game)
 
@@ -6008,6 +6357,7 @@ class SteamGridDBClient:
 
     async def get_icons(self, game: Game) -> dict:
         return await self.get_art(SteamGridDBArtType.ICONS, game)
+
     async def get_all_art(
         self,
         game: Game,
@@ -6034,9 +6384,7 @@ class SteamGridDBClient:
             if not result["success"]:
                 return result
 
-        steam_art = steam_art_urls(
-            game.steamgriddb.get("steam_platform_data")
-        )
+        steam_art = steam_art_urls(game.steamgriddb.get("steam_platform_data"))
 
         game.steamgriddb["art"] = {
             ArtworkType.GRID_PORTRAIT: [
@@ -6069,6 +6417,7 @@ class SteamGridDBClient:
             "success": True,
             "data": game.steamgriddb["art"],
         }
+
     async def download_file(
         self,
         url: str,
@@ -6091,12 +6440,16 @@ class SteamGridDBClient:
                 "success": True,
             }
 
-        except Exception as e:
+        except (
+            httpx.RequestError,
+            httpx.HTTPStatusError,
+            OSError,
+        ) as e:
             return {
                 "success": False,
                 "error": str(e),
             }
-        
+
 
 # ============================================================
 # MAIN
