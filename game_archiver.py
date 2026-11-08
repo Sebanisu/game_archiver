@@ -2058,25 +2058,6 @@ def get_selected_artwork(
     return (game.steamgriddb.get("selected") or {}).get(artwork_type)
 
 
-def get_selected_artwork_path(
-    game: Game,
-    artwork_type: ArtworkType,
-    installed_only: bool = False,
-) -> Path | None:
-    selected = get_selected_artwork(game, artwork_type)
-
-    if not selected:
-        return None
-
-    path = (
-        selected.get("installed_path")
-        if installed_only
-        else selected.get("installed_path") or selected.get("downloaded_path")
-    )
-
-    return Path(path) if path is not None else None
-
-
 def icon_candidate_to_artwork(
     candidate: IconCandidate,
 ) -> dict:
@@ -3055,7 +3036,7 @@ class GameRow(ListItem):
 
     async def refresh_icon(self):
         """Update the row icon from the game's configured icon path."""
-        icon_path = get_selected_artwork_path(
+        icon_path = await self.app.get_selected_artwork_path(
             self.game,
             ArtworkType.ICON,
             installed_only=True,
@@ -3368,7 +3349,31 @@ class GameArchiver(App):
             self.notify(f"Error saving game data: {type(e).__name__}: {e}")
             raise
 
-    def make_shortcut(self, game: Game) -> dict:
+    async def get_selected_artwork_path(
+        self,
+        game: Game,
+        artwork_type: ArtworkType,
+        installed_only: bool = False,
+    ) -> Path | None:
+        selected = get_selected_artwork(game, artwork_type)
+
+        if not selected:
+            return None
+
+        if installed_only and selected.get("installed_path") is None:
+            await self.install_artwork(
+                game, artwork_type, selected.get("downloaded_path")
+            )
+
+        path = (
+            selected.get("installed_path")
+            if installed_only
+            else selected.get("installed_path") or selected.get("downloaded_path")
+        )
+
+        return Path(path) if path is not None else None
+
+    async def make_shortcut(self, game: Game) -> dict:
         launcher = game.launcher
         assert launcher is not None
 
@@ -3378,7 +3383,7 @@ class GameArchiver(App):
             self.notify(str(e))
             return None
 
-        icon_path = get_selected_artwork_path(
+        icon_path = await self.get_selected_artwork_path(
             game,
             ArtworkType.ICON,
             installed_only=True,
@@ -3425,7 +3430,7 @@ class GameArchiver(App):
         old_appid = game_appid(game) if key is not None else None
 
         # Build the shortcut as it should exist now.
-        desired = self.make_shortcut(game)
+        desired = await self.make_shortcut(game)
 
         self.save_game_data()
 
@@ -4820,6 +4825,12 @@ class GameArchiver(App):
         image: Path | str,
     ) -> bool:
         image = Path(image)
+        if not image.is_file():
+            self.notify(
+                f"Artwork file not found: {image}",
+                severity="error",
+            )
+            return False
 
         if art_type == ArtworkType.ICON:
             if image.suffix.lower() == ImageExtension.EXE:
