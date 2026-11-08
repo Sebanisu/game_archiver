@@ -4576,7 +4576,7 @@ class GameArchiver(App):
         elif self.app_mode == AppMode.LIBRARY:
             self.update_library_details(None)
 
-    def get_highlighted_game(self) -> Game | None:
+    def get_highlighted_row(self) -> GameRow | None:
         view = self.current_view()
 
         if view.index is None:
@@ -4586,8 +4586,11 @@ class GameArchiver(App):
             view.index = None
             return None
 
-        row = view.children[view.index]
-        return row.game
+        return view.children[view.index]
+
+    def get_highlighted_game(self) -> Game | None:
+        row = self.get_highlighted_row()
+        return row.game if row is not None else None
 
     def update_library_details(self, game: Game | None):
         info = self.query_one("#details-info", Static)
@@ -5976,6 +5979,8 @@ class GameArchiver(App):
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
+        row = self.get_highlighted_row()
+        game = row.game
         try:
             key = await self.get_steamgriddb_api_key()
 
@@ -5984,7 +5989,6 @@ class GameArchiver(App):
 
             # Create the client
             client = SteamGridDBClient(key)
-            game = self.get_highlighted_game()
             if game is None:
                 self.notify("No game highlighted.")
                 return
@@ -5993,9 +5997,11 @@ class GameArchiver(App):
                 await self.manage_steamgriddb(game, client)
             else:
                 await self.link_steamgriddb(game, client)
-
         finally:
             self.dialog_open = False
+            if game is not None:
+                self.update_library_details(game)
+                await row.refresh_icon()
 
 
 # ============================================================
