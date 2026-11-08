@@ -66,11 +66,11 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 8
+DATABASE_SCHEMA_VERSION = 9
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0  # 1024 * 1024  # 1 MB
-LOGGING_ENABLED = True  # DEBUG
+LOGGING_ENABLED = False  # DEBUG
 LOGGING_FILE = "/tmp/game_archiver-debug.log"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -500,6 +500,11 @@ def migrate_database(
         migrate_to_v8(db)
         set_schema_version(db, 8)
         current_version = 8
+
+    if current_version < 9:
+        migrate_to_v9(db)
+        set_schema_version(db, 9)
+        current_version = 9
     # Future migrations go here
 
 
@@ -985,6 +990,285 @@ def migrate_to_v8(db: sqlite3.Connection) -> None:
     drop_column_if_exists("games", "icon")
 
 
+def migrate_to_v9(db: sqlite3.Connection) -> None:
+    rows = db.execute(
+        """
+        SELECT id, path
+        FROM games
+        WHERE path IS NOT NULL
+        ORDER BY id
+        """
+    ).fetchall()
+
+    identity_groups = {}
+
+    for row in rows:
+        game = Game(path=Path(row["path"]))
+        identity = game_identity(game)
+
+        if identity is not None:
+            identity_groups.setdefault(identity, []).append(row["id"])
+
+    duplicate_groups = [ids for ids in identity_groups.values() if len(ids) > 1]
+
+    for ids in duplicate_groups:
+        keeper_id, *duplicate_ids = ids
+
+        debug_log(f"Deduplicating game IDs {duplicate_ids}; keeping {keeper_id}")
+
+        for duplicate_id in duplicate_ids:
+            # --------------------------------------------------
+            # Merge games table metadata.
+            # --------------------------------------------------
+
+            db.execute(
+                """
+                UPDATE games
+                SET
+                    last_played = MAX(last_played, (
+                        SELECT last_played
+                        FROM games
+                        WHERE id = ?
+                    )),
+                    launcher = COALESCE(
+                        launcher,
+                        (SELECT launcher FROM games WHERE id = ?)
+                    )
+                WHERE id = ?
+                """,
+                (duplicate_id, duplicate_id, keeper_id),
+            )
+
+            # --------------------------------------------------
+            # Merge Steam metadata.
+            # --------------------------------------------------
+
+            duplicate = db.execute(
+                """
+                SELECT *
+                FROM steam_games
+                WHERE game_id = ?
+                """,
+                (duplicate_id,),
+            ).fetchone()
+
+            if duplicate is not None:
+                keeper = db.execute(
+                    """
+                    SELECT *
+                    FROM steam_games
+                    WHERE game_id = ?
+                    """,
+                    (keeper_id,),
+                ).fetchone()
+
+                if keeper is None:
+                    db.execute(
+                        """
+                        INSERT INTO steam_games (
+                            game_id,
+                            steam_key,
+                            steam_entry,
+                            in_steam,
+                            steam_broken,
+                            duplicate_steam
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            keeper_id,
+                            duplicate["steam_key"],
+                            duplicate["steam_entry"],
+                            duplicate["in_steam"],
+                            duplicate["steam_broken"],
+                            duplicate["duplicate_steam"],
+                        ),
+                    )
+                else:
+                    db.execute(
+                        """
+                        UPDATE steam_games
+                        SET
+                            steam_key = COALESCE(steam_key, ?),
+                            steam_entry = COALESCE(steam_entry, ?),
+                            in_steam = MAX(in_steam, ?),
+                            steam_broken = MAX(steam_broken, ?),
+                            duplicate_steam = MAX(duplicate_steam, ?)
+                        WHERE game_id = ?
+                        """,
+                        (
+                            duplicate["steam_key"],
+                            duplicate["steam_entry"],
+                            duplicate["in_steam"],
+                            duplicate["steam_broken"],
+                            duplicate["duplicate_steam"],
+                            keeper_id,
+                        ),
+                    )
+
+            # --------------------------------------------------
+            # Merge SteamGridDB game metadata.
+            # --------------------------------------------------
+
+            duplicate = db.execute(
+                """
+                SELECT *
+                FROM steamgriddb_games
+                WHERE game_id = ?
+                """,
+                (duplicate_id,),
+            ).fetchone()
+
+            if duplicate is not None:
+                keeper = db.execute(
+                    """
+                    SELECT *
+                    FROM steamgriddb_games
+                    WHERE game_id = ?
+                    """,
+                    (keeper_id,),
+                ).fetchone()
+
+                if keeper is None:
+                    db.execute(
+                        """
+                        INSERT INTO steamgriddb_games (
+                            game_id,
+                            sgdb_id,
+                            name,
+                            search,
+                            game_data,
+                            steam_platform_data,
+                            cached
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            keeper_id,
+                            duplicate["sgdb_id"],
+                            duplicate["name"],
+                            duplicate["search"],
+                            duplicate["game_data"],
+                            duplicate["steam_platform_data"],
+                            duplicate["cached"],
+                        ),
+                    )
+                else:
+                    db.execute(
+                        """
+                        UPDATE steamgriddb_games
+                        SET
+                            sgdb_id = COALESCE(sgdb_id, ?),
+                            name = COALESCE(name, ?),
+                            search = COALESCE(search, ?),
+                            game_data = COALESCE(game_data, ?),
+                            steam_platform_data = COALESCE(
+                                steam_platform_data, ?
+                            ),
+                            cached = COALESCE(cached, ?)
+                        WHERE game_id = ?
+                        """,
+                        (
+                            duplicate["sgdb_id"],
+                            duplicate["name"],
+                            duplicate["search"],
+                            duplicate["game_data"],
+                            duplicate["steam_platform_data"],
+                            duplicate["cached"],
+                            keeper_id,
+                        ),
+                    )
+
+            # --------------------------------------------------
+            # Transfer all artwork associations.
+            # --------------------------------------------------
+
+            db.execute(
+                """
+                INSERT OR IGNORE INTO game_artwork (
+                    game_id,
+                    artwork_id
+                )
+                SELECT ?, artwork_id
+                FROM game_artwork
+                WHERE game_id = ?
+                """,
+                (keeper_id, duplicate_id),
+            )
+
+            # Preserve the keeper's existing selection.
+            # Only use the duplicate's selection when the keeper
+            # doesn't already have one for that artwork type.
+            db.execute(
+                """
+                INSERT OR IGNORE INTO selected_artwork (
+                    game_id,
+                    artwork_type,
+                    artwork_id,
+                    downloaded_path,
+                    installed_path
+                )
+                SELECT
+                    ?,
+                    artwork_type,
+                    artwork_id,
+                    downloaded_path,
+                    installed_path
+                FROM selected_artwork
+                WHERE game_id = ?
+                """,
+                (keeper_id, duplicate_id),
+            )
+
+            # Transfer SteamGridDB artwork associations.
+            db.execute(
+                """
+                INSERT OR IGNORE INTO steamgriddb_artwork (
+                    artwork_id,
+                    sgdb_game_id,
+                    sgdb_art_id
+                )
+                SELECT
+                    artwork_id,
+                    ?,
+                    sgdb_art_id
+                FROM steamgriddb_artwork
+                WHERE sgdb_game_id = ?
+                """,
+                (keeper_id, duplicate_id),
+            )
+
+            # --------------------------------------------------
+            # Remove the duplicate only after transferring data.
+            # --------------------------------------------------
+
+            db.execute(
+                "DELETE FROM games WHERE id = ?",
+                (duplicate_id,),
+            )
+
+        debug_log(f"Finished deduplicating identity; retained game ID {keeper_id}")
+
+    # ----------------------------------------------------------
+    # Verify that no duplicate identities remain.
+    # ----------------------------------------------------------
+
+    remaining = {}
+
+    for row in db.execute("SELECT id, path FROM games WHERE path IS NOT NULL"):
+        identity = game_identity(Game(path=Path(row["path"])))
+
+        if identity is not None:
+            remaining.setdefault(identity, []).append(row["id"])
+
+    duplicates = {identity: ids for identity, ids in remaining.items() if len(ids) > 1}
+
+    if duplicates:
+        raise RuntimeError(
+            f"Duplicate game identities remain after migration: {duplicates}"
+        )
+
+
 def reconcile_game_paths(
     db: sqlite3.Connection,
     games: list[Game],
@@ -1081,54 +1365,108 @@ def save_game(
         raise RuntimeError(f"Cannot save game without a path: {game.name}")
 
     path = str(game.path)
+    game_id = game.id
 
-    db.execute(
-        """
-        INSERT INTO games (
-            path,
-            name,
-            size,
-            mtime,
-            file_count,
-            last_played,
-            launcher,
-            gamescope_enabled
+    # Only check identity for games that don't already have a database ID.
+    if game_id is None:
+        identity = game_identity(game)
+
+        if identity is not None:
+            rows = db.execute(
+                "SELECT id, path FROM games WHERE path != ?",
+                (path,),
+            ).fetchall()
+
+            for row in rows:
+                existing_identity = game_identity(Game(name="", path=Path(row["path"])))
+
+                if existing_identity != identity:
+                    continue
+
+                game_id = row["id"]
+
+                db.execute(
+                    """
+                    UPDATE games
+                    SET path = ?,
+                        name = ?,
+                        size = ?,
+                        mtime = ?,
+                        file_count = ?,
+                        last_played = ?,
+                        launcher = ?,
+                        gamescope_enabled = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        path,
+                        game.name,
+                        game.size,
+                        game.mtime,
+                        game.file_count,
+                        game.last_played,
+                        str(game.launcher) if game.launcher is not None else None,
+                        int(game.gamescope_enabled),
+                        game_id,
+                    ),
+                )
+
+                break
+
+    # Insert only if we couldn't find an existing record.
+    if game_id is None:
+        db.execute(
+            """
+            INSERT INTO games (
+                path,
+                name,
+                size,
+                mtime,
+                file_count,
+                last_played,
+                launcher,
+                gamescope_enabled
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                name = excluded.name,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                file_count = excluded.file_count,
+                last_played = excluded.last_played,
+                launcher = excluded.launcher,
+                gamescope_enabled = excluded.gamescope_enabled
+            """,
+            (
+                path,
+                game.name,
+                game.size,
+                game.mtime,
+                game.file_count,
+                game.last_played,
+                str(game.launcher) if game.launcher is not None else None,
+                int(game.gamescope_enabled),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET
-            name = excluded.name,
-            size = excluded.size,
-            mtime = excluded.mtime,
-            file_count = excluded.file_count,
-            last_played = excluded.last_played,
-            launcher = excluded.launcher,
-            gamescope_enabled = excluded.gamescope_enabled
-        """,
-        (
-            path,
-            game.name,
-            game.size,
-            game.mtime,
-            game.file_count,
-            game.last_played,
-            str(game.launcher) if game.launcher is not None else None,
-            int(game.gamescope_enabled),
-        ),
-    )
 
-    row = db.execute(
-        "SELECT id FROM games WHERE path = ?",
-        (path,),
-    ).fetchone()
+        row = db.execute(
+            "SELECT id FROM games WHERE path = ?",
+            (path,),
+        ).fetchone()
 
-    if row is None:
-        raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
+        if row is None:
+            raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
 
-    game_id = row["id"]
+        game_id = row["id"]
+
+    # Store the ID on the Game object for future saves.
+    game.id = game_id
 
     save_steam(db, game_id, game)
     save_steamgriddb(db, game_id, game)
+
     debug_log(f"DEBUG: saving artwork for {game.name}")
+
     save_steamgriddb_artwork(db, game_id, game)
 
 
@@ -2058,6 +2396,7 @@ class SteamGridDBAction(Enum):
 
 @dataclass
 class Game:
+    id: int | None = None
     name: str = ""
     path: Path | None = None
     size: int = 0
@@ -3276,6 +3615,7 @@ def sort_games(games: list[Game]):
 
 class GameRow(ListItem):
     def __init__(self, game: Game):
+        set_width: int = 80
         self.game = game
 
         self.icon = AutoImage()
@@ -3287,13 +3627,13 @@ class GameRow(ListItem):
 
         self.label = Static()
         self.label.styles.width = "1fr"
-
         row = Horizontal(self.icon, self.label)
         row.styles.height = 1
+        row.styles.width = set_width
         row.styles.max_height = 1
 
         super().__init__(row)
-
+        self.styles.width = set_width
         self.refresh_row()
 
     async def refresh_icon(self):
@@ -3434,6 +3774,7 @@ class GameArchiver(App):
     ListView {
         width: 1fr;
         border: solid white;
+        overflow-x: auto;          /* enable horizontal scroll */
     }
 
     #status {
@@ -3454,7 +3795,6 @@ class GameArchiver(App):
         padding: 0;
         align: center top;
     }
-
 
     #library-art {
         padding: 0;
@@ -3671,6 +4011,7 @@ class GameArchiver(App):
 
                 for row in rows:
                     game = Game(
+                        id=row["id"],
                         name=row["name"],
                         path=Path(row["path"]) if row["path"] else None,
                         size=row["size"],
@@ -3808,7 +4149,7 @@ class GameArchiver(App):
         except Exception as e:  # noqa: BLE001 - Prevent database loading errors from crashing startup.
             self.notify(f"Error loading game data: {type(e).__name__}: {e}")
 
-    def save_game_data(self):
+    def save_game_data(self) -> None:
         debug_log("DEBUG: save_game_data called")
 
         try:
