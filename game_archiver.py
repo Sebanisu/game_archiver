@@ -2803,30 +2803,24 @@ def launch_path(game: Game) -> Path:
     return game.path
 
 
-def find_launchers(path: Path) -> list[Path]:
+def find_launchers(path: Path, max_depth: int = 3) -> list[Path]:
     if not path.is_dir():
         return []
 
     launchers: list[Path] = []
 
-    for p in path.iterdir():
-        if p.is_file():
-            if p.suffix in LAUNCHER_EXTS or (
-                p.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            ):
-                launchers.append(p)
-
-        elif p.is_dir():
-            for child in p.iterdir():
-                if child.is_file() and (
-                    child.suffix in LAUNCHER_EXTS
-                    or child.stat().st_mode
-                    & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    def scan(directory: Path, depth: int):
+        for p in directory.iterdir():
+            if p.is_file():
+                if p.suffix.lower() in LAUNCHER_EXTS or (
+                    p.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 ):
-                    launchers.append(child)
+                    launchers.append(p)
 
-    if not launchers:
-        return []
+            elif p.is_dir() and depth < max_depth:
+                scan(p, depth + 1)
+
+    scan(path, 1)
 
     return sorted(
         launchers,
@@ -3886,7 +3880,7 @@ class GameArchiver(App):
             return
 
         root = launch_path(game)
-        launchers = find_launchers(root)
+        launchers = find_launchers(root, max_depth=5)
 
         if not launchers:
             self.notify(f"No launchers found for {game.name}.")
