@@ -2418,7 +2418,7 @@ async def get_vndb_api_token(app) -> str | None:
             )
         )
 
-        if choice == "cancel":
+        if choice is None or choice == "cancel":
             return None
 
         if choice == "open":
@@ -2434,7 +2434,6 @@ async def get_vndb_api_token(app) -> str | None:
                     password=False,
                 )
             )
-
             key = result.value.strip() if result and result.value else ""
 
             if not key:
@@ -4339,6 +4338,9 @@ class GameArchiver(App):
                     case NoArtworkMatchAction.CANCEL:
                         return
 
+                    case None:
+                        return
+
                     case NoArtworkMatchAction.SEARCH:
                         new_query = await self.push_screen_wait(
                             InputDialog(
@@ -4417,6 +4419,8 @@ class GameArchiver(App):
             )
 
             match action:
+                case None:
+                    return
                 case SelectionDialogAction.CANCEL:
                     return
                 case SelectionDialogAction.SEARCH:
@@ -4486,6 +4490,9 @@ class GameArchiver(App):
             action = await self.push_screen_wait(SteamGridDBDialog(game))
 
             match action:
+                case None:
+                    return
+
                 case SteamGridDBAction.CANCEL:
                     return
 
@@ -4646,6 +4653,9 @@ class GameArchiver(App):
             )
 
             match action:
+                case None:
+                    continue
+
                 case ArtworkSelectionDialogAction.CANCEL:
                     continue
 
@@ -4978,7 +4988,7 @@ class GameArchiver(App):
                 )
             )
 
-            if choice == "cancel":
+            if choice is None or choice == "cancel":
                 return None
 
             if choice == "open":
@@ -5210,6 +5220,10 @@ class OptionDialog(ModalScreen[str | None]):
     }
     """
 
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
+
     def __init__(
         self,
         title: str,
@@ -5285,6 +5299,10 @@ class InputDialog(ModalScreen[InputDialogResult | None]):
         margin-left: 1;
     }
     """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -5367,7 +5385,7 @@ class NoArtworkMatchAction(StrEnum):
     CANCEL = "cancel"
 
 
-class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction]):
+class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction | None]):
     DEFAULT_CSS = """
     NoArtworkMatchDialog {
         align: center middle;
@@ -5388,6 +5406,10 @@ class NoArtworkMatchDialog(ModalScreen[NoArtworkMatchAction]):
         align-horizontal: right;
     }
     """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
 
     def __init__(self, query: str):
         super().__init__()
@@ -5463,6 +5485,10 @@ class ArtworkTypeDialog(ModalScreen[ArtworkTypeDialogResult | None]):
         margin-top: 1;
     }
     """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
 
     def __init__(
         self,
@@ -5794,6 +5820,10 @@ class ArtworkSelectionDialog(
     }
     """
 
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
+
     def __init__(
         self,
         title: str,
@@ -5990,6 +6020,10 @@ class SelectionDialog(ModalScreen[tuple[SelectionDialogAction, dict | None]]):
     }
     """
 
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
+
     def __init__(
         self,
         title: str,
@@ -6099,7 +6133,7 @@ class SelectionDialog(ModalScreen[tuple[SelectionDialogAction, dict | None]]):
 # ============================================================
 # SteamGridDB Dialog
 # ============================================================
-class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
+class SteamGridDBDialog(ModalScreen[SteamGridDBAction | None]):
     DEFAULT_CSS = """
     SteamGridDBDialog {
         align: center middle;
@@ -6127,6 +6161,10 @@ class SteamGridDBDialog(ModalScreen[SteamGridDBAction]):
         margin: 0 1;
     }
     """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "Cancel", show=False, priority=True),
+    ]
 
     def __init__(
         self,
