@@ -30,6 +30,7 @@ from urllib.parse import quote
 import httpx
 import vdf
 from PIL import Image
+from rich.traceback import install
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -55,6 +56,7 @@ try:
 except ImportError:
     tomli_w = None
 
+install(show_locals=False)
 
 # ============================================================
 # CONFIG
@@ -68,7 +70,7 @@ DATABASE_SCHEMA_VERSION = 8
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0  # 1024 * 1024  # 1 MB
-LOGGING_ENABLED = False  # DEBUG
+LOGGING_ENABLED = True  # DEBUG
 LOGGING_FILE = "/tmp/game_archiver-debug.log"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +222,10 @@ BAD_LAUNCHER_NAMES = (
     "dxsetup",
     "vc_redist",
     "redist",
+    "xalia",
+    "explorer",
+    "zsync",
+    "zsyncmake",
 )
 
 
@@ -232,6 +238,8 @@ IGNORE_DIRS = {
     "cache",
     ".cache",
     "__pycache__",
+    "drive_c",
+    "windows",
 }
 
 LAUNCHER_EXTS = (".sh", ".AppImage", ".x86_64", ".exe", ".swf", ".apk")
@@ -981,13 +989,17 @@ def reconcile_game_paths(
     db: sqlite3.Connection,
     games: list[Game],
 ):
-    rows = db.execute("SELECT id, path FROM games").fetchall()
+    rows = db.execute("SELECT id, path FROM games WHERE path IS NOT NULL").fetchall()
 
-    existing_paths = {
-        game_identity(Game(name="", path=Path(row["path"]))): row
-        for row in rows
-        if row["path"] is not None
-    }
+    existing_paths = {}
+
+    for row in rows:
+        identity = game_identity(Game(name="", path=Path(row["path"])))
+
+        if identity is None:
+            continue
+
+        existing_paths.setdefault(identity, []).append(row)
 
     for game in games:
         if game.path is None:
@@ -998,20 +1010,67 @@ def reconcile_game_paths(
         if identity is None:
             continue
 
-        row = existing_paths.get(identity)
+        location = get_game_location(game.path)
 
-        if row is None or row["path"] == str(game.path):
+        canonical_path = game.path
+
+        if location is not None:
+            relative_path = next(
+                (
+                    game.path.relative_to(base)
+                    for base in (location.local_path, location.remote_path)
+                    if base is not None and game.path.is_relative_to(base)
+                ),
+                None,
+            )
+
+            if relative_path is not None:
+                remote_path = (
+                    location.remote_path / relative_path
+                    if location.remote_path is not None
+                    else None
+                )
+
+                local_path = (
+                    location.local_path / relative_path
+                    if location.local_path is not None
+                    else None
+                )
+
+                if remote_path is not None and remote_path.exists():
+                    canonical_path = remote_path
+                elif local_path is not None and local_path.exists():
+                    canonical_path = local_path
+
+        matching_rows = existing_paths.get(identity, [])
+
+        if not matching_rows:
             continue
 
-        db.execute(
-            "UPDATE games SET path = ? WHERE id = ?",
-            (str(game.path), row["id"]),
+        # Prefer an existing remote record when one is available.
+        existing_row = next(
+            (
+                row
+                for row in matching_rows
+                if location is not None
+                and location.remote_path is not None
+                and Path(row["path"]).is_relative_to(location.remote_path)
+            ),
+            matching_rows[0],
         )
 
-        existing_paths[identity] = {
-            "id": row["id"],
-            "path": str(game.path),
-        }
+        if existing_row["path"] != str(canonical_path):
+            db.execute(
+                "UPDATE games SET path = ? WHERE id = ?",
+                (str(canonical_path), existing_row["id"]),
+            )
+
+        existing_paths[identity] = [
+            {
+                "id": existing_row["id"],
+                "path": str(canonical_path),
+            }
+        ]
 
 
 def save_game(
@@ -1223,7 +1282,7 @@ def save_steamgriddb_artwork(
     def persist_artwork(
         artwork_type: ArtworkType,
         asset: dict,
-    ) -> int:
+    ) -> int | None:
         source = asset.get("source", "steamgriddb")
         external_id = asset.get("id")
         external_id = str(external_id) if external_id is not None else None
@@ -1310,13 +1369,15 @@ def save_steamgriddb_artwork(
 
         # SteamGridDB assets are identified through their association table.
         if sgdb_game_id is None:
-            raise ValueError(
-                f"Cannot persist {source!r} artwork without a SteamGridDB game ID"
+            debug_log(
+                f"Skipping {source!r} artwork {external_id!r}: "
+                "missing SteamGridDB game ID"
             )
+            return None
+
         if external_id is None:
-            raise ValueError(
-                f"Cannot persist {source!r} artwork without an external ID"
-            )
+            debug_log(f"Skipping {source!r} artwork: missing external ID")
+            return None
 
         row = db.execute(
             """
@@ -1417,6 +1478,8 @@ def save_steamgriddb_artwork(
                 raise ValueError(f"Unknown artwork type: {artwork_type!r}") from exc
 
         artwork_id = persist_artwork(artwork_type, asset)
+        if not artwork_id:
+            continue
         downloaded_path = selected_info.get("downloaded_path")
         installed_path = selected_info.get("installed_path")
 
@@ -2285,9 +2348,6 @@ def merge_games(existing: list[Game], scanned: list[Game]):
             # Keep metadata, but use the path discovered by this scan.
             existing_game.path = scanned_game.path
             existing_game.name = scanned_game.name
-            existing_game.size = scanned_game.size
-            existing_game.mtime = scanned_game.mtime
-            existing_game.file_count = scanned_game.file_count
 
     sort_games(existing)
 
@@ -2700,15 +2760,24 @@ def find_icons(root: Path) -> list[IconCandidate]:
             dirs[:] = []
             continue
 
+        if any(part in IGNORE_DIRS for part in Path(current).parts):
+            continue
+
         for file in sorted(files):
             path = Path(current) / file
             name = file.casefold()
 
             if path.suffix.casefold() == ImageExtension.EXE:
+                name = path.name.casefold()
+
+                if any(bad in name for bad in BAD_LAUNCHER_NAMES):
+                    continue
+
                 if best_exe is None or launcher_score(path, root) < launcher_score(
                     best_exe, root
                 ):
                     best_exe = path
+
                 continue
 
             # Best possible icon
@@ -3598,6 +3667,7 @@ class GameArchiver(App):
                 ).fetchall()
 
                 games = []
+                seen_identities = {}
 
                 for row in rows:
                     game = Game(
@@ -3614,6 +3684,53 @@ class GameArchiver(App):
                         ),
                         gamescope_enabled=bool(row["gamescope_enabled"]),
                     )
+
+                    identity = game_identity(game)
+
+                    if identity is not None:
+                        existing_id = seen_identities.get(identity)
+
+                        if existing_id is not None:
+                            debug_log(
+                                f"Skipping duplicate game ID {row['id']} "
+                                f"({game.name!r}, {game.path}); "
+                                f"keeping ID {existing_id}"
+                            )
+                            continue
+
+                        seen_identities[identity] = row["id"]
+
+                        location = get_game_location(game.path)
+
+                        if location is not None and location.remote_path is not None:
+                            relative_path = next(
+                                (
+                                    game.path.relative_to(base)
+                                    for base in (
+                                        location.local_path,
+                                        location.remote_path,
+                                    )
+                                    if base is not None
+                                    and game.path.is_relative_to(base)
+                                ),
+                                None,
+                            )
+
+                            if relative_path is not None:
+                                remote_path = location.remote_path / relative_path
+
+                                if remote_path.is_dir() and game.path != remote_path:
+                                    debug_log(
+                                        f"Updating game ID {row['id']} path: "
+                                        f"{game.path} -> {remote_path}"
+                                    )
+
+                                    db.execute(
+                                        "UPDATE games SET path = ? WHERE id = ?",
+                                        (str(remote_path), row["id"]),
+                                    )
+
+                                    game.path = remote_path
 
                     if row["steam_key"] is not None:
                         game.steam_key = row["steam_key"]
@@ -3661,6 +3778,7 @@ class GameArchiver(App):
                         ) = load_steamgriddb_artwork(db, game_id)
 
                     games.append(game)
+
                 sort_games(games)
 
                 shared_games = []
@@ -5228,8 +5346,18 @@ class GameArchiver(App):
         art_type: ArtworkType,
         extension: str,
         appid: str | int | None = None,
+        is_steam_game: bool = False,
     ) -> Path | None:
-        appid = appid if appid is not None else game_appid(game)
+        if is_steam_game:
+            metadata = game.steamgriddb.get("steam_platform_data") or {}
+            steam_apps = metadata.get("external_platform_data", {}).get("steam", [])
+            appid = steam_apps[0].get("id") if steam_apps else None
+
+            if not appid:
+                appid = game_appid(game)
+        else:
+            appid = appid if appid is not None else game_appid(game)
+
         extension = extension.lower()
 
         if not extension.startswith("."):
@@ -5294,12 +5422,7 @@ class GameArchiver(App):
         image: Path | str,
     ) -> bool:
         image = Path(image)
-        if not can_add_to_steam(game):
-            self.notify(
-                f"Adding artwork to Steam games is not supported for {game.name}.",
-                severity="error",
-            )
-            return False
+
         if not image.is_file():
             self.notify(
                 f"Artwork file not found: {image}",
@@ -5312,9 +5435,9 @@ class GameArchiver(App):
                 extracted = await to_thread(extract_exe_icon, image)
 
                 if extracted is None:
-                    self.notify(
-                        f"Failed to extract icon from {image.name}.",
-                        severity="error",
+                    debug_log(
+                        f"Icon extraction failed: {image} "
+                        "(no extractable icon or unsupported executable)"
                     )
                     return False
 
@@ -5329,6 +5452,7 @@ class GameArchiver(App):
                 game,
                 art_type,
                 image_to_install.suffix,
+                is_steam_game=not can_add_to_steam(game),
             )
         )
 
@@ -5343,18 +5467,22 @@ class GameArchiver(App):
         if image_to_install.resolve() != dest.resolve():
             await to_thread(shutil.copy2, image_to_install, dest)
 
-        # Remove artwork of the same type that uses another extension.
-        # Keep the newly installed destination.
         for old_path in self.find_installed_artwork(game, art_type):
             if old_path.resolve() == dest.resolve():
                 continue
 
             old_path.unlink(missing_ok=True)
+
         selected = game.steamgriddb["selected"][art_type]
         selected["installed_path"] = dest
 
         self.save_game_data()
         self.refresh_game_row(game)
+
+        # Steam-managed games: persist the selection without installing artwork.
+        if not can_add_to_steam(game):
+            return True
+
         if art_type == ArtworkType.ICON:
             if not steam_running():
                 await self.sync_shortcut(game)
