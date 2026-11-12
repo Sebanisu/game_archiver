@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 import httpx
 import vdf
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from rich.traceback import install
 from textual import work
 from textual.app import App, ComposeResult
@@ -240,6 +240,10 @@ IGNORE_DIRS = {
     "__pycache__",
     "drive_c",
     "windows",
+    "Steamworks",
+    "Proton",
+    "DotNet",
+    "_CommonRedist",
 }
 
 LAUNCHER_EXTS = (".sh", ".AppImage", ".x86_64", ".exe", ".swf", ".apk")
@@ -1357,20 +1361,39 @@ def reconcile_game_paths(
         ]
 
 
-def save_game(
-    db: sqlite3.Connection,
-    game: Game,
-):
+def save_game(db: sqlite3.Connection, game: Game) -> None:
     if game.path is None:
         raise RuntimeError(f"Cannot save game without a path: {game.name}")
 
     path = str(game.path)
+    params = (
+        path,
+        game.name,
+        game.size,
+        game.mtime,
+        game.file_count,
+        game.last_played,
+        str(game.launcher) if game.launcher is not None else None,
+        int(game.gamescope_enabled),
+    )
+
     game_id = game.id
 
-    # Only check identity for games that don't already have a database ID.
-    if game_id is None:
+    # 1. Already known ID → just update
+    if game_id is not None:
+        db.execute(
+            """
+            UPDATE games
+            SET path = ?, name = ?, size = ?, mtime = ?,
+                file_count = ?, last_played = ?, launcher = ?,
+                gamescope_enabled = ?
+            WHERE id = ?
+            """,
+            (*params, game_id),
+        )
+    else:
+        # 2. Try identity match (path may have changed)
         identity = game_identity(game)
-
         if identity is not None:
             rows = db.execute(
                 "SELECT id, path FROM games WHERE path != ?",
@@ -1378,96 +1401,94 @@ def save_game(
             ).fetchall()
 
             for row in rows:
-                existing_identity = game_identity(Game(name="", path=Path(row["path"])))
+                existing = Game(name="", path=Path(row["path"]))
+                if game_identity(existing) == identity:
+                    game_id = row["id"]
+                    db.execute(
+                        """
+                        UPDATE games
+                        SET path = ?, name = ?, size = ?, mtime = ?,
+                            file_count = ?, last_played = ?, launcher = ?,
+                            gamescope_enabled = ?
+                        WHERE id = ?
+                        """,
+                        (*params, game_id),
+                    )
+                    break
 
-                if existing_identity != identity:
-                    continue
-
-                game_id = row["id"]
-
-                db.execute(
-                    """
-                    UPDATE games
-                    SET path = ?,
-                        name = ?,
-                        size = ?,
-                        mtime = ?,
-                        file_count = ?,
-                        last_played = ?,
-                        launcher = ?,
-                        gamescope_enabled = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        path,
-                        game.name,
-                        game.size,
-                        game.mtime,
-                        game.file_count,
-                        game.last_played,
-                        str(game.launcher) if game.launcher is not None else None,
-                        int(game.gamescope_enabled),
-                        game_id,
-                    ),
+        # 3. Still no ID → insert (or upsert on path)
+        if game_id is None:
+            db.execute(
+                """
+                INSERT INTO games (
+                    path, name, size, mtime, file_count,
+                    last_played, launcher, gamescope_enabled
                 )
-
-                break
-
-    # Insert only if we couldn't find an existing record.
-    if game_id is None:
-        db.execute(
-            """
-            INSERT INTO games (
-                path,
-                name,
-                size,
-                mtime,
-                file_count,
-                last_played,
-                launcher,
-                gamescope_enabled
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    name = excluded.name,
+                    size = excluded.size,
+                    mtime = excluded.mtime,
+                    file_count = excluded.file_count,
+                    last_played = excluded.last_played,
+                    launcher = excluded.launcher,
+                    gamescope_enabled = excluded.gamescope_enabled
+                """,
+                params,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                name = excluded.name,
-                size = excluded.size,
-                mtime = excluded.mtime,
-                file_count = excluded.file_count,
-                last_played = excluded.last_played,
-                launcher = excluded.launcher,
-                gamescope_enabled = excluded.gamescope_enabled
-            """,
-            (
-                path,
-                game.name,
-                game.size,
-                game.mtime,
-                game.file_count,
-                game.last_played,
-                str(game.launcher) if game.launcher is not None else None,
-                int(game.gamescope_enabled),
-            ),
-        )
+            row = db.execute("SELECT id FROM games WHERE path = ?", (path,)).fetchone()
+            if row is None:
+                raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
+            game_id = row["id"]
 
-        row = db.execute(
-            "SELECT id FROM games WHERE path = ?",
-            (path,),
-        ).fetchone()
-
-        if row is None:
-            raise RuntimeError(f"Failed to retrieve database ID for game: {path}")
-
-        game_id = row["id"]
-
-    # Store the ID on the Game object for future saves.
     game.id = game_id
 
     save_steam(db, game_id, game)
     save_steamgriddb(db, game_id, game)
-
     debug_log(f"DEBUG: saving artwork for {game.name}")
-
     save_steamgriddb_artwork(db, game_id, game)
+
+
+def purge_game_record(
+    db: sqlite3.Connection,
+    game_id: int | None,
+    game_path: Path | None,
+) -> None:
+    if game_id is not None:
+        db.execute(
+            "DELETE FROM games WHERE id = ?",
+            (game_id,),
+        )
+    elif game_path is not None:
+        db.execute(
+            "DELETE FROM games WHERE path = ?",
+            (str(game_path),),
+        )
+    else:
+        raise ValueError("Cannot delete a game without an ID or path")
+
+    # Remove artwork that is no longer associated with any game.
+    # Artwork shared by other games is preserved.
+    db.execute(
+        """
+        DELETE FROM artwork
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM game_artwork
+            WHERE game_artwork.artwork_id = artwork.id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM selected_artwork
+            WHERE selected_artwork.artwork_id = artwork.id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM steamgriddb_artwork
+            WHERE steamgriddb_artwork.artwork_id = artwork.id
+        )
+        """
+    )
 
 
 def save_steam(
@@ -2419,6 +2440,13 @@ class Game:
 # ============================================================
 
 
+def should_ignore_game(path: Path, root: Path) -> bool:
+    return any(
+        part.startswith(".") or part in IGNORE_DIRS
+        for part in path.relative_to(root).parts
+    )
+
+
 def can_add_to_steam(game: Game) -> bool:
     if game.path is None:
         return False
@@ -3099,7 +3127,7 @@ def find_icons(root: Path) -> list[IconCandidate]:
             dirs[:] = []
             continue
 
-        if any(part in IGNORE_DIRS for part in Path(current).parts):
+        if should_ignore_game(Path(current), root):
             continue
 
         for file in sorted(files):
@@ -3430,18 +3458,13 @@ def game_list_changed(
 ) -> bool:
     cached = {(g.name, g.mtime) for g in games}
 
-    if path is None:
-        return False
-    if not path.exists():
+    if path is None or not Path(path).exists():
         return False
 
     current = {
-        (
-            p.name,
-            p.stat().st_mtime,
-        )
+        (p.name, p.stat().st_mtime)
         for p in path.iterdir()
-        if p.is_dir()
+        if p.is_dir() and not should_ignore_game(p, path)
     }
 
     return current != cached
@@ -3502,7 +3525,10 @@ def dir_size(path: Path) -> int:
         else:
             target = path
 
-        exclude_args = [f"--exclude={name}" for name in IGNORE_DIRS]
+        exclude_args = [
+            *(f"--exclude={name}" for name in IGNORE_DIRS),
+            "--exclude=*/.*",
+        ]
 
         result = subprocess.run(
             ["du", "-sb", *exclude_args, str(target)],
@@ -3534,7 +3560,7 @@ def latest_activity(path: Path) -> float:
             if not p.is_file():
                 continue
 
-            if any(part in IGNORE_DIRS for part in p.parts):
+            if should_ignore_game(p, path):
                 continue
 
             try:
@@ -3584,11 +3610,7 @@ def scan_games(base: Path | None) -> list[Game]:
         return games
 
     for item in sorted(base.iterdir()):
-        if not item.is_dir():
-            continue
-
-        # Ignore hidden and ignored directories.
-        if item.name.startswith(".") or item.name in IGNORE_DIRS:
+        if not item.is_dir() or should_ignore_game(Path(item), base):
             continue
 
         game = Game(name=item.name, path=item)
@@ -3886,6 +3908,7 @@ class GameArchiver(App):
         Binding("g", "download_steamgriddb", "SteamGridDB"),
         Binding("alt+p", "open_proton_prefix", "Open Proton Prefix"),
         Binding("f2", "switch_mode", "Switch Mode"),
+        Binding("delete", "delete_game", "Delete"),
     ]
 
     def __init__(self, **kwargs):
@@ -3919,17 +3942,19 @@ class GameArchiver(App):
 
     async def update_library_artwork(self, game: Game):
         artwork = None
+        artwork_type = None
 
-        for artwork_type in (
+        for candidate_type in (
             ArtworkType.HERO,
             ArtworkType.GRID_LANDSCAPE,
             ArtworkType.GRID_PORTRAIT,
             ArtworkType.GRID_SQUARE,
             ArtworkType.ICON,
         ):
-            artwork = await self.get_selected_artwork_path(game, artwork_type)
-
-            if artwork and artwork.is_file():
+            path = await self.get_selected_artwork_path(game, candidate_type)
+            if path and path.is_file():
+                artwork = path
+                artwork_type = candidate_type
                 break
 
         # if self.app_mode != AppMode.LIBRARY or self.highlighted_game_path != game.path:
@@ -3938,33 +3963,46 @@ class GameArchiver(App):
         container = self.query_one("#details-artwork", Vertical)
         await container.remove_children()
 
-        if artwork:
-            if artwork_type is ArtworkType.HERO:
-                with Image.open(artwork) as img:
-                    image_width, image_height = img.size
-                    height = round(
-                        (container.size.width * image_height / image_width) / 2
-                    )
-                    debug_log(
-                        f"Artwork size: {image_width}x{image_height}, container width: {container.size.width}, calculated height: {height}"
-                    )
-                    container.styles.height = height
-            else:
-                container.styles.height = 10
-
-            debug_log(f"Artwork path: {artwork}")
-            debug_log(f"Exists: {artwork.is_file()}")
-            debug_log(f"Size: {artwork.stat().st_size if artwork.is_file() else 'N/A'}")
-
-            image = AutoImage(str(artwork), id="library-art")
-            await container.mount(image)
-
-            debug_log(f"Mounted: {image.is_mounted}")
-            debug_log(f"Container size: {container.size}")
-            debug_log(f"Image size: {image.size}")
-        else:
+        if not artwork:
             container.styles.height = 0
-            debug_log("No artwork found for the game.")
+            return
+
+        # Resolve .exe icons first
+        if artwork.suffix.lower() == ".exe":
+            artwork = await to_thread(extract_exe_icon, artwork)
+
+        if artwork is None or not artwork.is_file():
+            debug_log("No usable artwork image found")
+            container.styles.height = 0
+            return
+
+        # Validate that it is a real image
+        try:
+            with Image.open(artwork) as img:
+                img.verify()
+                # reopen because verify() can leave the file pointer in a bad state
+                img = Image.open(artwork)
+                image_width, image_height = img.size
+        except (UnidentifiedImageError, OSError):
+            debug_log(f"Invalid artwork image: {artwork}")
+            container.styles.height = 0
+            return
+
+        # Now safe to set height
+        if artwork_type is ArtworkType.HERO:
+            # Guard against zero-width container (not laid out yet)
+            width = container.size.width or 1
+            height = round((width * image_height / image_width) / 2)
+            debug_log(
+                f"Artwork size: {image_width}x{image_height}, "
+                f"container width: {container.size.width}, calculated height: {height}"
+            )
+            container.styles.height = height
+        else:
+            container.styles.height = 10
+
+        image = AutoImage(str(artwork), id="library-art")
+        await container.mount(image)
 
     def load_game_data(self) -> None:
         try:
@@ -4630,12 +4668,17 @@ class GameArchiver(App):
             else "Not installed"
         )
 
+        location = get_game_location(game.path) if game.path else None
+
         info.update(
             f"Size: {game.size:,} bytes\n"
             f"Files: {game.file_count:,}\n"
             f"Last Played: {last_played}\n"
             f"Launcher: {launcher}\n"
             f"Steam: {steam_status}\n"
+            f"Shared/Synced: {game in self.shared_games}\n"
+            f"Archived/Remote: {game in self.archived_games}\n"
+            f"Game Location: {location.name if location else 'Outside configured locations'}\n"
             f"Gamescope: {'Enabled' if game.gamescope_enabled else 'Disabled'}"
         )
         self.run_worker(
@@ -4763,6 +4806,88 @@ class GameArchiver(App):
 
     # ========================================================
 
+    @work
+    async def action_delete_game(self):
+        if self.dialog_open or self.is_scan_running():
+            return
+
+        game = self.get_highlighted_game()
+
+        if game is None:
+            return
+
+        # Remember the adjacent game so we can preserve the selection.
+        view = self.current_view()
+        current_index = view.index if view and view.index is not None else 0
+
+        remaining_visible = (
+            [
+                row.game
+                for row in view.children
+                if isinstance(row, GameRow) and row.game is not game
+            ]
+            if view is not None
+            else []
+        )
+
+        self.dialog_open = True
+
+        try:
+            choice = await self.push_screen_wait(
+                OptionDialog(
+                    title="Delete Game",
+                    message=(
+                        f"Remove {game.name} and all its saved library metadata?\n\n"
+                        "The game files themselves will NOT be deleted."
+                    ),
+                    options=[
+                        ("Delete", "delete"),
+                        ("Cancel", "cancel"),
+                    ],
+                )
+            )
+        finally:
+            self.dialog_open = False
+
+        if choice != "delete":
+            return
+
+        # Delete the database record and its orphaned artwork.
+        try:
+            with get_db() as db:
+                purge_game_record(db, game.id, game.path)
+                db.commit()
+
+        except (sqlite3.Error, ValueError) as e:
+            self.notify(
+                f"Failed to delete {game.name}: {type(e).__name__}: {e}",
+                severity="error",
+            )
+            return
+
+        # Remove the game from every in-memory collection.
+        for games in (
+            self.shared_games,
+            self.archived_games,
+            self.library_only_games,
+            self.games,
+        ):
+            games[:] = [candidate for candidate in games if candidate is not game]
+
+        # Select the next game in the current view, if available.
+        if remaining_visible:
+            next_index = min(current_index, len(remaining_visible) - 1)
+            self.highlighted_game_path = remaining_visible[next_index].path
+        else:
+            self.highlighted_game_path = None
+
+        self.refresh_views()
+
+        if self.app_mode == AppMode.LIBRARY and not remaining_visible:
+            self.update_library_details(None)
+
+        self.notify(f"Removed {game.name} from the library.")
+
     def action_switch_mode(self):
         modes = list(AppMode)
         current_index = modes.index(self.app_mode)
@@ -4792,36 +4917,39 @@ class GameArchiver(App):
             self.notify(f"No launchers found for {game.name}.")
             return
         previous_gamescope_enabled = game.gamescope_enabled
-
-        selected = await self.push_screen_wait(
-            LauncherDialog(
-                root=root,
-                launchers=launchers,
-                current=game.launcher,
-                game=game,
+        self.dialog_open = True
+        try:
+            selected = await self.push_screen_wait(
+                LauncherDialog(
+                    root=root,
+                    launchers=launchers,
+                    current=game.launcher,
+                    game=game,
+                )
             )
-        )
+            gamescope_changed = previous_gamescope_enabled != game.gamescope_enabled
+            launcher_changed = selected is not None and selected != game.launcher
 
-        gamescope_changed = previous_gamescope_enabled != game.gamescope_enabled
-        launcher_changed = selected is not None and selected != game.launcher
+            if not gamescope_changed and not launcher_changed:
+                return
 
-        if not gamescope_changed and not launcher_changed:
-            return
+            if launcher_changed:
+                game.launcher = selected
+                await self.sync_shortcut(game)
 
-        if launcher_changed:
-            game.launcher = selected
-            await self.sync_shortcut(game)
+            self.save_game_data()
+            self.refresh_game_row(game)
 
-        self.save_game_data()
-        self.refresh_game_row(game)
+            if launcher_changed:
+                self.notify(f"Launcher updated: {selected.name}")
 
-        if launcher_changed:
-            self.notify(f"Launcher updated: {selected.name}")
-
-        if gamescope_changed:
-            self.notify(
-                f"Gamescope {'enabled' if game.gamescope_enabled else 'disabled'}"
-            )
+            if gamescope_changed:
+                self.notify(
+                    f"Gamescope {'enabled' if game.gamescope_enabled else 'disabled'}"
+                )
+            self.update_library_details(game)
+        finally:
+            self.dialog_open = False
 
     def action_open_proton_prefix(self):
         game = self.get_highlighted_game()
@@ -5054,8 +5182,6 @@ class GameArchiver(App):
         elif game in self.archived_games:
             sort_games(self.archived_games)
 
-        self.save_game_data()
-
         self.refresh_views()
 
         try:
@@ -5063,8 +5189,8 @@ class GameArchiver(App):
         except RuntimeError as e:
             self.notify(str(e))
             return
-
-        self.save_game_data()
+        finally:
+            self.save_game_data()
 
         subprocess.Popen(
             info.cmd,
