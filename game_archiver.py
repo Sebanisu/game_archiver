@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import binascii
-import copy
 import hashlib
 import json
 import os
@@ -19,6 +18,7 @@ import time
 import tomllib
 import webbrowser
 from asyncio import to_thread
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum, StrEnum, auto
@@ -2438,6 +2438,9 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+def has_steamgriddb_match(game: Game) -> bool:
+    sgdb_game = game.steamgriddb.get("game")
+    return isinstance(sgdb_game, dict) and bool(sgdb_game.get("id"))
 
 
 def should_ignore_game(path: Path, root: Path) -> bool:
@@ -4614,6 +4617,19 @@ class GameArchiver(App):
         elif self.app_mode == AppMode.LIBRARY:
             self.update_library_details(None)
 
+    def get_row_for_game(self, game: Game) -> GameRow | None:
+        return next(
+            (
+                row
+                for row in self.current_view().query(GameRow)
+                if (
+                    (game.id is not None and row.game.id == game.id)
+                    or row.game.path == game.path
+                )
+            ),
+            None,
+        )
+
     def get_highlighted_row(self) -> GameRow | None:
         view = self.current_view()
 
@@ -5012,6 +5028,29 @@ class GameArchiver(App):
 
         self.refresh_views()
 
+    def get_current_game_list(self) -> list[Game]:
+        if self.app_mode is AppMode.LIBRARY:
+            return self.library_games
+        elif self.app_mode is AppMode.MOVE and self.shared_view.has_focus:
+            return self.shared_games
+        elif self.app_mode is AppMode.MOVE and self.archived_view.has_focus:
+            return self.archived_games
+
+        return []
+
+    def get_selected_games(self) -> list[Game]:
+        return [g for g in self.get_current_game_list() if g.selected]
+
+    def get_games_for_action(self) -> list[Game]:
+        games = self.get_selected_games()
+
+        if not games:
+            game = self.get_highlighted_game()
+            if game is not None:
+                games = [game]
+
+        return games
+
     async def action_move_selected(self):
         if self.app_mode != AppMode.MOVE:
             self.notify("Only available in MOVE mode")
@@ -5027,11 +5066,9 @@ class GameArchiver(App):
         archived_location = get_location("Archived")
 
         if self.shared_view.has_focus:
-            source = self.shared_games
             destination = self.archived_games
             target = archived_location.remote_path
         else:
-            source = self.archived_games
             destination = self.shared_games
             target = shared_location.remote_path
 
@@ -5040,7 +5077,7 @@ class GameArchiver(App):
             self.moving = False
             return
 
-        moved = await self.move_games(source, destination, target)
+        moved = await self.move_games(destination, target)
 
         if not moved:
             self.moving = False
@@ -5052,14 +5089,14 @@ class GameArchiver(App):
 
     async def move_games(
         self,
-        source_games: list[Game],
         destination_games: list[Game],
         target: Path,
     ) -> bool:
         if not self.storage_online:
-            return
+            return False
+        source_games = self.get_current_game_list()
+        moving = self.get_selected_games()
 
-        moving = [g for g in source_games if g.selected]
         if not moving:
             return False
 
@@ -6102,32 +6139,126 @@ class GameArchiver(App):
 
                 return key.value.strip()
 
+    async def apply_steamgriddb_to_all(
+        self,
+        games: list[Game],
+        client: SteamGridDBClient,
+    ):
+        source_game = games[0]
+
+        if has_steamgriddb_match(source_game):
+            await self.manage_steamgriddb(source_game, client)
+        else:
+            await self.link_steamgriddb(source_game, client)
+
+        # Check the final state after all dialog switching is finished.
+        if not has_steamgriddb_match(source_game):
+            self.notify("No SteamGridDB match selected.")
+            return
+
+        source_data = source_game.steamgriddb
+        selected = source_data.get("selected") or {}
+
+        selections = {
+            art_type: deepcopy(info)
+            for art_type, info in selected.items()
+            if isinstance(info, dict)
+            and info.get("asset") is not None
+            and info.get("downloaded_path") is not None
+        }
+
+        if not selections:
+            self.notify("No artwork selected to apply.")
+            return
+
+        # Copy the SteamGridDB match and artwork metadata to the other games.
+        successful = 0
+
+        for game in games[1:]:
+            game.steamgriddb = deepcopy(source_data)
+
+            for art_type, info in selections.items():
+                game.steamgriddb["selected"][art_type] = deepcopy(info)
+
+                if await self.install_artwork(
+                    game,
+                    art_type,
+                    info["downloaded_path"],
+                ):
+                    successful += 1
+
+        self.save_game_data()
+
+        if successful:
+            self.notify(f"Applied artwork to {successful} of {len(games) - 1} games.")
+        else:
+            self.notify(
+                "Failed to install artwork for all target games.",
+                severity="error",
+            )
+
     @work
     async def action_download_steamgriddb(self):
         self.dialog_open = True
-        row = self.get_highlighted_row()
-        game = row.game
-        try:
-            key = await self.get_steamgriddb_api_key()
+        # grab the game here just encase it changes.
+        highlighted_game = self.get_highlighted_game()
+        games = self.get_games_for_action()
 
+        try:
+            if not games:
+                self.notify("No games selected or highlighted.")
+                return
+
+            key = await self.get_steamgriddb_api_key()
             if key is None:
                 return
 
-            # Create the client
             client = SteamGridDBClient(key)
-            if game is None:
-                self.notify("No game highlighted.")
+
+            # One game: use the existing workflow directly.
+            if len(games) == 1:
+                game = games[0]
+
+                if has_steamgriddb_match(game):
+                    await self.manage_steamgriddb(game, client)
+                else:
+                    await self.link_steamgriddb(game, client)
+
                 return
 
-            if game.steamgriddb.get("game"):
-                await self.manage_steamgriddb(game, client)
             else:
-                await self.link_steamgriddb(game, client)
+                choice = await self.push_screen_wait(
+                    OptionDialog(
+                        title="SteamGridDB",
+                        message=f"How would you like to apply artwork to {len(games)} games?",
+                        options=[
+                            ("Apply to All", "all"),
+                            ("Choose for Each", "each"),
+                            ("Cancel", "cancel"),
+                        ],
+                    )
+                )
+
+                if choice == "each":
+                    for game in games:
+                        if has_steamgriddb_match(game):
+                            await self.manage_steamgriddb(game, client)
+                        else:
+                            await self.link_steamgriddb(game, client)
+
+                elif choice == "all":
+                    await self.apply_steamgriddb_to_all(games, client)
+
         finally:
             self.dialog_open = False
-            if game is not None:
-                self.update_library_details(game)
-                await row.refresh_icon()
+
+            if highlighted_game is not None:
+                self.update_library_details(highlighted_game)
+
+            for game in games:
+                row = self.get_row_for_game(game)
+                if row is not None:
+                    await row.refresh_icon()
 
 
 # ============================================================
@@ -6921,7 +7052,7 @@ class ArtworkSelectionDialog(
         super().__init__()
 
         self.title = title
-        self.artwork = copy.deepcopy(artwork)
+        self.artwork = deepcopy(artwork)
         self.client = client
         self.selected_artwork = selected_artwork
 
@@ -6929,7 +7060,7 @@ class ArtworkSelectionDialog(
             selected_id = str(selected_artwork.get("id"))
 
             if not any(str(item.get("id")) == selected_id for item in self.artwork):
-                self.artwork.append(copy.deepcopy(selected_artwork))
+                self.artwork.append(deepcopy(selected_artwork))
 
     def build_item(
         self,
