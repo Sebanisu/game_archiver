@@ -5966,10 +5966,10 @@ class GameArchiver(App):
         )
 
         if dest is None:
-            self.notify(
-                f"{art_type.name} artwork cannot be installed as Steam artwork.",
-                severity="warning",
-            )
+            # self.notify(
+            #     f"{art_type.name} artwork cannot be installed as Steam artwork.",
+            #     severity="warning",
+            # )
             return False
 
         dest.parent.mkdir(parents=True, exist_ok=True)
