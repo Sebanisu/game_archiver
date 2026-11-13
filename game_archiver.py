@@ -3253,16 +3253,16 @@ def launcher_score(path: Path, root: Path):
     )
 
 
-def game_appid(game: Game) -> str:
+def game_appid(game: Game) -> str | None:
     if game.steam_entry is not None:
         appid = game.steam_entry["appid"]
+        # new generated app ids are str; when read from the parser they are int
         return appid if isinstance(appid, str) else str(appid & 0xFFFFFFFF)
-        # new generated app ids are str
-        # when read in the parser it's as an int
 
-    launcher = game.launcher
-    assert launcher is not None
-    return generate_appid(launcher, game.name)
+    if game.launcher is None:
+        return None
+
+    return generate_appid(game.launcher, game.name)
 
 
 def shortcuts_path(user: SteamUser) -> Path:
@@ -5030,7 +5030,7 @@ class GameArchiver(App):
 
     def get_current_game_list(self) -> list[Game]:
         if self.app_mode is AppMode.LIBRARY:
-            return self.library_games
+            return self.games
         elif self.app_mode is AppMode.MOVE and self.shared_view.has_focus:
             return self.shared_games
         elif self.app_mode is AppMode.MOVE and self.archived_view.has_focus:
@@ -5865,8 +5865,10 @@ class GameArchiver(App):
         else:
             appid = appid if appid is not None else game_appid(game)
 
-        extension = extension.lower()
+        if not appid:
+            return None
 
+        extension = extension.lower()
         if not extension.startswith("."):
             extension = f".{extension}"
 
@@ -6144,6 +6146,8 @@ class GameArchiver(App):
         games: list[Game],
         client: SteamGridDBClient,
     ):
+        games.sort(key=lambda game: not has_steamgriddb_match(game))
+
         source_game = games[0]
 
         if has_steamgriddb_match(source_game):
