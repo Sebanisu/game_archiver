@@ -6194,7 +6194,7 @@ class GameArchiver(App):
         self.save_game_data()
 
         if successful:
-            self.notify(f"Applied artwork to {successful} of {len(games) - 1} games.")
+            self.notify(f"Applied {successful} artworks to {len(games) - 1} games.")
         else:
             self.notify(
                 "Failed to install artwork for all target games.",
