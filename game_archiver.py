@@ -5378,28 +5378,8 @@ class GameArchiver(App):
 
         self.notify(f"Updated {updated} Steam shortcut{'s' if updated != 1 else ''}.")
 
-    def action_select_all(self):
-        if self.shared_view.has_focus:
-            games = list(self.shared_games)
-        else:
-            games = self.archived_games
-
-        if not games:
-            self.notify("No games.")
-            return
-
-        for game in games:
-            if not game.selected:
-                game.selected = True
-                self.refresh_game_row(game)
-
-        self.update_status()
-
     def action_select_none(self):
-        if self.shared_view.has_focus:
-            games = list(self.shared_games)
-        else:
-            games = self.archived_games
+        games = self.get_current_game_list()
 
         if not games:
             self.notify("No games.")
@@ -5408,6 +5388,20 @@ class GameArchiver(App):
         for game in games:
             if game.selected:
                 game.selected = False
+                self.refresh_game_row(game)
+
+        self.update_status()
+
+    def action_select_all(self):
+        games = self.get_current_game_list()
+
+        if not games:
+            self.notify("No games.")
+            return
+
+        for game in games:
+            if not game.selected:
+                game.selected = True
                 self.refresh_game_row(game)
 
         self.update_status()
