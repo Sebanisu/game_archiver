@@ -4501,16 +4501,12 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
     def refresh_game_row(self, game: Game):
-        for view in (
-            self.shared_view,
-            self.archived_view,
-            self.library_view,
-        ):
-            for row in view.children:
-                if row.game is game:
-                    row.refresh_row()
-                    self.update_status()
-                    return
+        view = self.current_view()
+        for row in view.children:
+            if row.game is game:
+                row.refresh_row()
+                self.update_status()
+                return
 
     def update_game_info(self, game: Game):
         path = game.path
@@ -5391,6 +5387,7 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
         self.update_status()
+        self.save_game_data()
 
     def action_select_all(self):
         games = self.get_current_game_list()
@@ -5405,6 +5402,7 @@ class GameArchiver(App):
                 self.refresh_game_row(game)
 
         self.update_status()
+        self.save_game_data()
 
     async def link_steamgriddb(
         self,
