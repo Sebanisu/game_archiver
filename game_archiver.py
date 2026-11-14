@@ -7051,6 +7051,7 @@ class ArtworkSelectionDialog(
         self.artwork = deepcopy(artwork)
         self.client = client
         self.selected_artwork = selected_artwork
+        self._dismiss_in_progress = False
 
         if selected_artwork and selected_artwork.get("source") == "local":
             selected_id = str(selected_artwork.get("id"))
@@ -7183,6 +7184,13 @@ class ArtworkSelectionDialog(
                     self.artwork[index],
                 )
             )
+
+    def dismiss(self, result=None):
+        if getattr(self, "_dismiss_in_progress", False):
+            return
+
+        self._dismiss_in_progress = True
+        super().dismiss(result)
 
     def action_dismiss(self):
         self.dismiss(
