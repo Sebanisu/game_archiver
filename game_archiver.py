@@ -2799,27 +2799,41 @@ def preferred_language(images: dict[str, str]) -> tuple[str, str] | None:
     return lang, images[lang]
 
 
-FALLBACKS = {
-    "library_capsule": {
-        "thumb": "library_600x900" + ImageExtension.JPG,
-        "full": "library_600x900_2x" + ImageExtension.JPG,
-    },
-    "header_image": {
-        "thumb": "header" + ImageExtension.JPG,
-        "full": "header" + ImageExtension.JPG,
-    },
-    "library_hero": {
-        "thumb": "library_hero" + ImageExtension.JPG,
-        "full": "library_hero_2x" + ImageExtension.JPG,
-    },
-    "library_logo": {
-        "thumb": "logo" + ImageExtension.PNG,
-        "full": "logo_2x" + ImageExtension.PNG,
-    },
+FALLBACKS: dict[str, list[dict[str, str]]] = {
+    "library_capsule": [
+        {
+            "thumb": "library_600x900" + ImageExtension.JPG,
+            "full": "library_600x900_2x" + ImageExtension.JPG,
+        }
+    ],
+    "header_image": [
+        {
+            "thumb": "header" + ImageExtension.JPG,
+            "full": "header" + ImageExtension.JPG,
+        }
+    ],
+    "library_hero": [
+        {
+            "thumb": "library_hero" + ImageExtension.JPG,
+            "full": "library_hero_2x" + ImageExtension.JPG,
+        },
+        {  # when hero is missing we could use this.
+            "thumb": "page_bg_raw" + ImageExtension.JPG,
+            "full": "page_bg_raw" + ImageExtension.JPG,
+        },
+    ],
+    "library_logo": [
+        {
+            "thumb": "logo" + ImageExtension.PNG,
+            "full": "logo_2x" + ImageExtension.PNG,
+        }
+    ],
 }
 
 
-def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | None]:
+def steam_art_urls(
+    metadata: dict | None,
+) -> dict[ArtworkType, list[SteamArtwork]]:
     """
     Returns:
     {
@@ -2829,13 +2843,13 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
     }
     """
 
-    art = {
-        ArtworkType.GRID_PORTRAIT: None,
-        ArtworkType.GRID_SQUARE: None,
-        ArtworkType.GRID_LANDSCAPE: None,
-        ArtworkType.HERO: None,
-        ArtworkType.LOGO: None,
-        ArtworkType.ICON: None,
+    art: dict[ArtworkType, list[SteamArtwork]] = {
+        ArtworkType.GRID_PORTRAIT: [],
+        ArtworkType.GRID_SQUARE: [],
+        ArtworkType.GRID_LANDSCAPE: [],
+        ArtworkType.HERO: [],
+        ArtworkType.LOGO: [],
+        ArtworkType.ICON: [],
     }
 
     if not metadata:
@@ -2849,80 +2863,87 @@ def steam_art_urls(metadata: dict | None) -> dict[ArtworkType, SteamArtwork | No
     if not appid:
         return art
 
-    def build(steam_type: str) -> SteamArtwork | None:
+    def build(steam_type: str) -> list[SteamArtwork] | None:
         data = meta.get(f"{steam_type}_full")
         icon = meta.get("icon")
         clienticon = meta.get("clienticon")
 
         language = "english"
-        urls: list[str] = []
+        candidates: list[tuple[str, str]] = []
 
         if steam_type == "icon":
             if clienticon:
-                urls.append(
-                    f"{STEAM_CLIENTICON_CDN}{appid}/{clienticon}{ImageExtension.ICO}"
-                )
+                url = f"{STEAM_CLIENTICON_CDN}{appid}/{clienticon}{ImageExtension.ICO}"
+                candidates.append((url, url))
 
             if icon:
-                urls.append(f"{STEAM_ICON_CDN}{appid}/{icon}{ImageExtension.JPG}")
+                url = f"{STEAM_ICON_CDN}{appid}/{icon}{ImageExtension.JPG}"
+                candidates.append((url, url))
 
-            if not urls:
-                return None
+        elif isinstance(data, dict):
+            thumb = preferred_language(data.get("image", data))
+            full = preferred_language(data.get("image2x", data.get("image", data)))
 
-            # First URL remains the preferred URL.
-            thumb_url = full_url = urls[0]
-
-        else:
-            if isinstance(data, dict):
-                thumb = preferred_language(data.get("image", data))
-                full = preferred_language(data.get("image2x", data.get("image", data)))
-
-                if thumb is None:
-                    return None
-
+            if thumb:
                 language, thumb_file = thumb
 
                 if full is None:
                     full_file = thumb_file
                 else:
                     _, full_file = full
-            else:
-                fallback = FALLBACKS.get(steam_type)
-                if fallback is None:
-                    return None
 
-                thumb_file = fallback["thumb"]
-                full_file = fallback["full"]
+                thumb_url = f"{STEAM_STORE_CDN}{appid}/{thumb_file}"
+                full_url = f"{STEAM_STORE_CDN}{appid}/{full_file}"
+                candidates.append((thumb_url, full_url))
 
-            thumb_url = f"{STEAM_STORE_CDN}{appid}/{thumb_file}"
-            full_url = f"{STEAM_STORE_CDN}{appid}/{full_file}"
-            urls = [full_url]
+        # Always append fallbacks after metadata artwork.
+        if steam_type != "icon":
+            for fallback in FALLBACKS.get(steam_type, []):
+                thumb_url = f"{STEAM_STORE_CDN}{appid}/{fallback['thumb']}"
+                full_url = f"{STEAM_STORE_CDN}{appid}/{fallback['full']}"
+                candidates.append((thumb_url, full_url))
+
+        if not candidates:
+            return None
 
         mtime = meta.get("store_asset_mtime")
-        if mtime:
-            thumb_url += f"?t={mtime}"
-            full_url += f"?t={mtime}"
+        artwork = []
+        seen: set[str] = set()
 
-        return {
-            "id": sha1(full_url.encode()).hexdigest(),
-            "language": language,
-            "thumb": thumb_url,
-            "url": full_url,
-            "urls": urls,
-            "author": {
-                "name": "Steam",
-                "avatar": None,
-                "steam64": None,
-            },
-            "style": "official",
-            "source": "steam",
-        }
+        for thumb_url, full_url in candidates:
+            if full_url in seen:
+                continue
 
-    art[ArtworkType.GRID_PORTRAIT] = build("library_capsule")
-    art[ArtworkType.GRID_LANDSCAPE] = build("header_image")
-    art[ArtworkType.HERO] = build("library_hero")
-    art[ArtworkType.LOGO] = build("library_logo")
-    art[ArtworkType.ICON] = build("icon")
+            seen.add(full_url)
+
+            if mtime:
+                thumb_url += f"?t={mtime}"
+                full_url += f"?t={mtime}"
+
+            artwork.append(
+                {
+                    "id": sha1(full_url.encode()).hexdigest(),
+                    "language": language,
+                    "thumb": thumb_url,
+                    "url": full_url,
+                    "urls": [full_url],
+                    "author": {
+                        "name": "Steam",
+                        "avatar": None,
+                        "steam64": None,
+                    },
+                    "style": "official",
+                    "source": "steam",
+                }
+            )
+
+        return artwork
+
+    art[ArtworkType.GRID_PORTRAIT] = build("library_capsule") or []
+    art[ArtworkType.GRID_LANDSCAPE] = build("header_image") or []
+    art[ArtworkType.HERO] = build("library_hero") or []
+    art[ArtworkType.LOGO] = build("library_logo") or []
+    art[ArtworkType.ICON] = build("icon") or []
     return art
 
 
@@ -7668,8 +7689,7 @@ class SteamGridDBClient:
         }
 
         for artwork_type, artwork in steam_art.items():
-            if artwork is not None:
-                game.steamgriddb["art"][artwork_type].insert(0, artwork)
+            game.steamgriddb["art"][artwork_type][0:0] = artwork
 
         game.steamgriddb["cached"] = time.time()
 
