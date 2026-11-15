@@ -3811,6 +3811,8 @@ class GameArchiver(App):
 
         with Horizontal(id="search-bar"):
             yield Input(placeholder="Regex search...", id="game-search")
+            yield Checkbox("Not in Steam", id="filter-not-steam")
+            yield Checkbox("No SGDB match", id="filter-no-sgdb")
             yield Checkbox("Group by match", id="group-matches")
 
         yield Static(id="status")
@@ -3865,7 +3867,8 @@ class GameArchiver(App):
             self.sort_games(self.games)
             self.sort_games(self.shared_games)
             self.sort_games(self.archived_games)
-            self.refresh_views()
+
+        self.refresh_views()
 
     def update_mode_display(self):
         move_mode = self.query_one("#move-mode")
@@ -4783,23 +4786,33 @@ class GameArchiver(App):
 
     def filter_games(self, games: list[Game]) -> list[Game]:
         pattern = self.query_one("#game-search", Input).value
-
-        if not pattern:
-            return games
+        filter_not_steam = self.query_one("#filter-not-steam", Checkbox).value
+        filter_no_sgdb = self.query_one("#filter-no-sgdb", Checkbox).value
 
         try:
-            regex = re.compile(pattern, re.IGNORECASE)
+            regex = re.compile(pattern, re.IGNORECASE) if pattern else None
         except re.error:
-            return games
+            regex = None
 
         return [
             game
             for game in games
-            if regex.search(game.name)
-            or regex.search(str(game.path))
-            or (
-                isinstance(game.steamgriddb.get("game"), dict)
-                and regex.search(str(game.steamgriddb["game"].get("name") or ""))
+            if (not filter_not_steam or (not game.in_steam and can_add_to_steam(game)))
+            and (
+                not filter_no_sgdb
+                or not (
+                    isinstance(game.steamgriddb.get("game"), dict)
+                    and game.steamgriddb["game"].get("id")
+                )
+            )
+            and (
+                regex is None
+                or regex.search(game.name)
+                or regex.search(str(game.path))
+                or (
+                    isinstance(game.steamgriddb.get("game"), dict)
+                    and regex.search(str(game.steamgriddb["game"].get("name") or ""))
+                )
             )
         ]
 
@@ -4871,49 +4884,44 @@ class GameArchiver(App):
         self.call_after_refresh(restore_highlight)
 
     def update_status(self):
+        parts = []
 
-        shared_size = sum(g.size for g in self.shared_games)
+        if self.app_mode == AppMode.MOVE:
+            shared_size = sum(g.size for g in self.shared_games)
+            parts.append(f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB")
 
-        selected_archive = sum(g.size for g in self.shared_games if g.selected) or None
+            selected_archive = (
+                sum(g.size for g in self.shared_games if g.selected) or None
+            )
+            if selected_archive is not None:
+                parts.append(f"To Archive: {fmt_size(selected_archive)}")
 
-        selected_restore = (
-            sum(g.size for g in self.archived_games if g.selected) or None
-        )
+            selected_restore = (
+                sum(g.size for g in self.archived_games if g.selected) or None
+            )
+            if selected_restore is not None:
+                parts.append(f"To Restore: {fmt_size(selected_restore)}")
 
-        steam = self.current_steam_user()
-
-        if steam is None:
-            steam_text = "None"
-        else:
-            steam_text = steam.display_name
-
-        scan_text = "Computing sizes..." if self.computing_sizes else ""
-        steam_scan_text = "Detecting Steam..." if self.detecting_steam else ""
-
-        parts = [
-            f"Shared: {fmt_size(shared_size)} / {LIMIT_GB} GB",
-        ]
-
-        if selected_archive is not None:
-            parts.append(f"To Archive: {fmt_size(selected_archive)}")
-
-        if selected_restore is not None:
-            parts.append(f"To Restore: {fmt_size(selected_restore)}")
+        view = self.current_view()
+        selected_count = sum(row.game.selected for row in view.children)
+        if selected_count:
+            parts.append(f"Selected: {selected_count}")
 
         if self.storage_online:
             parts.append(f"Sync: {self.sync_status}")
         else:
             parts.append("Remote Storage: Offline")
 
-        parts.extend(
-            [
-                f"Steam: {steam_text}",
-                scan_text,
-                steam_scan_text,
-            ]
-        )
+        steam = self.current_steam_user()
+        parts.append(f"Steam: {steam.display_name if steam else 'None'}")
 
-        text = "   ".join(part for part in parts if part)
+        if self.computing_sizes:
+            parts.append("Computing sizes...")
+
+        if self.detecting_steam:
+            parts.append("Detecting Steam...")
+
+        text = "   ".join(parts)
         self.query_one("#status", Static).update(text)
 
     def current_view(self) -> ListView | None:
