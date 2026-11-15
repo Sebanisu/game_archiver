@@ -2695,33 +2695,6 @@ def add_selected_artwork_to_art(
     artwork_list.append(asset)
 
 
-def merge_games(existing: list[Game], scanned: list[Game]):
-    existing_map = {
-        game_identity(game): game
-        for game in existing
-        if game_identity(game) is not None
-    }
-    scanned_map = {
-        game_identity(game): game for game in scanned if game_identity(game) is not None
-    }
-
-    # Remove games that no longer exist.
-    existing[:] = [game for game in existing if game_identity(game) in scanned_map]
-
-    # Add new games and update existing ones.
-    for identity, scanned_game in scanned_map.items():
-        existing_game = existing_map.get(identity)
-
-        if existing_game is None:
-            existing.append(scanned_game)
-        else:
-            # Keep metadata, but use the path discovered by this scan.
-            existing_game.path = scanned_game.path
-            existing_game.name = scanned_game.name
-
-    sort_games(existing)
-
-
 def executable_files(root: Path) -> list[Path]:
     executables = []
 
@@ -3607,53 +3580,6 @@ def latest_activity(path: Path) -> float:
     return path.stat().st_mtime
 
 
-def scan_game_locations(
-    locations: tuple[GameLocation, ...],
-    remote_available: bool,
-) -> dict[str, list[Game]]:
-    games = {}
-
-    for location in locations:
-        base = location.scan_path(remote_available)
-
-        if base is None:
-            continue
-
-        games[location.name] = scan_games(base)
-
-    return games
-
-
-def scan_games(base: Path | None) -> list[Game]:
-    games = []
-
-    if base is None:
-        return games
-
-    if not base.exists():
-        return games
-
-    for item in sorted(base.iterdir()):
-        if not item.is_dir() or should_ignore_game(Path(item), base):
-            continue
-
-        game = Game(name=item.name, path=item)
-
-        games.append(game)
-
-    sort_games(games)
-    return games
-
-
-def sort_games(games: list[Game]):
-    games.sort(
-        key=lambda g: (
-            -g.last_played,
-            natural_key(g.name),
-        )
-    )
-
-
 # ============================================================
 # UI
 # ============================================================
@@ -3848,6 +3774,21 @@ class GameArchiver(App):
         width: auto;
         height: auto;
     }
+
+    #search-bar {
+        height: 3;
+        padding: 0 1;
+        align: center middle;
+    }
+
+    #game-search {
+        width: 1fr;
+    }
+
+    #group-matches {
+        width: auto;
+        margin-left: 1;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -3867,6 +3808,10 @@ class GameArchiver(App):
             with Vertical(id="library-details"):
                 yield Vertical(id="details-artwork")
                 yield Static("", id="details-info")
+
+        with Horizontal(id="search-bar"):
+            yield Input(placeholder="Regex search...", id="game-search")
+            yield Checkbox("Group by match", id="group-matches")
 
         yield Static(id="status")
 
@@ -3903,14 +3848,35 @@ class GameArchiver(App):
         self.refresh_bindings()
         self.save_game_data()
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "game-search":
+            return
+
+        if self.search_timer:
+            self.search_timer.stop()
+
+        self.search_timer = self.set_timer(
+            0.5,
+            self.refresh_views,
+        )
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "group-matches":
+            self.sort_games(self.games)
+            self.sort_games(self.shared_games)
+            self.sort_games(self.archived_games)
+            self.refresh_views()
+
     def update_mode_display(self):
         move_mode = self.query_one("#move-mode")
         library_mode = self.query_one("#library-mode")
+        search = self.query_one("#game-search", Input)
 
         move_mode.display = self.app_mode == AppMode.MOVE
         library_mode.display = self.app_mode == AppMode.LIBRARY
         view = self.current_view()
-        if view:
+
+        if view and not search.has_focus:
             self.set_focus(view)
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -3951,6 +3917,7 @@ class GameArchiver(App):
         self.game_rows = {}
         self.sync_status = "Detecting"
         self.storage_online = False
+        self.search_timer = False
 
         self.games: list[Game] = []
         self.shared_games: list[Game] = []
@@ -4027,6 +3994,91 @@ class GameArchiver(App):
 
         image = AutoImage(str(artwork), id="library-art")
         await container.mount(image)
+
+    def sort_games(self, games: list[Game]):
+        group_matches = self.query_one("#group-matches", Checkbox).value
+
+        if group_matches:
+            games.sort(
+                key=lambda g: (
+                    not isinstance(g.steamgriddb.get("game"), dict),
+                    ((g.steamgriddb.get("game") or {}).get("name") or "").casefold(),
+                    -g.last_played,
+                    natural_key(g.name),
+                )
+            )
+        else:
+            games.sort(
+                key=lambda g: (
+                    -g.last_played,
+                    natural_key(g.name),
+                )
+            )
+
+    def scan_game_locations(
+        self,
+        locations: tuple[GameLocation, ...],
+        remote_available: bool,
+    ) -> dict[str, list[Game]]:
+        games = {}
+
+        for location in locations:
+            base = location.scan_path(remote_available)
+
+            if base is None:
+                continue
+
+            games[location.name] = self.scan_games(base)
+
+        return games
+
+    def scan_games(self, base: Path | None) -> list[Game]:
+        games = []
+
+        if base is None:
+            return games
+
+        if not base.exists():
+            return games
+
+        for item in sorted(base.iterdir()):
+            if not item.is_dir() or should_ignore_game(Path(item), base):
+                continue
+
+            game = Game(name=item.name, path=item)
+
+            games.append(game)
+
+        self.sort_games(games)
+        return games
+
+    def merge_games(self, existing: list[Game], scanned: list[Game]):
+        existing_map = {
+            game_identity(game): game
+            for game in existing
+            if game_identity(game) is not None
+        }
+        scanned_map = {
+            game_identity(game): game
+            for game in scanned
+            if game_identity(game) is not None
+        }
+
+        # Remove games that no longer exist.
+        existing[:] = [game for game in existing if game_identity(game) in scanned_map]
+
+        # Add new games and update existing ones.
+        for identity, scanned_game in scanned_map.items():
+            existing_game = existing_map.get(identity)
+
+            if existing_game is None:
+                existing.append(scanned_game)
+            else:
+                # Keep metadata, but use the path discovered by this scan.
+                existing_game.path = scanned_game.path
+                existing_game.name = scanned_game.name
+
+        self.sort_games(existing)
 
     def load_game_data(self) -> None:
         try:
@@ -4182,7 +4234,7 @@ class GameArchiver(App):
 
                     games.append(game)
 
-                sort_games(games)
+                self.sort_games(games)
 
                 shared_games = []
                 archived_games = []
@@ -4720,27 +4772,64 @@ class GameArchiver(App):
             exclusive=True,
         )
 
+    def check_action(
+        self,
+        action: str,
+        parameters: tuple[object, ...],
+    ) -> bool | None:
+        search = self.query_one("#game-search", Input)
+
+        return not search.has_focus
+
+    def filter_games(self, games: list[Game]) -> list[Game]:
+        pattern = self.query_one("#game-search", Input).value
+
+        if not pattern:
+            return games
+
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return games
+
+        return [
+            game
+            for game in games
+            if regex.search(game.name)
+            or regex.search(str(game.path))
+            or (
+                isinstance(game.steamgriddb.get("game"), dict)
+                and regex.search(str(game.steamgriddb["game"].get("name") or ""))
+            )
+        ]
+
     def refresh_views(self):
+        search = self.query_one("#game-search", Input)
+        search_focused = search.has_focus
         self.update_mode_display()
         selected_path = self.highlighted_game_path
 
         archived_display = self.archived_games if self.storage_online else []
         self.archived_view.display = bool(archived_display)
 
-        sort_games(self.shared_games)
+        self.sort_games(self.shared_games)
 
         if self.storage_online:
-            sort_games(self.archived_games)
+            self.sort_games(self.archived_games)
 
-        sort_games(self.games)
+        self.sort_games(self.games)
 
         self.shared_view.clear()
         self.archived_view.clear()
         self.library_view.clear()
 
-        self.shared_view.extend([GameRow(g) for g in self.shared_games])
-        self.archived_view.extend([GameRow(g) for g in archived_display])
-        self.library_view.extend([GameRow(g) for g in self.games])
+        self.shared_view.extend(
+            [GameRow(g) for g in self.filter_games(self.shared_games)]
+        )
+        self.archived_view.extend(
+            [GameRow(g) for g in self.filter_games(archived_display)]
+        )
+        self.library_view.extend([GameRow(g) for g in self.filter_games(self.games)])
 
         self.update_status()
 
@@ -4763,7 +4852,8 @@ class GameArchiver(App):
                             if self.app_mode == AppMode.LIBRARY:
                                 self.update_library_details(row.game)
 
-                            self.set_focus(view)
+                            if not search_focused:
+                                self.set_focus(view)
                             return
             view = self.current_view()
             if view is not None:
@@ -4775,8 +4865,8 @@ class GameArchiver(App):
 
                     if self.app_mode == AppMode.LIBRARY:
                         self.update_library_details(row.game)
-
-                self.set_focus(view)
+                if not search_focused:
+                    self.set_focus(view)
 
         self.call_after_refresh(restore_highlight)
 
@@ -4999,11 +5089,13 @@ class GameArchiver(App):
         subprocess.Popen(["xdg-open", str(compat)])
 
     def action_switch_pane(self):
-
-        if self.shared_view.has_focus:
-            self.archived_view.focus()
-        else:
-            self.shared_view.focus()
+        search = self.query_one("#game-search", Input)
+        search_focused = search.has_focus
+        if not search_focused:
+            if self.shared_view.has_focus:
+                self.archived_view.focus()
+            else:
+                self.shared_view.focus()
 
     def action_toggle(self):
         view = self.current_view()
@@ -5183,8 +5275,8 @@ class GameArchiver(App):
             source_games.remove(game)
             destination_games.append(game)
 
-        sort_games(source_games)
-        sort_games(destination_games)
+        self.sort_games(source_games)
+        self.sort_games(destination_games)
 
         self.save_game_data()
 
@@ -5193,15 +5285,17 @@ class GameArchiver(App):
     def action_refresh(self):
         if self.is_scan_running():
             return
+        if self.focused == self.query_one("#game-search", Input):
+            return False
 
         self.verify_storage()
 
-        scanned = scan_game_locations(GAME_LOCATIONS, self.storage_online)
+        scanned = self.scan_game_locations(GAME_LOCATIONS, self.storage_online)
 
-        merge_games(self.shared_games, scanned.get("Shared", []))
+        self.merge_games(self.shared_games, scanned.get("Shared", []))
 
         if self.storage_online:
-            merge_games(self.archived_games, scanned.get("Archived", []))
+            self.merge_games(self.archived_games, scanned.get("Archived", []))
 
         library_only_scanned = [
             game
@@ -5210,7 +5304,7 @@ class GameArchiver(App):
             for game in games
         ]
 
-        merge_games(self.library_only_games, library_only_scanned)
+        self.merge_games(self.library_only_games, library_only_scanned)
 
         self.games = (
             self.shared_games + self.archived_games + self.library_only_games
@@ -5229,12 +5323,12 @@ class GameArchiver(App):
 
         game.last_played = time.time()
 
-        sort_games(self.games)
+        self.sort_games(self.games)
 
         if game in self.shared_games:
-            sort_games(self.shared_games)
+            self.sort_games(self.shared_games)
         elif game in self.archived_games:
-            sort_games(self.archived_games)
+            self.sort_games(self.archived_games)
 
         self.refresh_views()
 
@@ -5412,14 +5506,20 @@ class GameArchiver(App):
 
     def action_select_all(self):
         games = self.get_current_game_list()
+        filtered_games = self.filter_games(games)
 
-        if not games:
-            self.notify("No games.")
+        if not filtered_games:
+            self.notify("No games to select.")
+            self.action_select_none()
             return
 
+        filtered_paths = {game.path for game in filtered_games}
+
         for game in games:
-            if not game.selected:
-                game.selected = True
+            selected = game.path in filtered_paths
+
+            if game.selected != selected:
+                game.selected = selected
                 self.refresh_game_row(game)
 
         self.update_status()
