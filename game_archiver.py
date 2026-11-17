@@ -3926,6 +3926,7 @@ class GameArchiver(App):
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
         self.library_only_games: list[Game] = []
+        self.unavailable_games: list[Game] = []
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
@@ -4055,33 +4056,47 @@ class GameArchiver(App):
         self.sort_games(games)
         return games
 
-    def merge_games(self, existing: list[Game], scanned: list[Game]):
+    def merge_games(
+        self,
+        existing: list[Game],
+        scanned: list[Game],
+    ) -> tuple[list[Game], list[Game]]:
         existing_map = {
             game_identity(game): game
             for game in existing
             if game_identity(game) is not None
         }
+
         scanned_map = {
             game_identity(game): game
             for game in scanned
             if game_identity(game) is not None
         }
 
-        # Remove games that no longer exist.
-        existing[:] = [game for game in existing if game_identity(game) in scanned_map]
+        found = []
+        not_found = []
 
-        # Add new games and update existing ones.
         for identity, scanned_game in scanned_map.items():
             existing_game = existing_map.get(identity)
 
             if existing_game is None:
-                existing.append(scanned_game)
+                found.append(scanned_game)
             else:
-                # Keep metadata, but use the path discovered by this scan.
+                # Preserve metadata and database ID.
                 existing_game.path = scanned_game.path
                 existing_game.name = scanned_game.name
+                found.append(existing_game)
 
-        self.sort_games(existing)
+        not_found = [
+            game
+            for identity, game in existing_map.items()
+            if identity not in scanned_map
+        ]
+
+        self.sort_games(found)
+        self.sort_games(not_found)
+
+        return found, not_found
 
     def load_game_data(self) -> None:
         try:
@@ -5300,19 +5315,36 @@ class GameArchiver(App):
 
         scanned = self.scan_game_locations(GAME_LOCATIONS, self.storage_online)
 
-        self.merge_games(self.shared_games, scanned.get("Shared", []))
+        scanned_games = [game for games in scanned.values() for game in games]
 
-        if self.storage_online:
-            self.merge_games(self.archived_games, scanned.get("Archived", []))
+        existing_games = self.games + self.unavailable_games
 
-        library_only_scanned = [
-            game
-            for name, games in scanned.items()
-            if name not in ("Shared", "Archived")
-            for game in games
-        ]
+        self.games, self.unavailable_games = self.merge_games(
+            existing_games,
+            scanned_games,
+        )
 
-        self.merge_games(self.library_only_games, library_only_scanned)
+        shared_games = []
+        archived_games = []
+        library_only_games = []
+
+        for game in self.games:
+            location = get_game_location(game.path) if game.path else None
+
+            if location is None:
+                library_only_games.append(game)
+                continue
+
+            if location.name == "Shared":
+                shared_games.append(game)
+            elif location.name == "Archived":
+                archived_games.append(game)
+            else:
+                library_only_games.append(game)
+
+        self.shared_games = shared_games
+        self.archived_games = archived_games
+        self.library_only_games = library_only_games
 
         self.games = (
             self.shared_games + self.archived_games + self.library_only_games
