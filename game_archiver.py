@@ -66,7 +66,7 @@ CONFIG_DIR = Path.home() / ".config" / "game_archiver"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 GAME_DATA = CONFIG_DIR / "game_data.json"
 DATABASE_FILE = CONFIG_DIR / "game_archiver.db"
-DATABASE_SCHEMA_VERSION = 9
+DATABASE_SCHEMA_VERSION = 10
 RESCAN_INTERVAL_SEC = 1 * 60
 SYNC_STATUS_INTERVAL_SEC = 30
 MIN_GAME_SIZE = 0  # 1024 * 1024  # 1 MB
@@ -505,10 +505,10 @@ def migrate_database(
         set_schema_version(db, 8)
         current_version = 8
 
-    if current_version < 9:
-        migrate_to_v9(db)
-        set_schema_version(db, 9)
-        current_version = 9
+    if current_version < 10:
+        migrate_to_v9_and_v10(db)
+        set_schema_version(db, 10)
+        current_version = 10
     # Future migrations go here
 
 
@@ -994,7 +994,16 @@ def migrate_to_v8(db: sqlite3.Connection) -> None:
     drop_column_if_exists("games", "icon")
 
 
-def migrate_to_v9(db: sqlite3.Connection) -> None:
+def migrate_to_v9_and_v10(db: sqlite3.Connection) -> None:
+    """Merge duplicate game records across movable locations."""
+    # Existing v9 migration logic, with the corrected deduplication.
+
+    if not POOL_DIR.is_mount():
+        raise RuntimeError(
+            f"Game storage is not mounted at {POOL_DIR}. "
+            "Cannot safely run database migration."
+        )
+
     rows = db.execute(
         """
         SELECT id, path
@@ -1011,12 +1020,81 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
         identity = game_identity(game)
 
         if identity is not None:
-            identity_groups.setdefault(identity, []).append(row["id"])
+            identity_groups.setdefault(identity, []).append(row)
 
-    duplicate_groups = [ids for ids in identity_groups.values() if len(ids) > 1]
+    merge_groups = []
 
-    for ids in duplicate_groups:
-        keeper_id, *duplicate_ids = ids
+    for identity, group_rows in identity_groups.items():
+        if len(group_rows) < 2:
+            continue
+
+        # Group records by their actual location.
+        location_groups = {}
+
+        for row in group_rows:
+            location = get_game_location(Path(row["path"]))
+            group = _movable_group(location) if location else None
+
+            key = location.name if group is not None else None
+            location_groups.setdefault(key, []).append(row)
+
+        # Find records whose paths currently exist.
+        existing_by_location = {}
+
+        for name, location_rows in location_groups.items():
+            existing = [
+                row for row in location_rows
+                if Path(row["path"]).exists()
+            ]
+
+            if existing:
+                existing.sort(key=lambda r: r["id"])
+                existing_by_location[name] = existing
+
+        # If multiple movable locations have existing copies,
+        # preserve one record per location.
+        if len(existing_by_location) > 1:
+            keepers = []
+
+            for location_rows in existing_by_location.values():
+                keeper, *duplicates = location_rows
+                keepers.append(keeper)
+
+                if duplicates:
+                    merge_groups.append((keeper, duplicates))
+
+            # Merge records whose paths no longer exist.
+            missing = [row for row in group_rows if not Path(row["path"]).exists()]
+
+            if missing:
+                merge_groups.append((keepers[0], missing))
+
+        else:
+            # Prefer an existing record; otherwise keep the lowest ID.
+            existing = next(
+                iter(existing_by_location.values()),
+                [],
+            )
+
+            keeper = (
+                existing[0]
+                if existing
+                else min(group_rows, key=lambda r: r["id"])
+            )
+
+            duplicates = [row for row in group_rows if row["id"] != keeper["id"]]
+
+            if duplicates:
+                merge_groups.append((keeper, duplicates))
+
+    # ----------------------------------------------------------
+    # Merge duplicate records.
+    # ----------------------------------------------------------
+
+    for keeper_row, duplicate_rows in merge_groups:
+        keeper_id = keeper_row["id"]
+
+        duplicate_ids = [row["id"] for row in duplicate_rows]
 
         debug_log(f"Deduplicating game IDs {duplicate_ids}; keeping {keeper_id}")
 
@@ -1184,7 +1262,7 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
                     )
 
             # --------------------------------------------------
-            # Transfer all artwork associations.
+            # Transfer artwork associations.
             # --------------------------------------------------
 
             db.execute(
@@ -1201,8 +1279,6 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
             )
 
             # Preserve the keeper's existing selection.
-            # Only use the duplicate's selection when the keeper
-            # doesn't already have one for that artwork type.
             db.execute(
                 """
                 INSERT OR IGNORE INTO selected_artwork (
@@ -1243,7 +1319,7 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
             )
 
             # --------------------------------------------------
-            # Remove the duplicate only after transferring data.
+            # Remove the duplicate after transferring its data.
             # --------------------------------------------------
 
             db.execute(
@@ -1251,10 +1327,10 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
                 (duplicate_id,),
             )
 
-        debug_log(f"Finished deduplicating identity; retained game ID {keeper_id}")
+        debug_log(f"Finished deduplicating; retained game ID {keeper_id}")
 
     # ----------------------------------------------------------
-    # Verify that no duplicate identities remain.
+    # Verify remaining duplicate identities.
     # ----------------------------------------------------------
 
     remaining = {}
@@ -1263,9 +1339,30 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
         identity = game_identity(Game(path=Path(row["path"])))
 
         if identity is not None:
-            remaining.setdefault(identity, []).append(row["id"])
+            remaining.setdefault(identity, []).append(row)
 
-    duplicates = {identity: ids for identity, ids in remaining.items() if len(ids) > 1}
+    duplicates = {}
+
+    for identity, group_rows in remaining.items():
+        if len(group_rows) < 2:
+            continue
+
+        locations = set()
+        all_exist = True
+
+        for row in group_rows:
+            path = Path(row["path"])
+            location = get_game_location(path)
+
+            if not path.exists() or location is None:
+                all_exist = False
+                break
+
+            locations.add(location.name)
+
+        # Multiple existing copies in different locations are intentional.
+        if not all_exist or len(locations) != len(group_rows):
+            duplicates[identity] = [row["id"] for row in group_rows]
 
     if duplicates:
         raise RuntimeError(
@@ -1276,7 +1373,7 @@ def migrate_to_v9(db: sqlite3.Connection) -> None:
 def reconcile_game_paths(
     db: sqlite3.Connection,
     games: list[Game],
-):
+) -> None:
     rows = db.execute("SELECT id, path FROM games WHERE path IS NOT NULL").fetchall()
 
     existing_paths = {}
@@ -1284,22 +1381,20 @@ def reconcile_game_paths(
     for row in rows:
         identity = game_identity(Game(name="", path=Path(row["path"])))
 
-        if identity is None:
-            continue
+        if identity is not None:
+            existing_paths.setdefault(identity, []).append(row)
 
-        existing_paths.setdefault(identity, []).append(row)
+    used_rows = set()
 
     for game in games:
         if game.path is None:
             continue
 
         identity = game_identity(game)
-
         if identity is None:
             continue
 
         location = get_game_location(game.path)
-
         canonical_path = game.path
 
         if location is not None:
@@ -1313,52 +1408,53 @@ def reconcile_game_paths(
             )
 
             if relative_path is not None:
-                remote_path = (
+                paths = (
                     location.remote_path / relative_path
                     if location.remote_path is not None
-                    else None
-                )
-
-                local_path = (
+                    else None,
                     location.local_path / relative_path
                     if location.local_path is not None
-                    else None
+                    else None,
                 )
 
-                if remote_path is not None and remote_path.exists():
-                    canonical_path = remote_path
-                elif local_path is not None and local_path.exists():
-                    canonical_path = local_path
+                canonical_path = next(
+                    (path for path in paths if path is not None and path.exists()),
+                    game.path,
+                )
 
         matching_rows = existing_paths.get(identity, [])
 
-        if not matching_rows:
+        unused_rows = [row for row in matching_rows if row["id"] not in used_rows]
+
+        if not unused_rows:
             continue
 
-        # Prefer an existing remote record when one is available.
+        # Prefer a record belonging to the same logical location.
         existing_row = next(
             (
                 row
-                for row in matching_rows
+                for row in unused_rows
                 if location is not None
-                and location.remote_path is not None
-                and Path(row["path"]).is_relative_to(location.remote_path)
+                and (row_location := get_game_location(Path(row["path"]))) is not None
+                and row_location.name == location.name
             ),
-            matching_rows[0],
+            None,
         )
+
+        # If only one record remains, it can represent a moved game.
+        if existing_row is None and len(unused_rows) == 1:
+            existing_row = unused_rows[0]
+
+        if existing_row is None:
+            continue
+
+        used_rows.add(existing_row["id"])
 
         if existing_row["path"] != str(canonical_path):
             db.execute(
                 "UPDATE games SET path = ? WHERE id = ?",
                 (str(canonical_path), existing_row["id"]),
             )
-
-        existing_paths[identity] = [
-            {
-                "id": existing_row["id"],
-                "path": str(canonical_path),
-            }
-        ]
 
 
 def save_game(db: sqlite3.Connection, game: Game) -> None:
@@ -2438,6 +2534,8 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+
 def has_steamgriddb_match(game: Game) -> bool:
     sgdb_game = game.steamgriddb.get("game")
     return isinstance(sgdb_game, dict) and bool(sgdb_game.get("id"))
@@ -2468,20 +2566,88 @@ def get_location(name: str) -> GameLocation:
     return next(location for location in GAME_LOCATIONS if location.name == name)
 
 
-def game_identity(game: Game) -> tuple[str, Path] | None:
+def _movable_group(
+    location: GameLocation,
+) -> tuple[str, str] | None:
+    """Return the locations linked by a reciprocal move_to relationship."""
+    if location.move_to is None:
+        return None
+
+    linked = next(
+        (
+            other
+            for other in GAME_LOCATIONS
+            if other.name == location.move_to and other.move_to == location.name
+        ),
+        None,
+    )
+
+    if linked is None:
+        return None
+
+    return tuple(sorted((location.name, linked.name)))
+
+
+def game_identity(
+    game: Game,
+) -> tuple[tuple[str, ...], Path] | None:
     if game.path is None:
         return None
 
     location = get_game_location(game.path)
 
     if location is None:
-        return ("path", game.path)
+        return (("path",), game.path)
 
     for base in (location.local_path, location.remote_path):
         if base is not None and game.path.is_relative_to(base):
-            return (location.name, game.path.relative_to(base))
+            relative = game.path.relative_to(base)
+            group = _movable_group(location)
 
-    return ("path", game.path)
+            return (group or (location.name,), relative)
+
+    return (("path",), game.path)
+
+
+def is_on_disk_duplicate(game: Game) -> tuple[str, ...] | None:
+    """Return the movable group when the game exists in multiple locations."""
+    if game.path is None:
+        return None
+
+    location = get_game_location(game.path)
+    if location is None:
+        return None
+
+    group = _movable_group(location)
+    if group is None:
+        return None
+
+    relative = None
+    for base in (location.local_path, location.remote_path):
+        if base is not None and game.path.is_relative_to(base):
+            relative = game.path.relative_to(base)
+            break
+
+    if relative is None:
+        return None
+
+    locations_present = set()
+
+    for name in group:
+        loc = get_location(name)
+        if loc is None:
+            continue
+
+        for base in (loc.local_path, loc.remote_path):
+            if base is not None and (base / relative).exists():
+                locations_present.add(name)
+                break
+
+    return group if len(locations_present) > 1 else None
+
+def has_on_disk_duplicate(game: Game) -> bool:
+    """Return whether the game exists in multiple movable locations."""
+    return is_on_disk_duplicate(game) is not None
 
 
 def get_game_location(path: Path) -> GameLocation | None:
@@ -5238,6 +5404,14 @@ class GameArchiver(App):
         )
 
         for game in moving:
+            duplicate_group = is_on_disk_duplicate(game)
+            if duplicate_group:
+                self.notify(
+                    f"{game.name} exists in both {' and '.join(duplicate_group)} – "
+                    "resolve the duplicate before moving."
+                )
+                game.selected = False
+                continue
             self.notify(f"Moving {game.name}")
 
             old_path = game.path
