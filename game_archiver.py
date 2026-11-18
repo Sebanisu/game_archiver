@@ -1042,10 +1042,7 @@ def migrate_to_v9_and_v10(db: sqlite3.Connection) -> None:
         existing_by_location = {}
 
         for name, location_rows in location_groups.items():
-            existing = [
-                row for row in location_rows
-                if Path(row["path"]).exists()
-            ]
+            existing = [row for row in location_rows if Path(row["path"]).exists()]
 
             if existing:
                 existing.sort(key=lambda r: r["id"])
@@ -1076,11 +1073,7 @@ def migrate_to_v9_and_v10(db: sqlite3.Connection) -> None:
                 [],
             )
 
-            keeper = (
-                existing[0]
-                if existing
-                else min(group_rows, key=lambda r: r["id"])
-            )
+            keeper = existing[0] if existing else min(group_rows, key=lambda r: r["id"])
 
             duplicates = [row for row in group_rows if row["id"] != keeper["id"]]
 
@@ -2536,6 +2529,26 @@ class Game:
 # ============================================================
 
 
+def shortcut_game_directory(entry: dict) -> Path | None:
+    start_dir = entry.get("StartDir") or entry.get("startdir")
+
+    if not start_dir:
+        return None
+
+    return Path(start_dir.strip('"'))
+
+
+def game_launch_identity(
+    game: Game,
+) -> tuple[tuple[str, ...], Path] | None:
+    path = launch_path(game)
+
+    if path is None:
+        return None
+
+    return game_identity(Game(name=game.name, path=path))
+
+
 def has_steamgriddb_match(game: Game) -> bool:
     sgdb_game = game.steamgriddb.get("game")
     return isinstance(sgdb_game, dict) and bool(sgdb_game.get("id"))
@@ -2644,6 +2657,7 @@ def is_on_disk_duplicate(game: Game) -> tuple[str, ...] | None:
                 break
 
     return group if len(locations_present) > 1 else None
+
 
 def has_on_disk_duplicate(game: Game) -> bool:
     """Return whether the game exists in multiple movable locations."""
@@ -3504,37 +3518,40 @@ def shortcut_target(entry: dict) -> str:
     return exe
 
 
-def find_existing_shortcut(
+def find_existing_shortcuts(
     entries: dict,
     game: Game,
-) -> str | None:
+) -> list[str]:
+    target_identity = game_launch_identity(game)
+
+    if target_identity is not None:
+        matches = []
+
+        for key, entry in entries.items():
+            directory = shortcut_game_directory(entry)
+
+            if directory is None:
+                continue
+
+            existing_identity = game_identity(Game(name="", path=directory))
+
+            if existing_identity == target_identity:
+                matches.append(key)
+
+        if matches:
+            return matches
+
+    # Fall back to matching game name, but only if unambiguous.
     target_name = game.name.casefold()
-    target_exe = normalize_exe(str(game.launcher)) if game.launcher else ""
 
-    # First look for matching launcher
-    for key, entry in entries.items():
-        exe = shortcut_target(entry)
+    matches = [
+        key
+        for key, entry in entries.items()
+        if (entry.get("AppName") or entry.get("appname") or "").casefold()
+        == target_name
+    ]
 
-        if exe == target_exe:
-            return key
-
-    # Then fall back to matching launcher signature
-    target = launcher_signature(target_exe)
-
-    for key, entry in entries.items():
-        exe = shortcut_target(entry)
-
-        if launcher_signature(exe) == target:
-            return key
-
-    # Finally fall back to matching game name
-    for key, entry in entries.items():
-        name = (entry.get("AppName") or entry.get("appname") or "").casefold()
-
-        if name == target_name:
-            return key
-
-    return None
+    return matches if len(matches) == 1 else []
 
 
 def generate_appid(exe: Path, stable_id: str) -> str:
@@ -4532,10 +4549,6 @@ class GameArchiver(App):
         if not can_add_to_steam(game):
             return False
 
-        # Don't touch duplicate shortcuts.
-        if game.duplicate_steam:
-            return False
-
         user = self.current_steam_user()
         if user is None:
             return False
@@ -4547,6 +4560,22 @@ class GameArchiver(App):
         entries = shortcuts["shortcuts"]
 
         key = game.steam_key
+
+        game.duplicate_steam = False
+        game.steam_broken = False
+
+        # A cached key may no longer exist.
+        if key is not None and key not in entries:
+            key = None
+            game.steam_key = None
+
+        if key is None:
+            matches = find_existing_shortcuts(entries, game)
+
+            if matches:
+                key = matches[0]
+                game.steam_key = key
+                game.duplicate_steam = len(matches) > 1
 
         # Remember the current appid in case it changes.
         old_appid = game_appid(game) if key is not None else None
@@ -4581,10 +4610,7 @@ class GameArchiver(App):
 
         # Persist changes to shortcuts.vdf.
         if changed:
-            save_shortcuts(
-                user,
-                shortcuts,
-            )
+            save_shortcuts(user, shortcuts)
 
         # Refresh cached state on the Game object.
         game.steam_key = key
@@ -4612,6 +4638,39 @@ class GameArchiver(App):
             return False
         return not self.is_scan_running()
 
+    def _resolve_steam_entry(
+        self,
+        game: Game,
+        entries: dict[str, dict],
+    ) -> tuple[str, dict] | None:
+        matches = find_existing_shortcuts(entries, game)
+
+        game.duplicate_steam = len(matches) > 1
+
+        # Prefer the cached shortcut if it is one of the matches.
+        if game.steam_key in matches:
+            return game.steam_key, entries[game.steam_key]
+
+        if not matches:
+            # Still trust an existing cached key.
+            if game.steam_key is not None and game.steam_key in entries:
+                return game.steam_key, entries[game.steam_key]
+
+            return None
+
+        key = matches[0]
+        game.steam_key = key
+
+        return key, entries[key]
+
+    def _set_steam_entry_status(
+        self,
+        game: Game,
+        entry: dict,
+    ) -> None:
+        game.steam_entry = entry
+        game.in_steam = True
+
     async def update_game_steam_status(
         self,
         game: Game,
@@ -4632,34 +4691,16 @@ class GameArchiver(App):
         if game.launcher is None:
             return
 
-        key = game.steam_key
+        result = self._resolve_steam_entry(game, entries)
 
-        # Reuse the cached shortcut if it still exists.
-        if key is None or key not in entries:
-            key = find_existing_shortcut(
-                entries,
-                game,
-            )
-
-            # Only replace the cached key with what we actually found.
-            game.steam_key = key
-
-        if key is None:
+        if result is None:
+            # No matching shortcut was found.
+            if game.steam_key is not None:
+                game.steam_broken = True
             return
 
-        entry = entries[key]
-
-        game.in_steam = True
-        game.steam_entry = entry
-
-        exe = shortcut_target(entry)
-        expected = normalize_exe(str(game.launcher))
-
-        if exe != expected:
-            if Path(exe).exists():
-                game.duplicate_steam = True
-            else:
-                game.steam_broken = True
+        _, entry = result
+        self._set_steam_entry_status(game, entry)
 
     async def compute_steam_status(self):
         user = self.current_steam_user()
