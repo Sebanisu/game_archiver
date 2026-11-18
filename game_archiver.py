@@ -2529,6 +2529,64 @@ class Game:
 # ============================================================
 
 
+def purge_duplicate_shortcuts(
+    entries: dict[str, dict],
+    games: list[Game],
+) -> bool:
+    """Remove duplicate Steam shortcuts while keeping the oldest entry."""
+    changed = False
+
+    for game in games:
+        if not game.steam_key or not game.duplicate_steam:
+            continue
+
+        if game.steam_key not in entries:
+            continue
+
+        # Get the directory associated with the game's cached shortcut.
+        target_dir = shortcut_game_directory(entries[game.steam_key])
+
+        if target_dir is None:
+            continue
+
+        target_dir = target_dir.resolve()
+
+        # Find shortcuts pointing to this exact directory.
+        matches = []
+
+        for key, entry in entries.items():
+            directory = shortcut_game_directory(entry)
+
+            if directory is None:
+                continue
+
+            if directory.resolve() == target_dir:
+                matches.append(key)
+
+        if len(matches) < 2:
+            game.duplicate_steam = False
+            continue
+
+        # Keep the oldest shortcut (lowest numeric key).
+        matches.sort(key=int)
+        keep_key = matches[0]
+
+        # Never delete entries unless the cached shortcut is among the matches.
+        if game.steam_key not in matches:
+            continue
+
+        for key in matches:
+            if key != keep_key:
+                del entries[key]
+                changed = True
+
+        game.steam_key = keep_key
+        game.steam_entry = entries[keep_key]
+        game.duplicate_steam = False
+
+    return changed
+
+
 def shortcut_game_directory(entry: dict) -> Path | None:
     start_dir = entry.get("StartDir") or entry.get("startdir")
 
@@ -4545,6 +4603,7 @@ class GameArchiver(App):
         }
 
     async def sync_shortcut(self, game: Game) -> bool:
+
         # Don't create shortcuts for games already installed through Steam.
         if not can_add_to_steam(game):
             return False
@@ -4607,6 +4666,8 @@ class GameArchiver(App):
         # Keep Steam artwork filenames in sync if the appid changed.
         if old_appid is not None:
             changed |= await self.rename_artwork(game, old_appid)
+
+        changed |= purge_duplicate_shortcuts(entries, self.games)
 
         # Persist changes to shortcuts.vdf.
         if changed:
@@ -5713,6 +5774,10 @@ class GameArchiver(App):
         if not self.can_modify_steam():
             return
 
+        user = self.current_steam_user()
+        if user is None:
+            return False
+
         if self.shared_view.has_focus:
             games = [g for g in self.shared_games if g.selected]
         else:
@@ -5740,6 +5805,16 @@ class GameArchiver(App):
 
         for game in games:
             await self.update_game_steam_status(game, entries)
+
+        # Remove duplicate shortcuts with identical StartDir paths.
+        if purge_duplicate_shortcuts(entries, games):
+            save_shortcuts(user, shortcuts)
+
+            # Recalculate status after removing entries.
+            for game in games:
+                await self.update_game_steam_status(game, entries)
+
+        for game in games:
             self.refresh_game_row(game)
 
         self.notify(f"Updated {updated} Steam shortcut{'s' if updated != 1 else ''}.")
