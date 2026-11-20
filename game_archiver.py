@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 from __future__ import annotations
 
 import asyncio
@@ -18,14 +19,16 @@ import time
 import tomllib
 import webbrowser
 from asyncio import to_thread
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum, StrEnum, auto
 from hashlib import sha1
 from pathlib import Path
+from threading import Event
 from typing import ClassVar, Literal, TypedDict
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import vdf
@@ -2389,12 +2392,16 @@ def get_launch_info(game: Game, *, for_steam: bool = False) -> LaunchInfo:
         ]
 
     if game.launcher is None:
-        game.launcher = find_launcher(launch_path(game))
+        game.launcher = find_launcher(game)
 
     if game.launcher is None:
         raise RuntimeError(f"No launcher found for '{game.name}'.")
-        return
     launcher = game.launcher
+
+    if is_steam_launcher(launcher):
+        raise RuntimeError("Steam URI launchers must be opened directly.")
+
+    launcher = Path(launcher)
     env = os.environ.copy()
     env["SDL_VIDEODRIVER"] = "x11"
 
@@ -2514,7 +2521,7 @@ class Game:
     file_count: int = 0
     last_played: float = 0.0
     selected: bool = False
-    launcher: Path | None = None
+    launcher: Path | str | None = None
     steam_key: str | None = None
     steam_entry: dict | None = None
     in_steam: bool = False
@@ -2527,6 +2534,23 @@ class Game:
 # ============================================================
 # HELPERS
 # ============================================================
+
+
+def steam_appid_from_uri(value: str) -> str | None:
+    parsed = urlsplit(value)
+
+    if (
+        parsed.scheme == "steam"
+        and parsed.netloc == "rungameid"
+        and parsed.path.lstrip("/").isdigit()
+    ):
+        return parsed.path.lstrip("/")
+
+    return None
+
+
+def is_steam_launcher(launcher: Path | str | None) -> bool:
+    return isinstance(launcher, str) and steam_appid_from_uri(launcher) is not None
 
 
 def purge_duplicate_shortcuts(
@@ -3493,8 +3517,10 @@ def game_appid(game: Game) -> str | None:
 
     if game.launcher is None:
         return None
+    if is_steam_launcher(game.launcher):
+        return steam_appid_from_uri(game.launcher)
 
-    return generate_appid(game.launcher, game.name)
+    return generate_appid(Path(game.launcher), game.name)
 
 
 def shortcuts_path(user: SteamUser) -> Path:
@@ -3656,33 +3682,71 @@ def launch_path(game: Game) -> Path:
     return game.path
 
 
-def find_launchers(path: Path, max_depth: int = 3) -> list[Path]:
-    if not path.is_dir():
-        return []
+def gen_launchers(
+    game: Game,
+    max_depth: int = 3,
+    cancel_event: Event | None = None,
+) -> Iterator[Path | str]:
+    def cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
 
-    launchers: list[Path] = []
+    path = launch_path(game)
 
-    def scan(directory: Path, depth: int):
+    if not can_add_to_steam(game):
+        metadata = game.steamgriddb.get("steam_platform_data") or {}
+        steam_apps = metadata.get("external_platform_data", {}).get("steam", [])
+        appid = steam_apps[0].get("id") if steam_apps else None
+
+        if not appid:
+            appid = game_appid(game)
+
+        if appid:
+            yield f"steam://rungameid/{appid}"
+
+    if cancelled() or not path.is_dir():
+        return
+
+    def scan(directory: Path, depth: int) -> Iterator[Path]:
+        if cancelled():
+            return
+
         for p in directory.iterdir():
+            if cancelled():
+                return
+
             if p.is_file():
                 if p.suffix.lower() in LAUNCHER_EXTS or (
                     p.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 ):
-                    launchers.append(p)
+                    yield p
 
             elif p.is_dir() and depth < max_depth:
-                scan(p, depth + 1)
+                yield from scan(p, depth + 1)
 
-    scan(path, 1)
-
-    return sorted(
-        launchers,
-        key=lambda p: launcher_score(p, path),
-    )
+    yield from scan(path, 1)
 
 
-def find_launcher(path: Path) -> Path | None:
-    launchers = find_launchers(path)
+def find_launchers(
+    game: Game,
+    max_depth: int = 3,
+) -> list[Path | str]:
+    path = launch_path(game)
+
+    launchers = list(gen_launchers(game, max_depth))
+
+    path_launchers = [launcher for launcher in launchers if isinstance(launcher, Path)]
+
+    steam_launchers = [
+        launcher for launcher in launchers if is_steam_launcher(launcher)
+    ]
+
+    path_launchers.sort(key=lambda p: launcher_score(p, path))
+
+    return path_launchers + steam_launchers
+
+
+def find_launcher(game: Game) -> Path | str | None:
+    launchers = find_launchers(game)
 
     if not launchers:
         return None
@@ -4392,7 +4456,9 @@ class GameArchiver(App):
                         file_count=row["file_count"],
                         last_played=row["last_played"],
                         launcher=(
-                            Path(row["launcher"])
+                            row["launcher"]
+                            if is_steam_launcher(row["launcher"])
+                            else Path(row["launcher"])
                             if row["launcher"] is not None
                             else None
                         ),
@@ -4566,13 +4632,15 @@ class GameArchiver(App):
 
         return Path(path) if path is not None else None
 
-    async def make_shortcut(self, game: Game) -> dict:
+    async def make_shortcut(self, game: Game) -> dict | None:
+        if is_steam_launcher(game.launcher):
+            return None
         launcher = game.launcher
         assert launcher is not None
 
         try:
             info = get_launch_info(game, for_steam=True)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             self.notify(str(e))
             return None
 
@@ -4606,6 +4674,9 @@ class GameArchiver(App):
 
         # Don't create shortcuts for games already installed through Steam.
         if not can_add_to_steam(game):
+            return False
+        
+        if is_steam_launcher(game.launcher):
             return False
 
         user = self.current_steam_user()
@@ -4738,7 +4809,7 @@ class GameArchiver(App):
         entries: dict[str, dict],
     ):
         if game.launcher is None:
-            game.launcher = find_launcher(launch_path(game))
+            game.launcher = find_launcher(game)
 
         if get_selected_artwork(game, ArtworkType.ICON) is None:
             local_icons = await to_thread(find_icons, launch_path(game))
@@ -4840,9 +4911,12 @@ class GameArchiver(App):
 
         for game in games:
             # Keep the current launcher if it still exists.
-            if game.launcher is not None and game.launcher.is_file():
+            if is_steam_launcher(game.launcher):
                 continue
-            launcher = find_launcher(launch_path(game))
+
+            if game.launcher is not None and Path(game.launcher).is_file():
+                continue
+            launcher = find_launcher(game)
 
             # The game directory may have disappeared if remote storage went offline.
             if launcher is None:
@@ -5029,7 +5103,13 @@ class GameArchiver(App):
             else "Never"
         )
 
-        launcher = game.launcher.name if game.launcher else "Automatic"
+        launcher = (
+            "Launch through Steam"
+            if is_steam_launcher(game.launcher)
+            else Path(game.launcher).name
+            if game.launcher
+            else "Automatic"
+        )
 
         steam_status = (
             "Broken"
@@ -5324,20 +5404,12 @@ class GameArchiver(App):
         if not self.can_modify_steam():
             return
 
-        root = launch_path(game)
-        launchers = find_launchers(root, max_depth=5)
-
-        if not launchers:
-            self.notify(f"No launchers found for {game.name}.")
-            return
         previous_gamescope_enabled = game.gamescope_enabled
         self.dialog_open = True
         try:
             selected = await self.push_screen_wait(
                 LauncherDialog(
-                    root=root,
-                    launchers=launchers,
-                    current=game.launcher,
+                    max_depth=5,
                     game=game,
                 )
             )
@@ -5355,7 +5427,13 @@ class GameArchiver(App):
             self.refresh_game_row(game)
 
             if launcher_changed:
-                self.notify(f"Launcher updated: {selected.name}")
+                name = (
+                    "Launch through Steam"
+                    if is_steam_launcher(selected)
+                    else Path(selected).name
+                )
+
+                self.notify(f"Launcher updated: {name}")
 
             if gamescope_changed:
                 self.notify(
@@ -5521,9 +5599,9 @@ class GameArchiver(App):
 
             # Preserve the current launcher and icon relative to the game directory.
             launcher_rel = None
-            if game.launcher is not None:
+            if game.launcher is not None and not is_steam_launcher(game.launcher):
                 try:
-                    launcher_rel = game.launcher.relative_to(old_path)
+                    launcher_rel = Path(game.launcher).relative_to(old_path)
                 except ValueError:
                     pass
 
@@ -5544,21 +5622,25 @@ class GameArchiver(App):
             game.mtime = new_path.stat().st_mtime
 
             # Restore the launcher using its previous relative path.
-            launchers = find_launchers(launch_path(game))
+            if is_steam_launcher(game.launcher):
+                # Steam URI doesn't depend on the game directory.
+                pass
+            else:
+                launchers = find_launchers(game)
 
-            game.launcher = next(
-                (
-                    path
-                    for path in launchers
-                    if launcher_rel is not None and path == new_path / launcher_rel
-                ),
-                None,
-            )
+                game.launcher = next(
+                    (
+                        path
+                        for path in launchers
+                        if isinstance(path, Path)
+                        and launcher_rel is not None
+                        and path == new_path / launcher_rel
+                    ),
+                    None,
+                )
 
-            # Fall back to automatic launcher detection if the old launcher
-            # could not be matched.
-            if game.launcher is None:
-                game.launcher = find_launcher(launch_path(game))
+                if game.launcher is None:
+                    game.launcher = find_launcher(game)
 
             # Preserve the icon if it was inside the game directory.
             update_artwork_paths_for_game(game, old_path, new_path)
@@ -5649,19 +5731,29 @@ class GameArchiver(App):
         self.refresh_views()
 
         try:
+            if game.launcher is None:
+                game.launcher = find_launcher(game)
+
+            if is_steam_launcher(game.launcher):
+                subprocess.Popen(
+                    ["xdg-open", game.launcher],
+                    start_new_session=True,
+                )
+                return
+
             info = get_launch_info(game)
-        except RuntimeError as e:
+
+            subprocess.Popen(
+                info.cmd,
+                cwd=info.cwd,
+                env=info.env,
+                start_new_session=True,
+            )
+
+        except (RuntimeError, OSError) as e:
             self.notify(str(e))
-            return
         finally:
             self.save_game_data()
-
-        subprocess.Popen(
-            info.cmd,
-            cwd=info.cwd,
-            env=info.env,
-            start_new_session=True,
-        )
 
     def action_open_folder(self):
         view = self.current_view()
@@ -6772,7 +6864,7 @@ def get_steam_users() -> list[SteamUser]:
     return users
 
 
-class LauncherDialog(ModalScreen[Path | None]):
+class LauncherDialog(ModalScreen[Path | str | None]):
     DEFAULT_CSS = """
     LauncherDialog {
         align: center middle;
@@ -6799,31 +6891,24 @@ class LauncherDialog(ModalScreen[Path | None]):
 
     def __init__(
         self,
-        root: Path,
-        launchers: list[Path],
-        current: Path | None = None,
-        game: Game | None = None,
+        game: Game,
+        max_depth: int = 5,
     ):
         super().__init__()
-        self.root = root
-        self.launchers = launchers
-        self.current = current
+        self.root: Path = launch_path(game)
+        self.launchers: list[Path | str] = []
+        self.current: Path | str | None = game.launcher
         self.game = game
+        self._cancel_event = Event()
+        self._launcher_worker = None
+        self.max_depth = max_depth
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label("[b]Select Game Launcher[/b]")
 
             yield ListView(
-                *[
-                    ListItem(
-                        Label(
-                            f"{'[🗸] ' if path == self.current else '[ ] '}"
-                            f"{path.relative_to(self.root)}"
-                        )
-                    )
-                    for path in self.launchers
-                ],
+                *[self.make_launcher_item(launcher) for launcher in self.launchers],
                 id="launchers",
             )
 
@@ -6835,11 +6920,100 @@ class LauncherDialog(ModalScreen[Path | None]):
 
             yield Label("Enter: Select    Escape: Cancel")
 
+    @work(thread=True, exclusive=True)
+    def load_launchers(self, game: Game) -> None:
+        found = False
+
+        for launcher in gen_launchers(
+            game,
+            self.max_depth,
+            self._cancel_event,
+        ):
+            if self._cancel_event.is_set():
+                return
+
+            found = True
+            self.app.call_from_thread(self.add_launcher, launcher)
+
+        if not self._cancel_event.is_set():
+            self.app.call_from_thread(self.finish_loading, found)
+
+    def finish_loading(self, found: bool) -> None:
+        if self.cancelled():
+            return
+
+        if not found:
+            self._cancel_event.set()
+            self.app.notify(f"No launchers found for {self.game.name}.")
+            self.dismiss(None)
+            return
+
+        self.sort_launchers()
+
+    def cancelled(self) -> bool:
+        return self._cancel_event is not None and self._cancel_event.is_set()
+
+    def add_launcher(self, launcher: Path | str) -> None:
+        if self.cancelled():
+            return
+
+        if launcher in self.launchers:
+            return
+
+        self.launchers.append(launcher)
+
+        list_view = self.query_one("#launchers", ListView)
+        list_view.append(self.make_launcher_item(launcher))
+
+    def sort_launchers(self) -> None:
+        if self.cancelled():
+            return
+
+        def sort_key(p: Path | str):
+            if isinstance(p, str):
+                return (0, "")
+
+            return (1, launcher_score(p, launch_path(self.game)))
+
+        self.launchers.sort(key=sort_key)
+
+        list_view = self.query_one("#launchers", ListView)
+        list_view.clear()
+        list_view.extend(self.make_launcher_item(p) for p in self.launchers)
+
+    def on_unmount(self) -> None:
+        self._cancel_event.set()
+
+        if self._launcher_worker is not None:
+            self._launcher_worker.cancel()
+
+    def make_launcher_item(self, launcher: Path | str) -> ListItem:
+        if is_steam_launcher(launcher):
+            label = "Launch through Steam"
+        else:
+            path = Path(launcher)
+
+            try:
+                label = str(path.relative_to(self.root))
+            except ValueError:
+                label = str(path)
+
+        item = ListItem(
+            Label(f"{'[🗸] ' if str(launcher) == str(self.current) else '[ ] '}{label}")
+        )
+        item.tooltip = str(launcher)
+
+        return item
+
     def on_list_view_selected(
         self,
         event: ListView.Selected,
-    ):
+    ) -> None:
+        if self.cancelled():
+            return
+
         if event.index is not None:
+            self._cancel_event.set()
             self.dismiss(self.launchers[event.index])
 
     def on_checkbox_changed(
@@ -6849,14 +7023,16 @@ class LauncherDialog(ModalScreen[Path | None]):
         if event.checkbox.id == "gamescope-checkbox" and self.game:
             self.game.gamescope_enabled = event.value
 
-    def action_dismiss(self):
+    def action_dismiss(self) -> None:
+        if self.cancelled():
+            return
+
+        self._cancel_event.set()
         self.dismiss(None)
 
     def on_mount(self):
-        list_view = self.query_one("#launchers", ListView)
-
-        for item, path in zip(list_view.children, self.launchers):
-            item.tooltip = str(path)
+        if self.game:
+            self._launcher_worker = self.load_launchers(self.game)
 
 
 # ============================================================
