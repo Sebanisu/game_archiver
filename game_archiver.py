@@ -39,6 +39,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Checkbox,
@@ -4217,15 +4218,17 @@ class GameArchiver(App):
                 config.get("ui", {}).get("last_mode", AppMode.MOVE.value)
             )
         except ValueError:
-            self.app_mode = AppMode.MOVE
-        self.computing_sizes = False
-        self.detecting_steam = False
-        self.moving = False
-        self.dialog_open = False
+            self.app_mode: AppMode = AppMode.MOVE
+        self.computing_sizes: bool = False
+        self.detecting_steam: bool = False
+        self.moving: bool = False
+        self.dialog_open: bool = False
         self.game_rows = {}
-        self.sync_status = "Detecting"
-        self.storage_online = False
-        self.search_timer = False
+        self.sync_status: str = "Detecting"
+        self.storage_online: bool = False
+        self.search_timer: Timer | None = None
+        self._artwork_generation: int = 0
+        self._artwork_timer: Timer | None = None
 
         self.games: list[Game] = []
         self.shared_games: list[Game] = []
@@ -4236,11 +4239,30 @@ class GameArchiver(App):
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
 
-    async def clear_library_artwork(self):
+    async def clear_library_artwork(self, generation: int):
+        if generation != self._artwork_generation:
+            return
+
         container = self.query_one("#details-artwork", Vertical)
+
         await container.remove_children()
 
-    async def update_library_artwork(self, game: Game):
+        if generation != self._artwork_generation:
+            return
+
+        container.styles.height = 0
+
+    def artwork_update_is_current(self, game: Game, generation: int) -> bool:
+        return (
+            self.app_mode == AppMode.LIBRARY
+            and self.highlighted_game_path == game.path
+            and self._artwork_generation == generation
+        )
+
+    async def update_library_artwork(self, game: Game, generation: int):
+        if not self.artwork_update_is_current(game, generation):
+            return
+
         artwork = None
         artwork_type = None
 
@@ -4252,56 +4274,64 @@ class GameArchiver(App):
             ArtworkType.ICON,
         ):
             path = await self.get_selected_artwork_path(game, candidate_type)
+
+            if not self.artwork_update_is_current(game, generation):
+                return
+
             if path and path.is_file():
                 artwork = path
                 artwork_type = candidate_type
                 break
 
-        # if self.app_mode != AppMode.LIBRARY or self.highlighted_game_path != game.path:
-        #     return
+        if not self.artwork_update_is_current(game, generation):
+            return
 
         container = self.query_one("#details-artwork", Vertical)
+
         await container.remove_children()
+
+        if not self.artwork_update_is_current(game, generation):
+            return
 
         if not artwork:
             container.styles.height = 0
             return
 
-        # Resolve .exe icons first
         if artwork.suffix.lower() == ".exe":
             artwork = await to_thread(extract_exe_icon, artwork)
 
+            if not self.artwork_update_is_current(game, generation):
+                return
+
         if artwork is None or not artwork.is_file():
-            debug_log("No usable artwork image found")
             container.styles.height = 0
             return
 
-        # Validate that it is a real image
         try:
             with Image.open(artwork) as img:
                 img.verify()
-                # reopen because verify() can leave the file pointer in a bad state
-                img = Image.open(artwork)
+
+            with Image.open(artwork) as img:
                 image_width, image_height = img.size
+
         except (UnidentifiedImageError, OSError):
             debug_log(f"Invalid artwork image: {artwork}")
             container.styles.height = 0
             return
 
-        # Now safe to set height
         if artwork_type is ArtworkType.HERO:
-            # Guard against zero-width container (not laid out yet)
             width = container.size.width or 1
             height = round((width * image_height / image_width) / 2)
-            debug_log(
-                f"Artwork size: {image_width}x{image_height}, "
-                f"container width: {container.size.width}, calculated height: {height}"
-            )
             container.styles.height = height
         else:
             container.styles.height = 10
 
+        if not self.artwork_update_is_current(game, generation):
+            return
+
         image = AutoImage(str(artwork), id="library-art")
+        image.can_focus = False
+
         await container.mount(image)
 
     def sort_games(self, games: list[Game]):
@@ -4675,7 +4705,7 @@ class GameArchiver(App):
         # Don't create shortcuts for games already installed through Steam.
         if not can_add_to_steam(game):
             return False
-        
+
         if is_steam_launcher(game.launcher):
             return False
 
@@ -5040,11 +5070,16 @@ class GameArchiver(App):
 
         if isinstance(row, GameRow):
             self.highlighted_game_path = row.game.path
+        else:
+            self.highlighted_game_path = None
 
-            if self.app_mode == AppMode.LIBRARY:
-                self.update_library_details(row.game)
-        elif self.app_mode == AppMode.LIBRARY:
-            self.update_library_details(None)
+        if self.app_mode != AppMode.LIBRARY:
+            return
+
+        if isinstance(row, GameRow):
+            self.refresh_library_details(row.game)
+        else:
+            self.refresh_library_details(None)
 
     def get_row_for_game(self, game: Game) -> GameRow | None:
         return next(
@@ -5075,16 +5110,28 @@ class GameArchiver(App):
         row = self.get_highlighted_row()
         return row.game if row is not None else None
 
-    def update_library_details(self, game: Game | None):
+    def refresh_library_details(self, game: Game | None):
+        if self._artwork_timer is not None:
+            self._artwork_timer.stop()
+            self._artwork_timer = None
+
+        self._artwork_generation += 1
+        self.update_library_details(game, self._artwork_generation)
+
+    def update_library_details(
+        self,
+        game: Game | None,
+        generation: int,
+    ):
         info = self.query_one("#details-info", Static)
         details = self.query_one("#library-details")
         if game is None:
             details.border_title = "Select a game"
             info.update("")
+
             self.run_worker(
-                self.clear_library_artwork(),
+                self.clear_library_artwork(generation),
                 group="library-artwork",
-                exclusive=True,
             )
             return
 
@@ -5132,11 +5179,15 @@ class GameArchiver(App):
             f"Game Location: {location.name if location else 'Outside configured locations'}\n"
             f"Gamescope: {'Enabled' if game.gamescope_enabled else 'Disabled'}"
         )
-        self.run_worker(
-            self.update_library_artwork(game),
-            group="library-artwork",
-            exclusive=True,
-        )
+
+        def update_artwork():
+            self._artwork_timer = None
+            self.run_worker(
+                self.update_library_artwork(game, generation),
+                group="library-artwork",
+            )
+
+        self._artwork_timer = self.set_timer(0.15, update_artwork)
 
     def check_action(
         self,
@@ -5226,7 +5277,7 @@ class GameArchiver(App):
                             view.index = i
 
                             if self.app_mode == AppMode.LIBRARY:
-                                self.update_library_details(row.game)
+                                self.refresh_library_details(row.game)
 
                             if not search_focused:
                                 self.set_focus(view)
@@ -5236,11 +5287,15 @@ class GameArchiver(App):
                 view.index = 0
 
                 row = view.children[0] if view.children else None
+
                 if row is not None:
                     self.highlighted_game_path = row.game.path
+                else:
+                    self.highlighted_game_path = None
 
-                    if self.app_mode == AppMode.LIBRARY:
-                        self.update_library_details(row.game)
+                if self.app_mode == AppMode.LIBRARY:
+                    self.refresh_library_details(row.game if row else None)
+
                 if not search_focused:
                     self.set_focus(view)
 
@@ -5378,7 +5433,7 @@ class GameArchiver(App):
         self.refresh_views()
 
         if self.app_mode == AppMode.LIBRARY and not remaining_visible:
-            self.update_library_details(None)
+            self.refresh_library_details(None)
 
         self.notify(f"Removed {game.name} from the library.")
 
@@ -5386,6 +5441,13 @@ class GameArchiver(App):
         modes = list(AppMode)
         current_index = modes.index(self.app_mode)
         self.app_mode = modes[(current_index + 1) % len(modes)]
+
+        # Invalidate pending artwork updates when switching modes.
+        if self._artwork_timer is not None:
+            self._artwork_timer.stop()
+            self._artwork_timer = None
+
+        self._artwork_generation += 1
 
         config = load_config()
         config.setdefault("ui", {})["last_mode"] = self.app_mode.value
@@ -5439,7 +5501,7 @@ class GameArchiver(App):
                 self.notify(
                     f"Gamescope {'enabled' if game.gamescope_enabled else 'disabled'}"
                 )
-            self.update_library_details(game)
+            self.refresh_library_details(game)
         finally:
             self.dialog_open = False
 
@@ -6792,7 +6854,7 @@ class GameArchiver(App):
             self.dialog_open = False
 
             if highlighted_game is not None:
-                self.update_library_details(highlighted_game)
+                self.refresh_library_details(highlighted_game)
 
             for game in games:
                 row = self.get_row_for_game(game)
