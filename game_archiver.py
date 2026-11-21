@@ -112,9 +112,17 @@ PROTON = (
 )
 
 
+class GameLocationType(StrEnum):
+    SHARED = "shared"
+    ARCHIVED = "archived"
+    HEROIC = "heroic"
+    STEAM = "steam"
+
+
 @dataclass(frozen=True)
 class GameLocation:
     name: str
+    type: GameLocationType
     local_path: Path | None = None
     remote_path: Path | None = None
     move_to: str | None = None
@@ -128,6 +136,96 @@ class GameLocation:
 
     def is_movable(self, remote_available: bool) -> bool:
         return self.move_to is not None and remote_available
+
+
+def append_steam_locations(game_locations: list[GameLocation]) -> None:
+    steam_root = Path.home() / ".local" / "share" / "Steam"
+
+    # Steam has used both locations for this file.
+    library_files = (
+        steam_root / "config" / "libraryfolders.vdf",
+        steam_root / "steamapps" / "libraryfolders.vdf",
+    )
+
+    # Always include the primary Steam library.
+    library_roots = [steam_root]
+
+    # Read the first available, successfully parsed library file.
+    for library_file in library_files:
+        if not library_file.is_file():
+            continue
+
+        try:
+            with library_file.open("r", encoding="utf-8") as file:
+                data = vdf.load(file)
+        except (OSError, UnicodeError, SyntaxError, ValueError):
+            continue
+
+        libraries = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+
+        for key, entry in libraries.items():
+            if not str(key).isdigit():
+                continue
+
+            if isinstance(entry, dict):
+                # Skip explicitly unmounted libraries.
+                if entry.get("mounted") not in (None, "1", 1):
+                    continue
+
+                library_path = entry.get("path")
+            else:
+                # Older format stores the path directly.
+                library_path = entry
+
+            if library_path:
+                library_roots.append(Path(library_path).expanduser())
+
+        break
+
+    # Avoid duplicate paths, including the primary library if it
+    # also appears in libraryfolders.vdf.
+    existing_paths = {
+        Path(path).resolve()
+        for location in game_locations
+        for path in (location.local_path, location.remote_path)
+        if path is not None
+    }
+
+    used_names = {location.name for location in game_locations}
+    name_index = 1
+
+    for library_root in library_roots:
+        common_path = library_root / "steamapps" / "common"
+
+        if not common_path.is_dir():
+            continue
+
+        resolved_path = common_path.resolve()
+
+        if resolved_path in existing_paths:
+            continue
+
+        # Keep Steam location names unique.
+        while True:
+            name = "Steam" if name_index == 1 else f"Steam {name_index}"
+
+            if name not in used_names:
+                break
+
+            name_index += 1
+
+        game_locations.append(
+            GameLocation(
+                name=name,
+                local_path=common_path,
+                type=GameLocationType.STEAM,
+                steam_shortcuts=False,
+            )
+        )
+
+        existing_paths.add(resolved_path)
+        used_names.add(name)
+        name_index += 1
 
 
 # Game Storage Status:
@@ -147,30 +245,29 @@ class GameLocation:
 
 
 POOL_DIR = Path("/mnt/media/pool")
-GAME_LOCATIONS = (
+GAME_LOCATIONS: list[GameLocation] = [
     GameLocation(
         name="Shared",
+        type=GameLocationType.SHARED,
         local_path=Path.home() / "Games" / "shared",
         remote_path=POOL_DIR / "Games" / "shared",
         move_to="Archived",
     ),
     GameLocation(
         name="Archived",
+        type=GameLocationType.ARCHIVED,
         remote_path=POOL_DIR / "Games" / "archived",
         move_to="Shared",
     ),
     GameLocation(
         name="Heroic",
+        type=GameLocationType.HEROIC,
         local_path=Path.home() / "Games" / "Heroic",
         remote_path=POOL_DIR / "Games" / "Heroic",
     ),
-    GameLocation(
-        name="Steam",
-        local_path=Path.home() / ".local" / "share" / "Steam" / "steamapps" / "common",
-        remote_path=POOL_DIR / "Games" / "steam",
-        steam_shortcuts=False,
-    ),
-)
+]
+
+append_steam_locations(GAME_LOCATIONS)
 
 
 class AppMode(StrEnum):
@@ -850,7 +947,7 @@ def migrate_to_v8(db: sqlite3.Connection) -> None:
                 appid = str(appid & 0xFFFFFFFF)
 
         elif row["launcher"]:
-            appid = generate_appid(
+            appid = generate_nonsteam_appid(
                 Path(row["launcher"]),
                 row["name"],
             )
@@ -2512,6 +2609,12 @@ class SteamGridDBAction(Enum):
     CANCEL = auto()
 
 
+@dataclass(frozen=True)
+class SteamManifest:
+    id: str = ""
+    name: str = ""
+
+
 @dataclass
 class Game:
     id: int | None = None
@@ -2530,11 +2633,103 @@ class Game:
     duplicate_steam: bool = False
     steamgriddb: dict = field(default_factory=dict)
     gamescope_enabled: bool = True
+    steam_manifest: SteamManifest | None = None
+    steam_manifest_checked_for: Path | None = None
 
 
 # ============================================================
 # HELPERS
 # ============================================================
+
+_active_app: App | None = None
+
+
+def set_active_app(app: App | None) -> None:
+    global _active_app
+    _active_app = app
+
+
+def notify(
+    message: str,
+    *,
+    severity: str = "information",
+    title: str = "",
+) -> None:
+    if _active_app is not None:
+        _active_app.notify(
+            message,
+            severity=severity,
+            title=title,
+        )
+
+
+def find_steam_appid_from_manifest(game: Game) -> SteamManifest | None:
+
+    if game.path is None:
+        return None
+
+    location = get_game_location(game.path)
+
+    if (
+        location is None
+        or location.type is not GameLocationType.STEAM
+        or location.local_path is None
+    ):
+        return None
+
+    # Steam location points to .../steamapps/common.
+    common_path = location.local_path
+    steamapps = common_path.parent
+
+    if common_path.name != "common" or not steamapps.is_dir():
+        return None
+
+    target = game.path.resolve()
+
+    if game.steam_manifest_checked_for == target:
+        if game.steam_manifest:
+            return game.steam_manifest
+        else:
+            return None
+
+    game.steam_manifest = None
+    game.steam_manifest_checked_for = target
+
+    for manifest in steamapps.glob("appmanifest_*.acf"):
+        try:
+            with manifest.open(encoding="utf-8", errors="ignore") as file:
+                data = vdf.load(file)
+        except (OSError, UnicodeError, ValueError, SyntaxError):
+            continue
+
+        app_state = data.get("AppState") or data.get("appstate") or {}
+
+        installdir = app_state.get("installdir") or app_state.get("InstallDir")
+        if not installdir:
+            continue
+
+        install_path = (common_path / installdir).resolve()
+
+        if install_path != target:
+            continue
+
+        appid = app_state.get("appid") or app_state.get("appID")
+        name = app_state.get("name") or app_state.get("Name")
+        if appid is not None:
+            try:
+                game.steam_manifest = SteamManifest(
+                    id=str(int(appid) & 0xFFFFFFFF), name=name or game.name
+                )
+
+                notify(
+                    f"Using Steam manifest: {game.steam_manifest.name} "
+                    f"(AppID: {game.steam_manifest.id})"
+                )
+                return game.steam_manifest
+            except (TypeError, ValueError):
+                continue
+
+    return None
 
 
 def steam_appid_from_uri(value: str) -> str | None:
@@ -2660,6 +2855,10 @@ def get_move_locations(remote_available: bool) -> list[GameLocation]:
 
 def get_location(name: str) -> GameLocation:
     return next(location for location in GAME_LOCATIONS if location.name == name)
+
+
+def get_locations(location_type: GameLocationType) -> list[GameLocation]:
+    return [location for location in GAME_LOCATIONS if location.type is location_type]
 
 
 def _movable_group(
@@ -2804,41 +3003,52 @@ def update_artwork_paths_for_game(
     old_path: Path,
     new_path: Path,
 ) -> None:
-    if game.steamgriddb is None:
+    if game.steamgriddb is None or old_path == new_path:
         return
 
-    shared = get_location("Shared")
-    if shared.local_path is None:
+    source_location = get_game_location(old_path)
+    target_location = get_game_location(new_path)
+
+    if source_location is None or target_location is None:
         return
 
-    archived = get_location("Archived")
+    # Prefer local artwork paths when available.
+    # The game itself may have been moved to remote_path, but artwork
+    # should resolve to the local synced copy for faster UI access.
+    source_base = next(
+        (
+            base
+            for base in (source_location.local_path, source_location.remote_path)
+            if base is not None and old_path.is_relative_to(base)
+        ),
+        None,
+    )
 
-    # Shared -> Archived
-    if shared.remote_path is not None and old_path.is_relative_to(shared.remote_path):
-        path_mappings = [
-            (
-                shared.remote_path / old_path.name,
-                new_path,
-            ),
-            (
-                shared.local_path / old_path.name,
-                new_path,
-            ),
-        ]
+    target_base = next(
+        (
+            base
+            for base in (target_location.local_path, target_location.remote_path)
+            if base is not None and new_path.is_relative_to(base)
+        ),
+        None,
+    )
 
-    # Archived -> Shared
-    elif archived.remote_path is not None and old_path.is_relative_to(
-        archived.remote_path
-    ):
-        path_mappings = [
-            (
-                old_path,
-                shared.local_path / old_path.name,
-            ),
-        ]
-
-    else:
+    if source_base is None or target_base is None:
         return
+
+    source_relative = old_path.relative_to(source_base)
+    target_relative = new_path.relative_to(target_base)
+
+    # Prefer the local copy for artwork references when available.
+    artwork_target = (
+        target_location.local_path or target_location.remote_path
+    ) / target_relative
+
+    path_mappings = [
+        (base / source_relative, artwork_target)
+        for base in (source_location.local_path, source_location.remote_path)
+        if base is not None
+    ]
 
     art = game.steamgriddb.get("art", {})
     selected = game.steamgriddb.get("selected", {})
@@ -3510,6 +3720,41 @@ def launcher_score(path: Path, root: Path):
     )
 
 
+def steam_launch_appid(game: Game) -> str | None:
+    # 0. Steam installation manifest
+    manifest_match = find_steam_appid_from_manifest(game)
+
+    if manifest_match:
+        return manifest_match.id
+
+    # 1. SteamGridDB platform data
+    metadata = (game.steamgriddb or {}).get("steam_platform_data") or {}
+    steam_apps = metadata.get("external_platform_data", {}).get("steam", [])
+
+    if steam_apps:
+        appid = steam_apps[0].get("id")
+        if appid:
+            return appid if isinstance(appid, str) else str(int(appid) & 0xFFFFFFFF)
+
+    # 2. Existing Steam shortcut entry
+    if game.steam_entry is not None:
+        raw = game.steam_entry.get("appid")
+        if raw is not None:
+            try:
+                return str(int(raw) & 0xFFFFFFFF)
+            except (TypeError, ValueError):
+                pass
+
+    # 3. Existing Steam URI launcher
+    if game.launcher and is_steam_launcher(game.launcher):
+        appid = steam_appid_from_uri(game.launcher)
+        if appid:
+            return str(appid)
+
+    # Never generate a synthetic ID for a Steam URI.
+    return None
+
+
 def game_appid(game: Game) -> str | None:
     if game.steam_entry is not None:
         appid = game.steam_entry["appid"]
@@ -3519,9 +3764,9 @@ def game_appid(game: Game) -> str | None:
     if game.launcher is None:
         return None
     if is_steam_launcher(game.launcher):
-        return steam_appid_from_uri(game.launcher)
+        return steam_launch_appid(game)
 
-    return generate_appid(Path(game.launcher), game.name)
+    return generate_nonsteam_appid(Path(game.launcher), game.name)
 
 
 def shortcuts_path(user: SteamUser) -> Path:
@@ -3639,7 +3884,7 @@ def find_existing_shortcuts(
     return matches if len(matches) == 1 else []
 
 
-def generate_appid(exe: Path, stable_id: str) -> str:
+def generate_nonsteam_appid(exe: Path, stable_id: str) -> str:
     crc = binascii.crc32((str(exe) + stable_id).encode("utf-8")) | 0x80000000
 
     return str(crc & 0xFFFFFFFF)
@@ -3666,21 +3911,28 @@ def launch_path(game: Game) -> Path:
     if game.path is None:
         raise RuntimeError(f"Game has no path: {game.name}")
 
-    shared = get_location("Shared")
+    location = get_game_location(game.path)
 
-    if shared.local_path is not None and (
-        (
-            shared.remote_path is not None
-            and game.path.is_relative_to(shared.remote_path)
-        )
-        or game.path.is_relative_to(shared.local_path)
+    if (
+        location is None
+        or location.type is not GameLocationType.SHARED
+        or location.local_path is None
     ):
-        local = shared.local_path / game.name
+        return game.path
 
-        if local.is_dir():
-            return local
+    if location.remote_path is not None and game.path.is_relative_to(
+        location.remote_path
+    ):
+        relative_path = game.path.relative_to(location.remote_path)
+        local = location.local_path / relative_path
 
-    return game.path
+    elif game.path.is_relative_to(location.local_path):
+        local = game.path
+
+    else:
+        return game.path
+
+    return local if local.is_dir() else game.path
 
 
 def gen_launchers(
@@ -3694,12 +3946,7 @@ def gen_launchers(
     path = launch_path(game)
 
     if not can_add_to_steam(game):
-        metadata = game.steamgriddb.get("steam_platform_data") or {}
-        steam_apps = metadata.get("external_platform_data", {}).get("steam", [])
-        appid = steam_apps[0].get("id") if steam_apps else None
-
-        if not appid:
-            appid = game_appid(game)
+        appid = steam_launch_appid(game)
 
         if appid:
             yield f"steam://rungameid/{appid}"
@@ -3774,35 +4021,59 @@ def game_list_changed(
 
 
 def local_sync_status() -> str:
-    shared = get_location("Shared")
-    local_path = shared.local_path
-    remote_path = shared.remote_path
+    shared_locations = get_locations(GameLocationType.SHARED)
 
-    if local_path is None or not local_path.exists():
-        return "Local copy missing"
+    if not shared_locations:
+        return "No Shared locations configured"
 
-    if remote_path is None or not remote_path.exists():
-        return "Remote storage offline"
+    statuses = []
 
-    try:
-        remote = {p.name for p in remote_path.iterdir() if p.is_dir()}
-        local = {p.name for p in local_path.iterdir() if p.is_dir()}
-    except FileNotFoundError:
-        return "Remote storage offline"
+    for location in shared_locations:
+        local_path = location.local_path
+        remote_path = location.remote_path
 
-    if remote == local:
+        if local_path is None:
+            status = "No local path configured"
+
+        elif remote_path is None:
+            status = "No remote path configured"
+
+        elif not local_path.is_dir():
+            status = "Local copy missing"
+
+        elif not remote_path.is_dir():
+            status = "Remote storage offline"
+
+        else:
+            try:
+                remote = {p.name for p in remote_path.iterdir() if p.is_dir()}
+                local = {p.name for p in local_path.iterdir() if p.is_dir()}
+            except OSError:
+                status = "Unable to read directories"
+
+            else:
+                missing = remote - local
+                extra = local - remote
+
+                if not missing and not extra:
+                    status = "In Sync"
+                else:
+                    parts = []
+
+                    if missing:
+                        parts.append(f"{len(missing)} missing locally")
+
+                    if extra:
+                        parts.append(f"{len(extra)} extra locally")
+
+                    status = ", ".join(parts)
+
+        statuses.append((location.name, status))
+
+    if all(status == "In Sync" for _, status in statuses):
         return "In Sync"
 
-    missing = remote - local
-    extra = local - remote
-
-    parts = []
-    if missing:
-        parts.append(f"{len(missing)} missing locally")
-    if extra:
-        parts.append(f"{len(extra)} extra locally")
-
-    return ", ".join(parts)
+    return " | ".join(f"{name}: {status}" for name, status in statuses)
 
 
 def fmt_size(num: int) -> str:
@@ -3822,37 +4093,30 @@ def fmt_size(num: int) -> str:
 
 
 def dir_size(path: Path) -> int:
-    try:
-        if path.is_symlink():
-            target = path.resolve()
-        else:
-            target = path
+    target = path.resolve() if path.is_symlink() else path
 
-        exclude_args = [
-            *(f"--exclude={name}" for name in IGNORE_DIRS),
-            "--exclude=*/.*",
-        ]
+    exclude_args = [f"--exclude={name}" for name in IGNORE_DIRS]
+    exclude_args.append("--exclude=*/.*")
 
-        result = subprocess.run(
-            ["du", "-sb", *exclude_args, str(target)],
-            capture_output=True,
-            text=True,
-            check=False,
+    result = subprocess.run(
+        ["du", "-sb", *exclude_args, str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout.split(maxsplit=1)
+
+    if not output:
+        detail = result.stderr.strip() or (
+            f"du exited with status {result.returncode} without output"
         )
+        raise OSError(f"Unable to calculate size for {path}: {detail}")
 
-        if result.returncode != 0:
-            # du often returns non-zero on permission errors; still try to parse what we got
-            if result.stdout.strip():
-                return int(result.stdout.split()[0])
-            raise RuntimeError(
-                f"du failed (exit {result.returncode}): {result.stderr.strip() or 'unknown error'}"
-            )
-
-        return int(result.stdout.split()[0])
-
-    except Exception as e:
-        # Keep the message short and free of [ ] characters
-        raise RuntimeError(f"dir_size failed for {path}: {type(e).__name__}") from e
+    try:
+        return int(output[0])
+    except ValueError as e:
+        raise OSError(f"Unexpected du output for {path}: {result.stdout!r}") from e
 
 
 def latest_activity(path: Path) -> float:
@@ -4602,9 +4866,9 @@ class GameArchiver(App):
                         library_only_games.append(game)
                         continue
 
-                    if location.name == "Shared":
+                    if location.type is GameLocationType.SHARED:
                         shared_games.append(game)
-                    elif location.name == "Archived":
+                    elif location.type is GameLocationType.ARCHIVED:
                         archived_games.append(game)
                     else:
                         library_only_games.append(game)
@@ -4681,7 +4945,7 @@ class GameArchiver(App):
         )
 
         return {
-            "appid": generate_appid(launcher, game.name),
+            "appid": generate_nonsteam_appid(launcher, game.name),
             "AppName": game.name,
             "Exe": f'"{info.cmd[0]}"',
             "StartDir": f'"{info.cwd}"',
@@ -4914,16 +5178,18 @@ class GameArchiver(App):
             if base is None:
                 continue
 
-            if location.name == "Shared":
-                games = self.shared_games
-            elif location.name == "Archived":
-                games = self.archived_games
+            if location.type is GameLocationType.SHARED:
+                category_games = self.shared_games
+            elif location.type is GameLocationType.ARCHIVED:
+                category_games = self.archived_games
             else:
-                games = [
-                    game
-                    for game in self.library_only_games
-                    if game.path is not None and game.path.is_relative_to(base)
-                ]
+                category_games = self.library_only_games
+
+            games = [
+                game
+                for game in category_games
+                if game.path is not None and get_game_location(game.path) is location
+            ]
 
             if game_list_changed(base, games):
                 self.action_refresh()
@@ -5602,22 +5868,12 @@ class GameArchiver(App):
             return
         self.moving = True
 
-        shared_location = get_location("Shared")
-        archived_location = get_location("Archived")
-
         if self.shared_view.has_focus:
             destination = self.archived_games
-            target = archived_location.remote_path
         else:
             destination = self.shared_games
-            target = shared_location.remote_path
 
-        if target is None:
-            self.notify("Target location is not configured.")
-            self.moving = False
-            return
-
-        moved = await self.move_games(destination, target)
+        moved = await self.move_games(destination)
 
         if not moved:
             self.moving = False
@@ -5627,25 +5883,36 @@ class GameArchiver(App):
         self.refresh_views()
         self.moving = False
 
-    async def move_games(
-        self,
-        destination_games: list[Game],
-        target: Path,
-    ) -> bool:
+    async def move_games(self, destination_games: list[Game]) -> bool:
         if not self.storage_online:
             return False
+
         source_games = self.get_current_game_list()
         moving = self.get_selected_games()
 
         if not moving:
             return False
 
-        target.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
         for game in moving:
+            source_location = get_game_location(game.path)
+
+            if source_location is None or source_location.move_to is None:
+                self.notify(f"No move destination configured for {game.name}")
+                game.selected = False
+                continue
+
+            target_location = get_location(source_location.move_to)
+            target = target_location.remote_path
+
+            if target is None:
+                self.notify(
+                    f"Target location '{target_location.name}' is not configured."
+                )
+                game.selected = False
+                continue
+
+            target.mkdir(parents=True, exist_ok=True)
+            new_path = target / game.name
             duplicate_group = is_on_disk_duplicate(game)
             if duplicate_group:
                 self.notify(
@@ -5755,9 +6022,9 @@ class GameArchiver(App):
                 library_only_games.append(game)
                 continue
 
-            if location.name == "Shared":
+            if location.type is GameLocationType.SHARED:
                 shared_games.append(game)
-            elif location.name == "Archived":
+            elif location.type is GameLocationType.ARCHIVED:
                 archived_games.append(game)
             else:
                 library_only_games.append(game)
@@ -6389,23 +6656,42 @@ class GameArchiver(App):
         game: Game,
         art_type: ArtworkType,
     ) -> list[Path]:
+        appids = dict.fromkeys(
+            appid
+            for appid in (
+                steam_launch_appid(game),
+                game_appid(game),
+            )
+            if appid
+        )
+
+        if not appids:
+            self.notify(
+                f"{art_type.name} artwork cannot be installed as Steam artwork.",
+                severity="warning",
+            )
+            return []
+
         installed: list[Path] = []
 
-        for extension in ARTWORK_EXTENSIONS:
-            path = self.get_steam_artwork_path(
-                game,
-                art_type,
-                extension,
-            )
-
-            if path is not None and path.is_file():
-                installed.append(path)
-            elif path is None:
-                self.notify(
-                    f"{art_type.name} artwork cannot be installed as Steam artwork.",
-                    severity="warning",
+        for appid in appids:
+            for extension in ARTWORK_EXTENSIONS:
+                path = self.get_steam_artwork_path(
+                    game,
+                    art_type,
+                    extension,
+                    appid=appid,
                 )
-                return []
+
+                if path is None:
+                    self.notify(
+                        f"{art_type.name} artwork cannot be installed as Steam artwork.",
+                        severity="warning",
+                    )
+                    return []
+
+                if path.is_file() and path not in installed:
+                    installed.append(path)
 
         return installed
 
@@ -6453,12 +6739,7 @@ class GameArchiver(App):
         is_steam_game: bool = False,
     ) -> Path | None:
         if is_steam_game:
-            metadata = game.steamgriddb.get("steam_platform_data") or {}
-            steam_apps = metadata.get("external_platform_data", {}).get("steam", [])
-            appid = steam_apps[0].get("id") if steam_apps else None
-
-            if not appid:
-                appid = game_appid(game)
+            appid = steam_launch_appid(game)
         else:
             appid = appid if appid is not None else game_appid(game)
 
@@ -8406,4 +8687,6 @@ class SteamGridDBClient:
 if __name__ == "__main__":
     init_database()
     # migrate_game_data()
-    GameArchiver().run()
+    app = GameArchiver()
+    set_active_app(app)
+    app.run()
