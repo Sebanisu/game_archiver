@@ -2721,10 +2721,10 @@ def find_steam_appid_from_manifest(game: Game) -> SteamManifest | None:
                     id=str(int(appid) & 0xFFFFFFFF), name=name or game.name
                 )
 
-                notify(
-                    f"Using Steam manifest: {game.steam_manifest.name} "
-                    f"(AppID: {game.steam_manifest.id})"
-                )
+                # notify(
+                #     f"Using Steam manifest: {game.steam_manifest.name} "
+                #     f"(AppID: {game.steam_manifest.id})"
+                # )
                 return game.steam_manifest
             except (TypeError, ValueError):
                 continue
