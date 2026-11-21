@@ -6866,6 +6866,9 @@ class GameArchiver(App):
         self.save_game_data()
         self.refresh_game_row(game)
 
+        if self.app_mode == AppMode.LIBRARY and self.highlighted_game_path == game.path:
+            self.refresh_library_details(game)
+
         # Steam-managed games: persist the selection without installing artwork.
         if not can_add_to_steam(game):
             return True
