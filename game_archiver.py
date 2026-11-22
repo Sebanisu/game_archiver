@@ -5404,10 +5404,16 @@ class GameArchiver(App):
         sgdb = game.steamgriddb or {}
         sgdb_game = sgdb.get("game")
 
-        name = sgdb.get("name") or (
-            sgdb_game.get("name") if isinstance(sgdb_game, dict) else None
+        name = (
+            sgdb.get("name")
+            or (sgdb_game.get("name") if isinstance(sgdb_game, dict) else None)
+            or (
+                game.steam_manifest.name
+                if game.steam_manifest is not None
+                else None
+            )
         )
-
+        
         details.border_title = f"{game.name} ({name})" if name else game.name
 
         last_played = (
