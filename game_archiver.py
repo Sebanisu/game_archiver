@@ -6281,6 +6281,54 @@ class GameArchiver(App):
         game: Game,
         client: SteamGridDBClient,
     ):
+        # Prefer an exact Steam AppID match from the installed Steam manifest.
+        # Do not use steam_launch_appid() here: it can also use SteamGridDB data.
+        manifest = find_steam_appid_from_manifest(game)
+
+        if manifest is not None:
+            sgdb_game = await client.get_game_by_steam_appid(manifest.id)
+
+            if sgdb_game is not None:
+                game.steamgriddb = {
+                    "search": sgdb_game.get("name") or manifest.name or game.name,
+                    "game": sgdb_game,
+                    "steam_platform_data": None,
+                    "cached": None,
+                    "art": {
+                        ArtworkType.GRID_PORTRAIT: None,
+                        ArtworkType.GRID_SQUARE: None,
+                        ArtworkType.GRID_LANDSCAPE: None,
+                        ArtworkType.HERO: None,
+                        ArtworkType.LOGO: None,
+                        ArtworkType.ICON: None,
+                    },
+                    "selected": {
+                        ArtworkType.GRID_PORTRAIT: None,
+                        ArtworkType.GRID_SQUARE: None,
+                        ArtworkType.GRID_LANDSCAPE: None,
+                        ArtworkType.HERO: None,
+                        ArtworkType.LOGO: None,
+                        ArtworkType.ICON: None,
+                    },
+                }
+
+                # This fetch uses the SteamGridDB game ID only for optional
+                # platform artwork metadata; it does not determine the AppID.
+                steam_platform_data = await client.get_steam_platform_data(game)
+                if steam_platform_data is not None:
+                    game.steamgriddb["steam_platform_data"] = steam_platform_data
+
+                self.save_game_data()
+                self.notify(
+                    f"Matched via Steam manifest (AppID {manifest.id}): "
+                    f"{sgdb_game.get('name') or manifest.name or game.name}"
+                )
+                self.refresh_game_row(game)
+                await self.manage_steamgriddb(game, client)
+                return
+
+        # No manifest match (or no SteamGridDB entry for that AppID):
+        # fall back to the existing name-based search flow.
         query = steamgriddb_search_name(game)
         results = []
         prompt_for_search = False
@@ -8528,6 +8576,17 @@ class SteamGridDBClient:
         game_id: str,
     ) -> dict | None:
         result = await self.get(f"games/id/{game_id}")
+
+        if not result["success"]:
+            return None
+
+        return result["data"]
+    
+    async def get_game_by_steam_appid(
+        self,
+        steam_appid: str | int,
+    ) -> dict | None:
+        result = await self.get(f"games/steam/{steam_appid}")
 
         if not result["success"]:
             return None
