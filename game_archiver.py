@@ -4799,8 +4799,6 @@ class GameArchiver(App):
 
         return found, not_found
 
-    from collections.abc import Iterator
-
     def load_selected_art(
         self,
         db: sqlite3.Connection,
