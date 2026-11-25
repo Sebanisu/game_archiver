@@ -2636,6 +2636,85 @@ class Game:
     steam_manifest: SteamManifest | None = None
     steam_manifest_checked_for: Path | None = None
 
+    @classmethod
+    def from_row(
+        cls,
+        row: sqlite3.Row,
+        *,
+        steam_row: sqlite3.Row | None = None,
+        steamgriddb_row: sqlite3.Row | None = None,
+        art_rows: Iterator[tuple[ArtworkType, dict]] | None = None,
+        selected_rows: Iterator[tuple[ArtworkType, dict]] | None = None,
+    ) -> Game:
+        launcher = row["launcher"]
+
+        game = cls(
+            id=row["id"],
+            name=row["name"],
+            path=Path(row["path"]) if row["path"] else None,
+            size=row["size"],
+            mtime=row["mtime"],
+            file_count=row["file_count"],
+            last_played=row["last_played"],
+            launcher=(
+                launcher
+                if is_steam_launcher(launcher)
+                else Path(launcher)
+                if launcher is not None
+                else None
+            ),
+            gamescope_enabled=bool(row["gamescope_enabled"]),
+        )
+
+        find_steam_appid_from_manifest(game)
+
+        if steam_row is not None:
+            game.steam_key = steam_row["steam_key"]
+            game.steam_entry = (
+                json.loads(steam_row["steam_entry"])
+                if steam_row["steam_entry"] is not None
+                else None
+            )
+            game.in_steam = bool(steam_row["in_steam"])
+            game.steam_broken = bool(steam_row["steam_broken"])
+            game.duplicate_steam = bool(steam_row["duplicate_steam"])
+
+        if art_rows is not None:
+            art = {art_type: [] for art_type in ArtworkType}
+
+            has_artwork = False
+
+            for artwork_type, artwork in art_rows:
+                art.setdefault(artwork_type, []).append(artwork)
+                has_artwork = True
+
+        selected = {artwork_type: None for artwork_type in ArtworkType}
+
+        if selected_rows is not None:
+            for artwork_type, selection in selected_rows:
+                selected[artwork_type] = selection
+
+        if steamgriddb_row is not None:
+            game.steamgriddb = {
+                "search": steamgriddb_row["search"],
+                "game": (
+                    json.loads(steamgriddb_row["game_data"])
+                    if steamgriddb_row["game_data"] is not None
+                    else None
+                ),
+                "steam_platform_data": (
+                    json.loads(steamgriddb_row["steam_platform_data"])
+                    if steamgriddb_row["steam_platform_data"] is not None
+                    else None
+                ),
+                "cached": steamgriddb_row["cached"],
+                "art": art,
+                "artwork_cached": has_artwork,
+                "selected": selected,
+            }
+
+        return game
+
 
 # ============================================================
 # HELPERS
@@ -4096,27 +4175,50 @@ def dir_size(path: Path) -> int:
     target = path.resolve() if path.is_symlink() else path
 
     exclude_args = [f"--exclude={name}" for name in IGNORE_DIRS]
-    exclude_args.append("--exclude=*/.*")
+
+    cmd = ["du", "-sb", *exclude_args, str(target)]
 
     result = subprocess.run(
-        ["du", "-sb", *exclude_args, str(target)],
+        cmd,
         capture_output=True,
         text=True,
         check=False,
     )
 
-    output = result.stdout.split(maxsplit=1)
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
 
-    if not output:
-        detail = result.stderr.strip() or (
-            f"du exited with status {result.returncode} without output"
-        )
+    if result.returncode != 0 or not stdout:
+        if not path.exists():
+            raise FileNotFoundError(f"Path does not exist: {path}")
+        if not path.is_dir() and not path.is_symlink():
+            raise NotADirectoryError(f"Not a directory: {path}")
+
+        if "Permission denied" in stderr:
+            raise PermissionError(
+                f"Permission denied while calculating size of {path}: {stderr}"
+            )
+        if "No such file or directory" in stderr:
+            raise FileNotFoundError(f"du could not access {path}: {stderr}")
+
+        # Build a useful diagnostic
+        cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
+        if result.returncode == 0 and not stdout:
+            detail = f"du exited 0 but produced no output.\nCommand: {cmd_str}"
+        else:
+            detail = stderr or f"du exited with status {result.returncode}"
+            detail = f"{detail}\nCommand: {cmd_str}"
+
         raise OSError(f"Unable to calculate size for {path}: {detail}")
 
     try:
-        return int(output[0])
-    except ValueError as e:
-        raise OSError(f"Unexpected du output for {path}: {result.stdout!r}") from e
+        size_str = stdout.split(maxsplit=1)[0]
+        return int(size_str)
+    except (ValueError, IndexError) as e:
+        cmd_str = " ".join(shlex.quote(arg) for arg in cmd)
+        raise OSError(
+            f"Unexpected du output for {path}: {result.stdout!r}\nCommand: {cmd_str}"
+        ) from e
 
 
 def latest_activity(path: Path) -> float:
@@ -4697,189 +4799,236 @@ class GameArchiver(App):
 
         return found, not_found
 
+    from collections.abc import Iterator
+
+    def load_selected_art(
+        self,
+        db: sqlite3.Connection,
+        game_id: int,
+    ) -> Iterator[tuple[ArtworkType, dict]]:
+        cursor = db.execute(
+            """
+            SELECT
+                sa.artwork_type,
+                a.data,
+                sa.downloaded_path,
+                sa.installed_path
+            FROM selected_artwork AS sa
+            JOIN artwork AS a
+                ON a.id = sa.artwork_id
+            WHERE sa.game_id = ?
+            """,
+            (game_id,),
+        )
+
+        for row in cursor:
+            try:
+                artwork_type = ArtworkType[row["artwork_type"]]
+            except KeyError:
+                continue
+
+            try:
+                artwork = json.loads(row["data"])
+            except json.JSONDecodeError:
+                continue
+
+            # Restore local asset paths after JSON deserialization.
+            if artwork.get("source") == "local" and artwork.get("path") is not None:
+                artwork["path"] = Path(artwork["path"])
+
+            downloaded_path = row["downloaded_path"]
+            if downloaded_path is not None:
+                downloaded_path = Path(downloaded_path)
+
+            installed_path = row["installed_path"]
+            if installed_path is not None:
+                installed_path = Path(installed_path)
+
+            yield (
+                artwork_type,
+                {
+                    "asset": artwork,
+                    "downloaded_path": downloaded_path,
+                    "installed_path": installed_path,
+                },
+            )
+
+    def load_art(
+        self,
+        db: sqlite3.Connection,
+        game_id: int,
+    ) -> Iterator[tuple[ArtworkType, dict]]:
+        try:
+            cursor = db.execute(
+                """
+                SELECT
+                    a.type,
+                    a.data
+                FROM game_artwork AS ga
+                JOIN artwork AS a
+                    ON a.id = ga.artwork_id
+                WHERE ga.game_id = ?
+                """,
+                (game_id,),
+            )
+
+            for row in cursor:
+                try:
+                    artwork_type = ArtworkType[row["type"]]
+                except KeyError:
+                    continue
+
+                try:
+                    artwork = json.loads(row["data"])
+                except json.JSONDecodeError:
+                    continue
+
+                yield artwork_type, artwork
+
+        except Exception as e:  # noqa: BLE001
+            self.notify(f"Error loading artwork: {type(e).__name__}: {e}")
+
+    def load_games(self) -> Iterator[Game]:
+        with get_db() as db:
+            cursor = db.execute(
+                """
+                SELECT *
+                FROM games
+                ORDER BY id
+                """
+            )
+
+            for row in cursor:
+                game_id = row["id"]
+
+                steam_row = db.execute(
+                    """
+                    SELECT *
+                    FROM steam_games
+                    WHERE game_id = ?
+                    """,
+                    (game_id,),
+                ).fetchone()
+
+                steamgriddb_row = db.execute(
+                    """
+                    SELECT *
+                    FROM steamgriddb_games
+                    WHERE game_id = ?
+                    """,
+                    (game_id,),
+                ).fetchone()
+
+                yield Game.from_row(
+                    row=row,
+                    steam_row=steam_row,
+                    steamgriddb_row=steamgriddb_row,
+                    art_rows=self.load_art(db, game_id),
+                    selected_rows=self.load_selected_art(db, game_id),
+                )
+
     def load_game_data(self) -> None:
         try:
-            with get_db() as db:
-                rows = db.execute(
-                    """
-                    SELECT
-                        g.id,
-                        g.name,
-                        g.path,
-                        g.size,
-                        g.mtime,
-                        g.file_count,
-                        g.last_played,
-                        g.launcher,
-                        g.gamescope_enabled,
+            games = []
+            seen_identities = {}
+            path_updates = []
 
-                        s.steam_key,
-                        s.steam_entry,
-                        s.in_steam,
-                        s.steam_broken,
-                        s.duplicate_steam,
+            for game in self.load_games():
+                identity = game_identity(game)
 
-                        sg.sgdb_id,
-                        sg.search AS sgdb_search,
-                        sg.game_data,
-                        sg.steam_platform_data,
-                        sg.cached
+                if identity is not None:
+                    existing_id = seen_identities.get(identity)
 
-                    FROM games g
-
-                    LEFT JOIN steam_games s
-                        ON s.game_id = g.id
-
-                    LEFT JOIN steamgriddb_games sg
-                        ON sg.game_id = g.id
-
-                    ORDER BY g.id
-                    """
-                ).fetchall()
-
-                games = []
-                seen_identities = {}
-
-                for row in rows:
-                    game = Game(
-                        id=row["id"],
-                        name=row["name"],
-                        path=Path(row["path"]) if row["path"] else None,
-                        size=row["size"],
-                        mtime=row["mtime"],
-                        file_count=row["file_count"],
-                        last_played=row["last_played"],
-                        launcher=(
-                            row["launcher"]
-                            if is_steam_launcher(row["launcher"])
-                            else Path(row["launcher"])
-                            if row["launcher"] is not None
-                            else None
-                        ),
-                        gamescope_enabled=bool(row["gamescope_enabled"]),
-                    )
-
-                    identity = game_identity(game)
-
-                    if identity is not None:
-                        existing_id = seen_identities.get(identity)
-
-                        if existing_id is not None:
-                            debug_log(
-                                f"Skipping duplicate game ID {row['id']} "
-                                f"({game.name!r}, {game.path}); "
-                                f"keeping ID {existing_id}"
-                            )
-                            continue
-
-                        seen_identities[identity] = row["id"]
-
-                        location = get_game_location(game.path)
-
-                        if location is not None and location.remote_path is not None:
-                            relative_path = next(
-                                (
-                                    game.path.relative_to(base)
-                                    for base in (
-                                        location.local_path,
-                                        location.remote_path,
-                                    )
-                                    if base is not None
-                                    and game.path.is_relative_to(base)
-                                ),
-                                None,
-                            )
-
-                            if relative_path is not None:
-                                remote_path = location.remote_path / relative_path
-
-                                if remote_path.is_dir() and game.path != remote_path:
-                                    debug_log(
-                                        f"Updating game ID {row['id']} path: "
-                                        f"{game.path} -> {remote_path}"
-                                    )
-
-                                    db.execute(
-                                        "UPDATE games SET path = ? WHERE id = ?",
-                                        (str(remote_path), row["id"]),
-                                    )
-
-                                    game.path = remote_path
-
-                    if row["steam_key"] is not None:
-                        game.steam_key = row["steam_key"]
-
-                    if row["steam_entry"] is not None:
-                        game.steam_entry = json.loads(row["steam_entry"])
-
-                    game.in_steam = bool(row["in_steam"])
-                    game.steam_broken = bool(row["steam_broken"])
-                    game.duplicate_steam = bool(row["duplicate_steam"])
-
-                    game_id = row["id"]
-                    selected = load_selected_artwork(db, game_id)
-
-                    has_sgdb_data = (
-                        row["sgdb_id"] is not None
-                        or row["sgdb_search"] is not None
-                        or row["game_data"] is not None
-                    )
-                    has_selected_artwork = any(
-                        artwork is not None for artwork in selected.values()
-                    )
-
-                    if has_sgdb_data or has_selected_artwork:
-                        game.steamgriddb = {
-                            "search": row["sgdb_search"],
-                            "game": (
-                                json.loads(row["game_data"])
-                                if row["game_data"] is not None
-                                else None
-                            ),
-                            "steam_platform_data": (
-                                json.loads(row["steam_platform_data"])
-                                if row["steam_platform_data"] is not None
-                                else None
-                            ),
-                            "cached": row["cached"],
-                            "art": {},
-                            "selected": selected,
-                        }
-
-                        (
-                            game.steamgriddb["art"],
-                            game.steamgriddb["artwork_cached"],
-                        ) = load_steamgriddb_artwork(db, game_id)
-
-                    games.append(game)
-
-                self.sort_games(games)
-
-                shared_games = []
-                archived_games = []
-                library_only_games = []
-
-                for game in games:
-                    location = get_game_location(game.path) if game.path else None
-
-                    if location is None:
-                        library_only_games.append(game)
+                    if existing_id is not None:
+                        debug_log(
+                            f"Skipping duplicate game ID {game.id} "
+                            f"({game.name!r}, {game.path}); "
+                            f"keeping ID {existing_id}"
+                        )
                         continue
 
-                    if location.type is GameLocationType.SHARED:
-                        shared_games.append(game)
-                    elif location.type is GameLocationType.ARCHIVED:
-                        archived_games.append(game)
-                    else:
-                        library_only_games.append(game)
+                    seen_identities[identity] = game.id
 
-                self.shared_games = shared_games
-                self.archived_games = archived_games
-                self.library_only_games = library_only_games
+                    location = (
+                        get_game_location(game.path) if game.path is not None else None
+                    )
 
-                self.games = games
+                    if location is not None and location.remote_path is not None:
+                        relative_path = next(
+                            (
+                                game.path.relative_to(base)
+                                for base in (
+                                    location.local_path,
+                                    location.remote_path,
+                                )
+                                if base is not None and game.path.is_relative_to(base)
+                            ),
+                            None,
+                        )
 
-        except Exception as e:  # noqa: BLE001 - Prevent database loading errors from crashing startup.
+                        if relative_path is not None:
+                            remote_path = location.remote_path / relative_path
+
+                            if remote_path.is_dir() and game.path != remote_path:
+                                debug_log(
+                                    f"Updating game ID {game.id} path: "
+                                    f"{game.path} -> {remote_path}"
+                                )
+
+                                if game.id is not None:
+                                    path_updates.append((str(remote_path), game.id))
+
+                                game.path = remote_path
+
+                games.append(game)
+
+            # Apply path updates after load_games() has finished.
+            if path_updates:
+                with get_db() as db:
+                    db.executemany(
+                        """
+                        UPDATE games
+                        SET path = ?
+                        WHERE id = ?
+                        """,
+                        path_updates,
+                    )
+
+            self.sort_games(games)
+
+            shared_games = []
+            archived_games = []
+            library_only_games = []
+
+            for game in games:
+                location = (
+                    get_game_location(game.path) if game.path is not None else None
+                )
+
+                if location is None:
+                    library_only_games.append(game)
+                    continue
+
+                if location.type is GameLocationType.SHARED:
+                    shared_games.append(game)
+                elif location.type is GameLocationType.ARCHIVED:
+                    archived_games.append(game)
+                else:
+                    library_only_games.append(game)
+
+            self.shared_games = shared_games
+            self.archived_games = archived_games
+            self.library_only_games = library_only_games
+            self.games = games
+            # After loading and closing the database connection:
+            self.run_worker(
+                self.auto_populate_steamgriddb_from_manifests(),
+                name="steamgriddb-auto-link",
+            )
+
+        except TypeError:
+            raise
+        except Exception as e:  # noqa: BLE001
             self.notify(f"Error loading game data: {type(e).__name__}: {e}")
 
     def save_game_data(self) -> None:
@@ -5252,15 +5401,7 @@ class GameArchiver(App):
         if game.mtime == mtime and game.file_count == file_count:
             return
 
-        try:
-            game.size = dir_size(path)
-        except OSError as e:
-            self.notify(
-                f"Error computing size for {path}: {type(e).__name__}",
-                severity="error",
-                markup=False,
-            )
-            game.size = 0
+        game.size = dir_size(path)
 
         game.mtime = mtime
         game.file_count = file_count
@@ -5407,13 +5548,9 @@ class GameArchiver(App):
         name = (
             sgdb.get("name")
             or (sgdb_game.get("name") if isinstance(sgdb_game, dict) else None)
-            or (
-                game.steam_manifest.name
-                if game.steam_manifest is not None
-                else None
-            )
+            or (game.steam_manifest.name if game.steam_manifest is not None else None)
         )
-        
+
         details.border_title = f"{game.name} ({name})" if name else game.name
 
         last_played = (
@@ -6282,6 +6419,130 @@ class GameArchiver(App):
         self.update_status()
         self.save_game_data()
 
+    async def auto_link_steamgriddb_from_manifest(
+        self,
+        game: Game,
+        client: SteamGridDBClient,
+    ) -> bool:
+        if has_steamgriddb_match(game):
+            return False
+
+        manifest = find_steam_appid_from_manifest(game)
+        if manifest is None:
+            return False
+
+        if not isinstance(game.steamgriddb, dict):
+            game.steamgriddb = {}
+
+        # Use the Steam manifest name as the search query.
+        if not game.steamgriddb.get("search"):
+            game.steamgriddb["search"] = manifest.name
+
+        sgdb_game = await client.get_game_by_steam_appid(manifest.id)
+
+        if sgdb_game is None:
+            return False
+
+        if not isinstance(game.steamgriddb, dict):
+            game.steamgriddb = {}
+
+        game.steamgriddb["search"] = manifest.name
+        game.steamgriddb["game"] = sgdb_game
+
+        game.steamgriddb.setdefault("art", {})
+        game.steamgriddb.setdefault("selected", {})
+
+        debug_log(
+            f"Automatically matched {game.name!r} via Steam manifest: "
+            f"{manifest.name!r} (AppID {manifest.id})"
+        )
+
+        return True
+
+    async def auto_populate_steamgriddb_from_manifests(self) -> None:
+        config = load_config()
+        api_key = config.get("steamgriddb", {}).get("api_key")
+
+        # Don't prompt for an API key during startup.
+        if not api_key:
+            return
+
+        client = SteamGridDBClient(api_key)
+
+        updated_games = []
+
+        try:
+            for game in self.games:
+                try:
+                    if await self.auto_link_steamgriddb_from_manifest(
+                        game,
+                        client,
+                    ):
+                        updated_games.append(game)
+
+                except httpx.RequestError as e:
+                    debug_log(f"SteamGridDB connection failed: {type(e).__name__}: {e}")
+                    self.notify(
+                        "SteamGridDB connection failed. Stopping automatic lookups.",
+                        severity="warning",
+                    )
+                    break
+
+                await asyncio.sleep(0.5)
+
+        finally:
+            await client.close()
+
+        if not updated_games:
+            return
+
+        # Persist only the updated SteamGridDB records.
+        with get_db() as db:
+            for game in updated_games:
+                sgdb = game.steamgriddb
+                sgdb_game = sgdb["game"]
+
+                db.execute(
+                    """
+                    INSERT INTO steamgriddb_games (
+                        game_id,
+                        sgdb_id,
+                        name,
+                        search,
+                        game_data
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(game_id) DO UPDATE SET
+                        sgdb_id = excluded.sgdb_id,
+                        name = excluded.name,
+                        search = excluded.search,
+                        game_data = excluded.game_data
+                    """,
+                    (
+                        game.id,
+                        sgdb_game["id"],
+                        sgdb_game.get("name"),
+                        sgdb["search"],
+                        json.dumps(
+                            sgdb_game,
+                            indent=2,
+                            sort_keys=True,
+                            default=json_default,
+                        ),
+                    ),
+                )
+
+            db.commit()
+
+        for game in updated_games:
+            self.refresh_game_row(game)
+
+        self.notify(
+            f"Automatically matched {len(updated_games)} "
+            f"game{'s' if len(updated_games) != 1 else ''} "
+            "using Steam manifests."
+        )
+
     async def link_steamgriddb(
         self,
         game: Game,
@@ -6865,10 +7126,10 @@ class GameArchiver(App):
         image = Path(image)
 
         if not image.is_file():
-            self.notify(
-                f"Artwork file not found: {image}",
-                severity="error",
-            )
+            # self.notify(
+            #     f"Artwork file not found: {image}",
+            #     severity="error",
+            # )
             return False
 
         if art_type == ArtworkType.ICON:
@@ -7153,40 +7414,42 @@ class GameArchiver(App):
                 return
 
             client = SteamGridDBClient(key)
+            try:
+                # One game: use the existing workflow directly.
+                if len(games) == 1:
+                    game = games[0]
 
-            # One game: use the existing workflow directly.
-            if len(games) == 1:
-                game = games[0]
+                    if has_steamgriddb_match(game):
+                        await self.manage_steamgriddb(game, client)
+                    else:
+                        await self.link_steamgriddb(game, client)
 
-                if has_steamgriddb_match(game):
-                    await self.manage_steamgriddb(game, client)
+                    return
+
                 else:
-                    await self.link_steamgriddb(game, client)
-
-                return
-
-            else:
-                choice = await self.push_screen_wait(
-                    OptionDialog(
-                        title="SteamGridDB",
-                        message=f"How would you like to apply artwork to {len(games)} games?",
-                        options=[
-                            ("Apply to All", "all"),
-                            ("Choose for Each", "each"),
-                            ("Cancel", "cancel"),
-                        ],
+                    choice = await self.push_screen_wait(
+                        OptionDialog(
+                            title="SteamGridDB",
+                            message=f"How would you like to apply artwork to {len(games)} games?",
+                            options=[
+                                ("Apply to All", "all"),
+                                ("Choose for Each", "each"),
+                                ("Cancel", "cancel"),
+                            ],
+                        )
                     )
-                )
 
-                if choice == "each":
-                    for game in games:
-                        if has_steamgriddb_match(game):
-                            await self.manage_steamgriddb(game, client)
-                        else:
-                            await self.link_steamgriddb(game, client)
+                    if choice == "each":
+                        for game in games:
+                            if has_steamgriddb_match(game):
+                                await self.manage_steamgriddb(game, client)
+                            else:
+                                await self.link_steamgriddb(game, client)
 
-                elif choice == "all":
-                    await self.apply_steamgriddb_to_all(games, client)
+                    elif choice == "all":
+                        await self.apply_steamgriddb_to_all(games, client)
+            finally:
+                await client.close()
 
         finally:
             self.dialog_open = False
@@ -8526,18 +8789,27 @@ class SteamGridDBClient:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.client = httpx.AsyncClient(
+            timeout=15,
+            limits=httpx.Limits(
+                max_connections=1,
+                max_keepalive_connections=1,
+            ),
+        )
+
+    async def close(self):
+        await self.client.aclose()
 
     async def get(self, endpoint: str, params: dict | None = None) -> dict:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(
-                f"{self.BASE_URL}/{endpoint}",
-                headers=headers,
-                params=params,
-            )
+        response = await self.client.get(
+            f"{self.BASE_URL}/{endpoint}",
+            headers=headers,
+            params=params,
+        )
 
         try:
             payload = response.json()
@@ -8587,7 +8859,7 @@ class SteamGridDBClient:
             return None
 
         return result["data"]
-    
+
     async def get_game_by_steam_appid(
         self,
         steam_appid: str | int,
@@ -8721,10 +8993,8 @@ class SteamGridDBClient:
         path: Path,
     ) -> dict:
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url)
-
-                response.raise_for_status()
+            response = await self.client.get(url)
+            response.raise_for_status()
 
             path.parent.mkdir(
                 parents=True,
