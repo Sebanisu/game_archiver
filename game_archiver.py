@@ -2615,6 +2615,12 @@ class SteamManifest:
     name: str = ""
 
 
+@dataclass(frozen=True)
+class GogManifest:
+    id: str
+    name: str
+
+
 @dataclass
 class Game:
     id: int | None = None
@@ -2635,6 +2641,8 @@ class Game:
     gamescope_enabled: bool = True
     steam_manifest: SteamManifest | None = None
     steam_manifest_checked_for: Path | None = None
+    gog_manifest: GogManifest | None = None
+    gog_manifest_checked_for: Path | None = None
 
     @classmethod
     def from_row(
@@ -2665,8 +2673,6 @@ class Game:
             ),
             gamescope_enabled=bool(row["gamescope_enabled"]),
         )
-
-        find_steam_appid_from_manifest(game)
 
         if steam_row is not None:
             game.steam_key = steam_row["steam_key"]
@@ -2740,6 +2746,58 @@ def notify(
             severity=severity,
             title=title,
         )
+
+
+def find_gog_manifest(game: Game) -> GogManifest | None:
+    path = game.path
+
+    if path is None:
+        return None
+
+    # Already checked this installation path.
+    if game.gog_manifest_checked_for == path:
+        return game.gog_manifest
+
+    # Reset cached data when the installation path changes.
+    game.gog_manifest = None
+
+    if not path.is_dir():
+        return None
+    game.gog_manifest_checked_for = path
+
+    for manifest_dir in (path, path / "game"):
+        if not manifest_dir.is_dir():
+            continue
+
+        for manifest_path in sorted(manifest_dir.glob("goggame-*.info")):
+            try:
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            game_id = data.get("gameId")
+            name = data.get("name")
+            root_game_id = data.get("rootGameId")
+
+            if game_id is None or not isinstance(name, str) or not name.strip():
+                continue
+
+            game_id = str(game_id)
+
+            # Skip DLC manifests.
+            if root_game_id is not None and str(root_game_id) != game_id:
+                continue
+
+            game.gog_manifest = GogManifest(
+                id=game_id,
+                name=name.strip(),
+            )
+            return game.gog_manifest
+
+    return None
 
 
 def find_steam_appid_from_manifest(game: Game) -> SteamManifest | None:
@@ -4501,8 +4559,10 @@ class GameArchiver(App):
         self.archived_view = self.query_one("#archived", ListView)
         self.library_view = self.query_one("#library", ListView)
 
-        self.load_game_data()
-        self.action_refresh()
+        self.run_worker(
+            self.load_game_data(),
+            name="load-game-data",
+        )
 
         self.current_view().focus()
 
@@ -4520,7 +4580,7 @@ class GameArchiver(App):
             self.bind("]", "next_steam_user", "Steam+")
 
         self.refresh_bindings()
-        self.save_game_data()
+        # self.save_game_data()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "game-search":
@@ -4596,11 +4656,18 @@ class GameArchiver(App):
         self._artwork_generation: int = 0
         self._artwork_timer: Timer | None = None
 
+        # Games currently available to play, regardless of storage location.
         self.games: list[Game] = []
+
+        # Available games grouped by storage location.
         self.shared_games: list[Game] = []
         self.archived_games: list[Game] = []
         self.library_only_games: list[Game] = []
+
+        # Games whose installation paths are unavailable.
+        # Kept separate and rechecked during scans in case they become available again.
         self.unavailable_games: list[Game] = []
+
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
@@ -4925,11 +4992,40 @@ class GameArchiver(App):
                     selected_rows=self.load_selected_art(db, game_id),
                 )
 
-    def load_game_data(self) -> None:
+    async def load_game_data(self) -> None:
         try:
-            games = []
+            # Clear existing data.
+            self.games = []
+            self.shared_games = []
+            self.archived_games = []
+            self.library_only_games = []
+            self.unavailable_games = []
+
+            await self.shared_view.clear()
+            await self.archived_view.clear()
+            await self.library_view.clear()
+
             seen_identities = {}
             path_updates = []
+
+            async def insert_sorted(
+                collection: list[Game],
+                view: ListView,
+                game: Game,
+            ) -> None:
+                self.sort_games(collection)
+
+                index = next(i for i, item in enumerate(collection) if item is game)
+
+                await view.insert(index, [GameRow(game)])
+
+            async def add_sorted(
+                collection: list[Game],
+                view: ListView,
+                game: Game,
+            ) -> None:
+                collection.append(game)
+                await insert_sorted(collection, view, game)
 
             for game in self.load_games():
                 identity = game_identity(game)
@@ -4947,40 +5043,80 @@ class GameArchiver(App):
 
                     seen_identities[identity] = game.id
 
-                    location = (
-                        get_game_location(game.path) if game.path is not None else None
+                # Check whether the game has a mirrored remote path.
+                location = (
+                    get_game_location(game.path) if game.path is not None else None
+                )
+
+                if location is not None and location.remote_path is not None:
+                    relative_path = next(
+                        (
+                            game.path.relative_to(base)
+                            for base in (
+                                location.local_path,
+                                location.remote_path,
+                            )
+                            if base is not None and game.path.is_relative_to(base)
+                        ),
+                        None,
                     )
 
-                    if location is not None and location.remote_path is not None:
-                        relative_path = next(
-                            (
-                                game.path.relative_to(base)
-                                for base in (
-                                    location.local_path,
-                                    location.remote_path,
-                                )
-                                if base is not None and game.path.is_relative_to(base)
-                            ),
-                            None,
-                        )
+                    if relative_path is not None:
+                        remote_path = location.remote_path / relative_path
 
-                        if relative_path is not None:
-                            remote_path = location.remote_path / relative_path
+                        if remote_path.is_dir() and game.path != remote_path:
+                            debug_log(
+                                f"Updating game ID {game.id} path: "
+                                f"{game.path} -> {remote_path}"
+                            )
 
-                            if remote_path.is_dir() and game.path != remote_path:
-                                debug_log(
-                                    f"Updating game ID {game.id} path: "
-                                    f"{game.path} -> {remote_path}"
-                                )
+                            if game.id is not None:
+                                path_updates.append((str(remote_path), game.id))
 
-                                if game.id is not None:
-                                    path_updates.append((str(remote_path), game.id))
+                            game.path = remote_path
 
-                                game.path = remote_path
+                find_steam_appid_from_manifest(game)
+                find_gog_manifest(game)
 
-                games.append(game)
+                # Verify that the game directory is actually available.
+                if game.path is None or not game.path.is_dir():
+                    self.unavailable_games.append(game)
 
-            # Apply path updates after load_games() has finished.
+                    debug_log(
+                        f"Game ID {game.id} is unavailable: {game.name!r} ({game.path})"
+                    )
+                    continue
+
+                # Determine where the game belongs.
+                location = get_game_location(game.path)
+
+                if location is not None and location.type is GameLocationType.SHARED:
+                    await add_sorted(
+                        self.shared_games,
+                        self.shared_view,
+                        game,
+                    )
+
+                elif (
+                    location is not None and location.type is GameLocationType.ARCHIVED
+                ):
+                    await add_sorted(
+                        self.archived_games,
+                        self.archived_view,
+                        game,
+                    )
+
+                else:
+                    self.library_only_games.append(game)
+
+                # Every available game goes into the Library view.
+                await add_sorted(
+                    self.games,
+                    self.library_view,
+                    game,
+                )
+
+            # Apply path updates after load_games() has finished using the database.
             if path_updates:
                 with get_db() as db:
                     db.executemany(
@@ -4992,38 +5128,22 @@ class GameArchiver(App):
                         path_updates,
                     )
 
-            self.sort_games(games)
+            self.sort_games(self.library_only_games)
 
-            shared_games = []
-            archived_games = []
-            library_only_games = []
+            debug_log(
+                f"Loaded {len(self.games)} games: "
+                f"{len(self.shared_games)} shared, "
+                f"{len(self.archived_games)} archived, "
+                f"{len(self.library_only_games)} library-only, "
+                f"{len(self.unavailable_games)} unavailable"
+            )
 
-            for game in games:
-                location = (
-                    get_game_location(game.path) if game.path is not None else None
-                )
-
-                if location is None:
-                    library_only_games.append(game)
-                    continue
-
-                if location.type is GameLocationType.SHARED:
-                    shared_games.append(game)
-                elif location.type is GameLocationType.ARCHIVED:
-                    archived_games.append(game)
-                else:
-                    library_only_games.append(game)
-
-            self.shared_games = shared_games
-            self.archived_games = archived_games
-            self.library_only_games = library_only_games
-            self.games = games
-            # After loading and closing the database connection:
             self.run_worker(
                 self.auto_populate_steamgriddb_from_manifests(),
                 name="steamgriddb-auto-link",
             )
 
+            self.action_refresh()
         except TypeError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -5637,11 +5757,63 @@ class GameArchiver(App):
             )
         ]
 
+    def game_row_key(self, game: Game) -> tuple[str, int | Path | str]:
+        if game.id is not None:
+            return ("id", game.id)
+
+        if game.path is not None:
+            return ("path", game.path)
+
+        return ("name", game.name)
+
+    async def reconcile_list_view(
+        self,
+        view: ListView,
+        games: list[Game],
+    ) -> None:
+        existing_rows = {
+            self.game_row_key(row.game): row
+            for row in view.children
+            if isinstance(row, GameRow)
+        }
+
+        desired_rows = []
+
+        for game in games:
+            key = self.game_row_key(game)
+            row = existing_rows.pop(key, None)
+
+            if row is None:
+                row = GameRow(game)
+            else:
+                row.game = game
+                row.refresh_row()
+
+            desired_rows.append(row)
+
+        # Remove only games that are no longer in this view.
+        stale_rows = list(existing_rows.values())
+
+        async with view.batch():
+            if stale_rows:
+                await view.remove_children(stale_rows)
+
+            # Reorder existing rows and insert new ones where needed.
+            for index, row in enumerate(desired_rows):
+                if row.parent is view:
+                    if view.children[index] is not row:
+                        view.move_child(row, before=index)
+                elif index < len(view.children):
+                    await view.mount(row, before=index)
+                else:
+                    await view.mount(row)
+
     def refresh_views(self):
         search = self.query_one("#game-search", Input)
         search_focused = search.has_focus
-        self.update_mode_display()
         selected_path = self.highlighted_game_path
+
+        self.update_mode_display()
 
         archived_display = self.archived_games if self.storage_online else []
         self.archived_view.display = bool(archived_display)
@@ -5653,22 +5825,37 @@ class GameArchiver(App):
 
         self.sort_games(self.games)
 
-        self.shared_view.clear()
-        self.archived_view.clear()
-        self.library_view.clear()
-
-        self.shared_view.extend(
-            [GameRow(g) for g in self.filter_games(self.shared_games)]
-        )
-        self.archived_view.extend(
-            [GameRow(g) for g in self.filter_games(archived_display)]
-        )
-        self.library_view.extend([GameRow(g) for g in self.filter_games(self.games)])
-
         self.update_status()
 
-        def restore_highlight():
+        self.run_worker(
+            self._refresh_views(selected_path, search_focused, archived_display),
+            name="refresh-views",
+            group="refresh-views",
+            exclusive=True,
+        )
 
+    async def _refresh_views(
+        self,
+        selected_path: Path | None,
+        search_focused: bool,
+        archived_display: list[Game],
+    ) -> None:
+        await self.reconcile_list_view(
+            self.shared_view,
+            self.filter_games(self.shared_games),
+        )
+
+        await self.reconcile_list_view(
+            self.archived_view,
+            self.filter_games(archived_display),
+        )
+
+        await self.reconcile_list_view(
+            self.library_view,
+            self.filter_games(self.games),
+        )
+
+        def restore_highlight():
             if selected_path is not None:
                 views = ()
 
@@ -5676,7 +5863,6 @@ class GameArchiver(App):
                     views = (self.library_view,)
                 elif self.app_mode == AppMode.MOVE:
                     views = (self.shared_view, self.archived_view)
-                # Future modes here
 
                 for view in views:
                     for i, row in enumerate(view.children):
@@ -5688,17 +5874,17 @@ class GameArchiver(App):
 
                             if not search_focused:
                                 self.set_focus(view)
+
                             return
+
             view = self.current_view()
+
             if view is not None:
                 view.index = 0
 
                 row = view.children[0] if view.children else None
 
-                if row is not None:
-                    self.highlighted_game_path = row.game.path
-                else:
-                    self.highlighted_game_path = None
+                self.highlighted_game_path = row.game.path if row is not None else None
 
                 if self.app_mode == AppMode.LIBRARY:
                     self.refresh_library_details(row.game if row else None)
