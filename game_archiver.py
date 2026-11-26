@@ -3720,12 +3720,11 @@ def steam_running() -> bool:
 class IconCandidate:
     score: tuple
     path: Path
-    kind: Literal[ImageExtension.PNG, ImageExtension.ICO, ImageExtension.EXE]
+    kind: ImageExtension
 
 
 def find_icons(root: Path) -> list[IconCandidate]:
     icons: list[IconCandidate] = []
-    best_exe: Path | None = None
 
     for current, dirs, files in os.walk(root):
         depth = len(Path(current).relative_to(root).parts)
@@ -3742,79 +3741,79 @@ def find_icons(root: Path) -> list[IconCandidate]:
             name = file.casefold()
 
             if path.suffix.casefold() == ImageExtension.EXE:
-                name = path.name.casefold()
-
                 if any(bad in name for bad in BAD_LAUNCHER_NAMES):
                     continue
 
-                if best_exe is None or launcher_score(path, root) < launcher_score(
-                    best_exe, root
-                ):
-                    best_exe = path
-
-                continue
-
-            # Best possible icon
-            if name == "window_icon" + ImageExtension.PNG:
                 icons.append(
                     IconCandidate(
-                        score=(0, 0),
+                        score=(5,) + launcher_score(path, root),
                         path=path,
-                        kind=ImageExtension.PNG,
+                        kind=ImageExtension.EXE,
                     )
                 )
                 continue
 
-            # icon_\d+ + ImageExtension.PNG
-            if match := re.search(r"icon[-_]?(\d+)", name):
+            extension = path.suffix.casefold()
+
+            if extension not in ARTWORK_EXTENSIONS:
+                continue
+
+            kind = ImageExtension(extension)
+            stem = path.stem.casefold()
+
+            # Best possible icon
+            if stem == "window_icon":
+                icons.append(
+                    IconCandidate(
+                        score=(0, 0),
+                        path=path,
+                        kind=kind,
+                    )
+                )
+                continue
+
+            # icon_\d+ + supported image extension
+            if match := re.search(r"icon[-_]?(\d+)", stem):
                 size = int(match.group(1))
                 icons.append(
                     IconCandidate(
                         score=(1, -size),
                         path=path,
-                        kind=ImageExtension.PNG,
+                        kind=kind,
                     )
                 )
                 continue
 
             # Fallbacks
-            if name == "icon" + ImageExtension.PNG:
+            if stem == "icon":
                 icons.append(
                     IconCandidate(
                         score=(2, 0),
                         path=path,
-                        kind=ImageExtension.PNG,
+                        kind=kind,
                     )
                 )
                 continue
 
-            if name == "android-icon_foreground" + ImageExtension.PNG:
+            if stem == "android-icon_foreground":
                 icons.append(
                     IconCandidate(
                         score=(3, 0),
                         path=path,
-                        kind=ImageExtension.PNG,
+                        kind=kind,
                     )
                 )
                 continue
 
-            if path.suffix.casefold() == ImageExtension.ICO:
+            # Generic ICO fallback
+            if extension == ImageExtension.ICO:
                 icons.append(
                     IconCandidate(
                         score=(4, 0),
                         path=path,
-                        kind=ImageExtension.ICO,
+                        kind=kind,
                     )
                 )
-
-    if best_exe is not None:
-        icons.append(
-            IconCandidate(
-                score=(5,) + launcher_score(best_exe, root),
-                path=best_exe,
-                kind=ImageExtension.EXE,
-            )
-        )
 
     icons.sort()
     return icons
@@ -4359,7 +4358,20 @@ class GameRow(ListItem):
         if icon_path.suffix.lower() == ImageExtension.EXE:
             icon_path = await to_thread(extract_exe_icon, icon_path)
 
-        self.icon.image = icon_path if icon_path else None
+        if icon_path is None or not icon_path.is_file():
+            self.icon.image = None
+            return
+
+        try:
+            with Image.open(icon_path) as image:
+                image.verify()
+
+        except (UnidentifiedImageError, OSError, ValueError):
+            debug_log(f"Invalid game row icon: {icon_path}")
+            self.icon.image = None
+            return
+
+        self.icon.image = icon_path
 
     def refresh_tooltip(self):
         parts = [
