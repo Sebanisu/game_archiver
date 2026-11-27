@@ -38,6 +38,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Grid, Horizontal, Vertical
+from textual.events import ScreenResume, ScreenSuspend
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
@@ -1462,6 +1463,251 @@ def migrate_to_v9_and_v10(db: sqlite3.Connection) -> None:
         raise RuntimeError(
             f"Duplicate game identities remain after migration: {duplicates}"
         )
+
+
+def _transfer_game_record(
+    db: sqlite3.Connection,
+    keeper_id: int,
+    duplicate_id: int,
+) -> None:
+    """Merge a duplicate game record into its keeper and delete it."""
+
+    if keeper_id == duplicate_id:
+        return
+
+    debug_log(f"Deduplicating game ID {duplicate_id}; keeping {keeper_id}")
+
+    # ----------------------------------------------------------
+    # Merge games table metadata.
+    # ----------------------------------------------------------
+
+    db.execute(
+        """
+        UPDATE games
+        SET
+            last_played = MAX(last_played, (
+                SELECT last_played
+                FROM games
+                WHERE id = ?
+            )),
+            launcher = COALESCE(
+                launcher,
+                (SELECT launcher FROM games WHERE id = ?)
+            )
+        WHERE id = ?
+        """,
+        (duplicate_id, duplicate_id, keeper_id),
+    )
+
+    # ----------------------------------------------------------
+    # Merge Steam metadata.
+    # ----------------------------------------------------------
+
+    duplicate = db.execute(
+        """
+        SELECT *
+        FROM steam_games
+        WHERE game_id = ?
+        """,
+        (duplicate_id,),
+    ).fetchone()
+
+    if duplicate is not None:
+        keeper = db.execute(
+            """
+            SELECT *
+            FROM steam_games
+            WHERE game_id = ?
+            """,
+            (keeper_id,),
+        ).fetchone()
+
+        if keeper is None:
+            db.execute(
+                """
+                INSERT INTO steam_games (
+                    game_id,
+                    steam_key,
+                    steam_entry,
+                    in_steam,
+                    steam_broken,
+                    duplicate_steam
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    keeper_id,
+                    duplicate["steam_key"],
+                    duplicate["steam_entry"],
+                    duplicate["in_steam"],
+                    duplicate["steam_broken"],
+                    duplicate["duplicate_steam"],
+                ),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE steam_games
+                SET
+                    steam_key = COALESCE(steam_key, ?),
+                    steam_entry = COALESCE(steam_entry, ?),
+                    in_steam = MAX(in_steam, ?),
+                    steam_broken = MAX(steam_broken, ?),
+                    duplicate_steam = MAX(duplicate_steam, ?)
+                WHERE game_id = ?
+                """,
+                (
+                    duplicate["steam_key"],
+                    duplicate["steam_entry"],
+                    duplicate["in_steam"],
+                    duplicate["steam_broken"],
+                    duplicate["duplicate_steam"],
+                    keeper_id,
+                ),
+            )
+
+    # ----------------------------------------------------------
+    # Merge SteamGridDB game metadata.
+    # ----------------------------------------------------------
+
+    duplicate = db.execute(
+        """
+        SELECT *
+        FROM steamgriddb_games
+        WHERE game_id = ?
+        """,
+        (duplicate_id,),
+    ).fetchone()
+
+    if duplicate is not None:
+        keeper = db.execute(
+            """
+            SELECT *
+            FROM steamgriddb_games
+            WHERE game_id = ?
+            """,
+            (keeper_id,),
+        ).fetchone()
+
+        if keeper is None:
+            db.execute(
+                """
+                INSERT INTO steamgriddb_games (
+                    game_id,
+                    sgdb_id,
+                    name,
+                    search,
+                    game_data,
+                    steam_platform_data,
+                    cached
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    keeper_id,
+                    duplicate["sgdb_id"],
+                    duplicate["name"],
+                    duplicate["search"],
+                    duplicate["game_data"],
+                    duplicate["steam_platform_data"],
+                    duplicate["cached"],
+                ),
+            )
+        else:
+            db.execute(
+                """
+                UPDATE steamgriddb_games
+                SET
+                    sgdb_id = COALESCE(sgdb_id, ?),
+                    name = COALESCE(name, ?),
+                    search = COALESCE(search, ?),
+                    game_data = COALESCE(game_data, ?),
+                    steam_platform_data = COALESCE(
+                        steam_platform_data, ?
+                    ),
+                    cached = COALESCE(cached, ?)
+                WHERE game_id = ?
+                """,
+                (
+                    duplicate["sgdb_id"],
+                    duplicate["name"],
+                    duplicate["search"],
+                    duplicate["game_data"],
+                    duplicate["steam_platform_data"],
+                    duplicate["cached"],
+                    keeper_id,
+                ),
+            )
+
+    # ----------------------------------------------------------
+    # Transfer artwork associations.
+    # ----------------------------------------------------------
+
+    db.execute(
+        """
+        INSERT OR IGNORE INTO game_artwork (
+            game_id,
+            artwork_id
+        )
+        SELECT ?, artwork_id
+        FROM game_artwork
+        WHERE game_id = ?
+        """,
+        (keeper_id, duplicate_id),
+    )
+
+    # Preserve the keeper's existing artwork selections.
+    # If the keeper has no selection for a particular type,
+    # the duplicate's selection will be transferred.
+    db.execute(
+        """
+        INSERT OR IGNORE INTO selected_artwork (
+            game_id,
+            artwork_type,
+            artwork_id,
+            downloaded_path,
+            installed_path
+        )
+        SELECT
+            ?,
+            artwork_type,
+            artwork_id,
+            downloaded_path,
+            installed_path
+        FROM selected_artwork
+        WHERE game_id = ?
+        """,
+        (keeper_id, duplicate_id),
+    )
+
+    # Transfer SteamGridDB artwork associations.
+    db.execute(
+        """
+        INSERT OR IGNORE INTO steamgriddb_artwork (
+            artwork_id,
+            sgdb_game_id,
+            sgdb_art_id
+        )
+        SELECT
+            artwork_id,
+            ?,
+            sgdb_art_id
+        FROM steamgriddb_artwork
+        WHERE sgdb_game_id = ?
+        """,
+        (keeper_id, duplicate_id),
+    )
+
+    # ----------------------------------------------------------
+    # Delete the duplicate after transferring its data.
+    # ----------------------------------------------------------
+
+    db.execute(
+        "DELETE FROM games WHERE id = ?",
+        (duplicate_id,),
+    )
+
+    debug_log(f"Finished merging game ID {duplicate_id} into {keeper_id}")
 
 
 def reconcile_game_paths(
@@ -3290,7 +3536,12 @@ def add_selected_artwork_to_art(
 ) -> None:
     sgdb = game.steamgriddb
     art = sgdb.setdefault("art", {})
-    artwork_list = art.setdefault(artwork_type, [])
+
+    artwork_list = art.get(artwork_type)
+
+    if artwork_list is None:
+        artwork_list = []
+        art[artwork_type] = artwork_list
 
     asset_id = asset.get("id")
     source = asset.get("source")
@@ -4578,11 +4829,11 @@ class GameArchiver(App):
 
         self.current_view().focus()
 
-        self.set_interval(
+        self._sync_status_timer = self.set_interval(
             SYNC_STATUS_INTERVAL_SEC,
             self.refresh_sync_status,
         )
-        self.set_interval(
+        self._rescan_timer = self.set_interval(
             RESCAN_INTERVAL_SEC,
             self.refresh_if_changed,
         )
@@ -4665,8 +4916,11 @@ class GameArchiver(App):
         self.sync_status: str = "Detecting"
         self.storage_online: bool = False
         self.search_timer: Timer | None = None
+        self._library_details_timer: Timer | None = None
         self._artwork_generation: int = 0
         self._artwork_timer: Timer | None = None
+        self._sync_status_timer: Timer | None = None
+        self._rescan_timer: Timer | None = None
 
         # Games currently available to play, regardless of storage location.
         self.games: list[Game] = []
@@ -4683,6 +4937,7 @@ class GameArchiver(App):
         self.steam_users = get_steam_users()
         self.selected_steam_user = 0
         self.highlighted_game_path: Path | None = None
+        self._suspended_game_path: Path | None = None
 
     async def clear_library_artwork(self, generation: int):
         if generation != self._artwork_generation:
@@ -4836,6 +5091,257 @@ class GameArchiver(App):
         self.sort_games(games)
         return games
 
+    def collapse_duplicate_games(
+        self,
+        merged_ids: dict[int, int],
+    ) -> None:
+        """Remove duplicate games and reclassify surviving keepers."""
+
+        duplicate_ids = set(merged_ids)
+        keeper_ids = set(merged_ids.values())
+
+        category_collections = (
+            self.shared_games,
+            self.archived_games,
+            self.library_only_games,
+        )
+
+        all_collections = (
+            *category_collections,
+            self.unavailable_games,
+        )
+
+        # Preserve references to surviving keeper objects.
+        keeper_games = {
+            game.id: game
+            for games in all_collections
+            for game in games
+            if game.id in keeper_ids
+        }
+
+        # Remove deleted duplicates.
+        for games in all_collections:
+            games[:] = [game for game in games if game.id not in duplicate_ids]
+
+        # Reclassify keepers whose installation location changed.
+        for game in keeper_games.values():
+            if game.path is None or not game.path.is_dir():
+                target = self.unavailable_games
+
+            else:
+                location = get_game_location(game.path)
+
+                if location is not None and location.type is GameLocationType.SHARED:
+                    target = self.shared_games
+
+                elif (
+                    location is not None and location.type is GameLocationType.ARCHIVED
+                ):
+                    target = self.archived_games
+
+                else:
+                    target = self.library_only_games
+
+            # Already in the correct collection; nothing to do.
+            if any(existing is game for existing in target):
+                continue
+
+            # Remove from the previous collection and add to the correct one.
+            for collection in all_collections:
+                collection[:] = [
+                    existing for existing in collection if existing is not game
+                ]
+
+            target.append(game)
+
+        # Rebuild the available games collection.
+        self.games = (
+            self.shared_games + self.archived_games + self.library_only_games
+            if self.storage_online
+            else self.shared_games + self.library_only_games
+        )
+
+    def merge_duplicate_game_identities(
+        self,
+        db: sqlite3.Connection,
+    ) -> dict[int, int]:
+        """Merge all database records sharing a game identity."""
+
+        # Index currently loaded games so we can use their latest in-memory data.
+        collections = (
+            self.games,
+            self.shared_games,
+            self.archived_games,
+            self.library_only_games,
+            self.unavailable_games,
+        )
+
+        memory_games = {
+            game.id: game
+            for games in collections
+            for game in games
+            if game.id is not None
+        }
+
+        rows = db.execute(
+            """
+            SELECT *
+            FROM games
+            WHERE path IS NOT NULL
+            ORDER BY id
+            """
+        ).fetchall()
+
+        identity_groups: dict[tuple, list[sqlite3.Row]] = {}
+
+        for row in rows:
+            identity = game_identity(Game(path=Path(row["path"])))
+
+            if identity is not None:
+                identity_groups.setdefault(identity, []).append(row)
+
+        merged_ids = {}
+
+        def row_quality(row: sqlite3.Row) -> tuple:
+            """Rank records by installation validity and metadata completeness."""
+
+            path = Path(row["path"])
+            game = memory_games.get(row["id"])
+
+            launcher = game.launcher if game is not None else row["launcher"]
+
+            launcher_valid = bool(
+                launcher and (is_steam_launcher(launcher) or Path(launcher).is_file())
+            )
+
+            completeness = sum(
+                (
+                    bool(row["name"]),
+                    bool(launcher),
+                    row["size"] > 0,
+                    row["file_count"] > 0,
+                    row["mtime"] > 0,
+                )
+            )
+
+            return (
+                not path.is_dir(),
+                not launcher_valid,
+                -completeness,
+                -row["mtime"],
+                row["id"],
+            )
+
+        for identity, group_rows in identity_groups.items():
+            if len(group_rows) < 2:
+                continue
+
+            # Prefer the oldest ID belonging to an existing installation.
+            # If no installation exists, keep the oldest ID overall.
+            existing_rows = [row for row in group_rows if Path(row["path"]).is_dir()]
+
+            keeper_row = min(
+                existing_rows or group_rows,
+                key=lambda row: row["id"],
+            )
+
+            keeper_id = keeper_row["id"]
+
+            # Installation metadata can come from a different record
+            # than the one whose database ID we keep.
+            source_row = min(group_rows, key=row_quality)
+
+            duplicate_rows = [row for row in group_rows if row["id"] != keeper_id]
+
+            duplicate_ids = [row["id"] for row in duplicate_rows]
+
+            debug_log(
+                f"Deduplicating game IDs {duplicate_ids}; "
+                f"keeping {keeper_id}, using data from {source_row['id']}"
+            )
+
+            # Transfer metadata and delete duplicate records.
+            for duplicate_row in duplicate_rows:
+                duplicate_id = duplicate_row["id"]
+
+                _transfer_game_record(
+                    db,
+                    keeper_id,
+                    duplicate_id,
+                )
+
+                merged_ids[duplicate_id] = keeper_id
+
+            # Apply the best installation metadata to the surviving record.
+            # This happens AFTER duplicate deletion to avoid the unique
+            # constraint on games.path.
+            db.execute(
+                """
+                UPDATE games
+                SET
+                    path = ?,
+                    name = ?,
+                    size = ?,
+                    mtime = ?,
+                    file_count = ?,
+                    launcher = COALESCE(?, launcher),
+                    gamescope_enabled = ?
+                WHERE id = ?
+                """,
+                (
+                    source_row["path"],
+                    source_row["name"],
+                    source_row["size"],
+                    source_row["mtime"],
+                    source_row["file_count"],
+                    source_row["launcher"],
+                    source_row["gamescope_enabled"],
+                    keeper_id,
+                ),
+            )
+
+            # --------------------------------------------------
+            # Refresh the surviving in-memory Game object.
+            # --------------------------------------------------
+
+            keeper_game = memory_games.get(keeper_id)
+
+            if keeper_game is None:
+                keeper_game = next(
+                    (
+                        memory_games[row["id"]]
+                        for row in group_rows
+                        if row["id"] in memory_games
+                    ),
+                    None,
+                )
+
+            refreshed_game = self.load_game(db, keeper_id)
+
+            if keeper_game is not None and refreshed_game is not None:
+                selected = any(
+                    memory_games[row["id"]].selected
+                    for row in group_rows
+                    if row["id"] in memory_games
+                )
+
+                old_path = keeper_game.path
+
+                # Preserve existing references held by collections and widgets.
+                keeper_game.__dict__.update(refreshed_game.__dict__)
+                keeper_game.selected = selected
+
+                if old_path != keeper_game.path:
+                    debug_log(
+                        f"Game ID {keeper_id} path changed: "
+                        f"{old_path} -> {keeper_game.path}"
+                    )
+
+        if merged_ids:
+            debug_log(f"Merged {len(merged_ids)} duplicate game records: {merged_ids}")
+
+        return merged_ids
+
     def merge_games(
         self,
         existing: list[Game],
@@ -4965,44 +5471,51 @@ class GameArchiver(App):
         except Exception as e:  # noqa: BLE001
             self.notify(f"Error loading artwork: {type(e).__name__}: {e}")
 
+    def load_game(
+        self,
+        db: sqlite3.Connection,
+        game_id: int,
+    ) -> Game | None:
+        row = db.execute(
+            "SELECT * FROM games WHERE id = ?",
+            (game_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        steam_row = db.execute(
+            "SELECT * FROM steam_games WHERE game_id = ?",
+            (game_id,),
+        ).fetchone()
+
+        steamgriddb_row = db.execute(
+            "SELECT * FROM steamgriddb_games WHERE game_id = ?",
+            (game_id,),
+        ).fetchone()
+
+        return Game.from_row(
+            row=row,
+            steam_row=steam_row,
+            steamgriddb_row=steamgriddb_row,
+            art_rows=self.load_art(db, game_id),
+            selected_rows=self.load_selected_art(db, game_id),
+        )
+
     def load_games(self) -> Iterator[Game]:
         with get_db() as db:
             cursor = db.execute(
                 """
-                SELECT *
+                SELECT id
                 FROM games
                 ORDER BY id
                 """
             )
 
             for row in cursor:
-                game_id = row["id"]
-
-                steam_row = db.execute(
-                    """
-                    SELECT *
-                    FROM steam_games
-                    WHERE game_id = ?
-                    """,
-                    (game_id,),
-                ).fetchone()
-
-                steamgriddb_row = db.execute(
-                    """
-                    SELECT *
-                    FROM steamgriddb_games
-                    WHERE game_id = ?
-                    """,
-                    (game_id,),
-                ).fetchone()
-
-                yield Game.from_row(
-                    row=row,
-                    steam_row=steam_row,
-                    steamgriddb_row=steamgriddb_row,
-                    art_rows=self.load_art(db, game_id),
-                    selected_rows=self.load_selected_art(db, game_id),
-                )
+                game = self.load_game(db, row["id"])
+                if game is not None:
+                    yield game
 
     async def load_game_data(self) -> None:
         try:
@@ -5028,8 +5541,9 @@ class GameArchiver(App):
                 self.sort_games(collection)
 
                 index = next(i for i, item in enumerate(collection) if item is game)
-
-                await view.insert(index, [GameRow(game)])
+                row = GameRow(game)
+                self.apply_game_filter(row)
+                await view.insert(index, [row])
 
             async def add_sorted(
                 collection: list[Game],
@@ -5164,6 +5678,8 @@ class GameArchiver(App):
     def save_game_data(self) -> None:
         debug_log("DEBUG: save_game_data called")
 
+        merged_ids = {}
+
         try:
             with get_db() as db:
                 games = (
@@ -5175,11 +5691,18 @@ class GameArchiver(App):
                 for game in games:
                     save_game(db, game)
 
+                merged_ids = self.merge_duplicate_game_identities(db)
+
                 db.commit()
 
         except Exception as e:
             self.notify(f"Error saving game data: {type(e).__name__}: {e}")
             raise
+
+        # Update in-memory collections after the database commit succeeds.
+        if merged_ids:
+            self.collapse_duplicate_games(merged_ids)
+            self.refresh_views()
 
     async def get_selected_artwork_path(
         self,
@@ -5602,6 +6125,60 @@ class GameArchiver(App):
 
     # ========================================================
 
+    def on_screen_resume(self, event: ScreenResume) -> None:
+        # Ignore resumes between nested dialogs.
+        if len(self.screen_stack) > 1:
+            return
+
+        # Resume background intervals regardless of app mode.
+        for timer in (self._sync_status_timer, self._rescan_timer):
+            if timer is not None:
+                timer.resume()
+
+        # Restore the previously highlighted game if it still exists in the view.
+        if self._suspended_game_path is not None:
+            for index, row in enumerate(self.library_view.children):
+                if (
+                    isinstance(row, GameRow)
+                    and row.game.path == self._suspended_game_path
+                ):
+                    self.library_view.index = index
+                    self.highlighted_game_path = row.game.path
+                    break
+
+        if self.app_mode != AppMode.LIBRARY:
+            return
+
+        # Debounce library details refresh.
+        if self._library_details_timer is not None:
+            self._library_details_timer.stop()
+
+        self._library_details_timer = self.set_timer(
+            0.3,
+            self.refresh_highlighted_library_details,
+        )
+
+    def refresh_highlighted_library_details(self) -> None:
+        self._library_details_timer = None
+
+        if self.app_mode != AppMode.LIBRARY:
+            return
+
+        self.refresh_library_details(self.get_highlighted_game())
+
+    def on_screen_suspend(self, event: ScreenSuspend) -> None:
+        # Preserve the current selection before a dialog takes over.
+
+        self._suspended_game_path = self.highlighted_game_path
+
+        if self._library_details_timer is not None:
+            self._library_details_timer.stop()
+            self._library_details_timer = None
+
+        for timer in (self._sync_status_timer, self._rescan_timer):
+            if timer is not None:
+                timer.pause()
+
     async def on_list_view_highlighted(self, event: ListView.Highlighted):
         row = event.item
 
@@ -5737,7 +6314,7 @@ class GameArchiver(App):
 
         return not search.has_focus
 
-    def filter_games(self, games: list[Game]) -> list[Game]:
+    def game_matches_filter(self, game: Game) -> bool:
         pattern = self.query_one("#game-search", Input).value
         filter_not_steam = self.query_one("#filter-not-steam", Checkbox).value
         filter_no_sgdb = self.query_one("#filter-no-sgdb", Checkbox).value
@@ -5747,10 +6324,8 @@ class GameArchiver(App):
         except re.error:
             regex = None
 
-        return [
-            game
-            for game in games
-            if (not filter_not_steam or (not game.in_steam and can_add_to_steam(game)))
+        return (
+            (not filter_not_steam or (not game.in_steam and can_add_to_steam(game)))
             and (
                 not filter_no_sgdb
                 or not (
@@ -5767,7 +6342,15 @@ class GameArchiver(App):
                     and regex.search(str(game.steamgriddb["game"].get("name") or ""))
                 )
             )
-        ]
+        )
+
+    def apply_game_filter(self, row: GameRow) -> None:
+        row.styles.display = "block" if self.game_matches_filter(row.game) else "none"
+
+    def apply_view_filter(self, view: ListView) -> None:
+        for row in view.children:
+            if isinstance(row, GameRow):
+                self.apply_game_filter(row)
 
     def game_row_key(self, game: Game) -> tuple[str, int | Path | str]:
         if game.id is not None:
@@ -5777,48 +6360,6 @@ class GameArchiver(App):
             return ("path", game.path)
 
         return ("name", game.name)
-
-    async def reconcile_list_view(
-        self,
-        view: ListView,
-        games: list[Game],
-    ) -> None:
-        existing_rows = {
-            self.game_row_key(row.game): row
-            for row in view.children
-            if isinstance(row, GameRow)
-        }
-
-        desired_rows = []
-
-        for game in games:
-            key = self.game_row_key(game)
-            row = existing_rows.pop(key, None)
-
-            if row is None:
-                row = GameRow(game)
-            else:
-                row.game = game
-                row.refresh_row()
-
-            desired_rows.append(row)
-
-        # Remove only games that are no longer in this view.
-        stale_rows = list(existing_rows.values())
-
-        async with view.batch():
-            if stale_rows:
-                await view.remove_children(stale_rows)
-
-            # Reorder existing rows and insert new ones where needed.
-            for index, row in enumerate(desired_rows):
-                if row.parent is view:
-                    if view.children[index] is not row:
-                        view.move_child(row, before=index)
-                elif index < len(view.children):
-                    await view.mount(row, before=index)
-                else:
-                    await view.mount(row)
 
     def refresh_views(self):
         search = self.query_one("#game-search", Input)
@@ -5846,6 +6387,53 @@ class GameArchiver(App):
             exclusive=True,
         )
 
+    async def reconcile_list_view(
+        self,
+        view: ListView,
+        games: list[Game],
+    ) -> None:
+        """Synchronize ListView rows with the current game collection."""
+
+        existing_rows = {
+            self.game_row_key(row.game): row
+            for row in view.children
+            if isinstance(row, GameRow)
+        }
+
+        desired_rows = []
+
+        for game in games:
+            key = self.game_row_key(game)
+            row = existing_rows.pop(key, None)
+
+            if row is None:
+                row = GameRow(game)
+            else:
+                row.game = game
+                row.refresh_row()
+
+            desired_rows.append(row)
+
+        # Remove games no longer in the collection.
+        stale_rows = list(existing_rows.values())
+
+        async with view.batch():
+            if stale_rows:
+                await view.remove_children(stale_rows)
+
+            # Add missing rows and maintain sorting.
+            for index, row in enumerate(desired_rows):
+                if row.parent is view:
+                    if view.children[index] is not row:
+                        view.move_child(row, before=index)
+                else:
+                    if index < len(view.children):
+                        await view.mount(row, before=index)
+                    else:
+                        await view.mount(row)
+
+        self.apply_view_filter(view)
+
     async def _refresh_views(
         self,
         selected_path: Path | None,
@@ -5854,17 +6442,17 @@ class GameArchiver(App):
     ) -> None:
         await self.reconcile_list_view(
             self.shared_view,
-            self.filter_games(self.shared_games),
+            self.shared_games,
         )
 
         await self.reconcile_list_view(
             self.archived_view,
-            self.filter_games(archived_display),
+            archived_display,
         )
 
         await self.reconcile_list_view(
             self.library_view,
-            self.filter_games(self.games),
+            self.games,
         )
 
         def restore_highlight():
@@ -6743,52 +7331,63 @@ class GameArchiver(App):
         self,
         game: Game,
         client: SteamGridDBClient,
+        *,
+        force_search: bool = False,
     ):
         # Prefer an exact Steam AppID match from the installed Steam manifest.
         # Do not use steam_launch_appid() here: it can also use SteamGridDB data.
-        manifest = find_steam_appid_from_manifest(game)
+        if not force_search:
+            manifest = find_steam_appid_from_manifest(game)
 
-        if manifest is not None:
-            sgdb_game = await client.get_game_by_steam_appid(manifest.id)
+            if manifest is not None:
+                sgdb_game = await client.get_game_by_steam_appid(manifest.id)
 
-            if sgdb_game is not None:
-                game.steamgriddb = {
-                    "search": sgdb_game.get("name") or manifest.name or game.name,
-                    "game": sgdb_game,
-                    "steam_platform_data": None,
-                    "cached": None,
-                    "art": {
-                        ArtworkType.GRID_PORTRAIT: None,
-                        ArtworkType.GRID_SQUARE: None,
-                        ArtworkType.GRID_LANDSCAPE: None,
-                        ArtworkType.HERO: None,
-                        ArtworkType.LOGO: None,
-                        ArtworkType.ICON: None,
-                    },
-                    "selected": {
-                        ArtworkType.GRID_PORTRAIT: None,
-                        ArtworkType.GRID_SQUARE: None,
-                        ArtworkType.GRID_LANDSCAPE: None,
-                        ArtworkType.HERO: None,
-                        ArtworkType.LOGO: None,
-                        ArtworkType.ICON: None,
-                    },
-                }
+                if sgdb_game is not None:
+                    game.steamgriddb = {
+                        "search": sgdb_game.get("name") or manifest.name or game.name,
+                        "game": sgdb_game,
+                        "steam_platform_data": None,
+                        "cached": None,
+                        "art": {
+                            ArtworkType.GRID_PORTRAIT: None,
+                            ArtworkType.GRID_SQUARE: None,
+                            ArtworkType.GRID_LANDSCAPE: None,
+                            ArtworkType.HERO: None,
+                            ArtworkType.LOGO: None,
+                            ArtworkType.ICON: None,
+                        },
+                        "selected": {
+                            ArtworkType.GRID_PORTRAIT: None,
+                            ArtworkType.GRID_SQUARE: None,
+                            ArtworkType.GRID_LANDSCAPE: None,
+                            ArtworkType.HERO: None,
+                            ArtworkType.LOGO: None,
+                            ArtworkType.ICON: None,
+                        },
+                    }
 
-                # This fetch uses the SteamGridDB game ID only for optional
-                # platform artwork metadata; it does not determine the AppID.
-                steam_platform_data = await client.get_steam_platform_data(game)
-                if steam_platform_data is not None:
-                    game.steamgriddb["steam_platform_data"] = steam_platform_data
+                    # This fetch uses the SteamGridDB game ID only for optional
+                    # platform artwork metadata; it does not determine the AppID.
+                    steam_platform_data = await client.get_steam_platform_data(game)
+                    if steam_platform_data is not None:
+                        game.steamgriddb["steam_platform_data"] = steam_platform_data
 
-                self.save_game_data()
-                self.notify(
-                    f"Matched via Steam manifest (AppID {manifest.id}): "
-                    f"{sgdb_game.get('name') or manifest.name or game.name}"
-                )
-                self.refresh_game_row(game)
-                await self.manage_steamgriddb(game, client)
-                return
+                    self.save_game_data()
+                    self.notify(
+                        f"Matched via Steam manifest (AppID {manifest.id}): "
+                        f"{sgdb_game.get('name') or manifest.name or game.name}"
+                    )
+                    self.refresh_game_row(game)
+                    await self.manage_steamgriddb(game, client)
+                    return
+        else:
+            manifest = find_steam_appid_from_manifest(game)
+
+            if manifest is not None:
+                if not isinstance(game.steamgriddb, dict):
+                    game.steamgriddb = {}
+
+                game.steamgriddb["search"] = manifest.name
 
         # No manifest match (or no SteamGridDB entry for that AppID):
         # fall back to the existing name-based search flow.
@@ -6977,7 +7576,7 @@ class GameArchiver(App):
 
                 case SteamGridDBAction.CHANGE:
                     game.steamgriddb.pop("game", None)
-                    return await self.link_steamgriddb(game, client)
+                    return await self.link_steamgriddb(game, client, force_search=True)
 
                 case SteamGridDBAction.DOWNLOAD:
                     await self.download_steamgriddb_art(
